@@ -13,11 +13,12 @@ the payload matters. Then it gives you a verdict, a confidence number, and the
 reasoning behind them. Onion AI needs a Security Onion Pro license. soc-ai is
 an open alternative to it.
 
-The model runs on your own hardware behind a [LiteLLM](https://docs.litellm.ai/) gateway.
-No data about your network leaves it. The agent recommends each write-back, and
-you execute it. One exception exists. soc-ai can
-auto-acknowledge a high-confidence, low-stakes, investigated false positive, and
-it audits that write. The exception is off until you turn it on.
+The model runs on the hardware of the operator, behind a [LiteLLM](https://docs.litellm.ai/)
+gateway. No data about the network goes out of the network. The agent recommends each
+write-back, and the analyst executes each write-back. One exception exists. soc-ai can
+auto-acknowledge a high-confidence, investigated false positive, and soc-ai audits that
+write. A high-stakes alert waits for the analyst, unless a standing rule decision covers
+the rule of the alert. The exception is off by default.
 
 An optional cloud Oracle gives a second opinion on a hard alert. The Oracle is
 off until you turn it on, and soc-ai sanitizes its input first.
@@ -95,8 +96,10 @@ or edits a case. It runs on a bounded budget and reports what it found. If the
 budget stops it early, it still writes a grounded partial report.
 
 soc-ai also hunts when nobody asks. An analytic runs over the grid and writes a
-hit. Hits on one entity form a lead. The lead starts its own hunt, and you
-promote the hunt to an investigation that ends in a verdict.
+hit. Hits on one entity form a lead. The lead starts a lead hunt. The hunt
+investigates each threat finding that names an entity, unless a campaign holds
+the finding. Each investigation ends in a verdict. A confirmed attack starts or
+joins a campaign. The analyst decides once on the campaign in Needs you.
 
 <p align="center">
   <img src="img/hunting-flow.svg" alt="How this flows: an analytic finds a hit, hits on one entity form a lead, soc-ai hunts the lead and investigates the alerts and the threat findings, and a confirmed attack starts or joins a campaign that waits in Needs you" width="900">
@@ -113,16 +116,22 @@ You stay in control of every action that changes state.
 - **Reads run freely.** The agent pulls events, context, enrichment and packets
   without asking. A read changes nothing.
 - **Writes wait for a human.** A write acknowledges an alert, opens a case or
-  adds a comment. The agent recommends the write and you execute it with a
-  click. One exception is off until you turn it on. Set
+  adds a comment. The agent recommends the write, and the analyst executes the
+  write with a click. One exception is off by default. Set
   `auto_ack_fp_enabled=true` under Settings → Triage automation. The exception
   auto-acknowledges a confident false positive. The write needs high
-  confidence, and the investigation must have retrieved something first. It
-  never fires on a critical alert, or on a malware-class or exploit-class
-  alert. It fires on a high-severity alert only if each of these conditions is
-  true. The alert is a Suricata alert. The classification is policy violation
-  or inappropriate content. Each signature severity of the rule is
-  Informational. soc-ai audits every unattended write.
+  confidence, and the investigation must have retrieved something first.
+  soc-ai holds the write on a high-stakes alert. A high-stakes alert is
+  critical or high, has an exploit, attack or malware signal, or comes from a
+  decoy. A high-severity alert is not high-stakes only if each of these
+  conditions is true. The alert is a Suricata alert. The classification is
+  policy violation or inappropriate content. Each signature severity of the
+  rule is Informational. An analyst can lift the hold for one rule with a
+  standing rule decision. The term is `rule_decision_days`, and the default
+  is 30 days. The decision ends after the term or when the analyst ends the
+  decision. A true positive verdict on an investigation of the rule ends the
+  decision at once. Every other guard stays. soc-ai audits every unattended
+  write.
 - **No data leaves your network without your consent.** The reasoning runs on
   your own model and your own hardware. The Oracle is an optional cloud second
   opinion, and it is off by default. If you turn it on, soc-ai redacts

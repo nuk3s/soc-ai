@@ -1478,6 +1478,10 @@ def _finding_card_columns() -> Any:
         Investigation.verdict,
         Investigation.confidence,
         Investigation.is_fallback,
+        # The run half of the needs-you rule reads these two scalars
+        # (soc_ai.api.webui.action_rules.run_requests).
+        Investigation.is_synth_eval,
+        Investigation.started_by,
         Investigation.created_at,
         raiseload=True,
     )
@@ -2409,12 +2413,7 @@ async def standing_true_positives(
     and a third only when a run of the page has a follow-up.
     """
     conds = [
-        Investigation.status == "complete",
-        Investigation.verdict == "true_positive",
-        Investigation.is_fallback.isnot(True),
-        Investigation.is_synth_eval.isnot(True),
-        not_backtest(),
-        not_(superseded_sql()),
+        *_standing_conds(),
         Investigation.event_at >= since,
         Investigation.event_at <= until,
     ]
@@ -2431,22 +2430,104 @@ async def standing_true_positives(
     total = len(rows)
     if total >= limit:
         total = int(await db.scalar(select(func.count(Investigation.id)).where(*conds)) or 0)
-    answers = {inv.id: fid for inv in rows if (fid := follow_up_id(inv)) and fid != inv.id}
-    if answers:
-        live = set(
-            (
-                await db.scalars(
-                    select(Investigation.id).where(
-                        Investigation.id.in_(sorted(set(answers.values()))),
-                        Investigation.status.in_(_LIVE_STATUSES),
-                    )
-                )
-            ).all()
-        )
-        answered = {inv_id for inv_id, fid in answers.items() if fid in live}
+    answered = await _answered(db, rows)
+    if answered:
         rows = [inv for inv in rows if inv.id not in answered]
         total -= len(answered)
     return rows, max(total, 0)
+
+
+def _standing_conds() -> list[Any]:
+    """The SQL of a true positive that stands, with no window.
+
+    :func:`standing_true_positives` and :func:`standing_split` read it. A
+    run that a follow-up answered still passes it: :func:`_answered` takes
+    that run out.
+    """
+    return [
+        Investigation.status == "complete",
+        Investigation.verdict == "true_positive",
+        Investigation.is_fallback.isnot(True),
+        Investigation.is_synth_eval.isnot(True),
+        not_backtest(),
+        not_(superseded_sql()),
+    ]
+
+
+async def _answered(db: AsyncSession, rows: Sequence[Investigation]) -> set[str]:
+    """The ids among ``rows`` that a live follow-up run answered."""
+    answers = {inv.id: fid for inv in rows if (fid := follow_up_id(inv)) and fid != inv.id}
+    if not answers:
+        return set()
+    live = set(
+        (
+            await db.scalars(
+                select(Investigation.id).where(
+                    Investigation.id.in_(sorted(set(answers.values()))),
+                    Investigation.status.in_(_LIVE_STATUSES),
+                )
+            )
+        ).all()
+    )
+    return {inv_id for inv_id, fid in answers.items() if fid in live}
+
+
+async def answered_ids(db: AsyncSession, rows: Sequence[Investigation]) -> set[str]:
+    """The ids among ``rows`` that a live follow-up run answered.
+
+    The needs-you scan reads it, so a true positive that a follow-up
+    answered waits on no surface (:func:`standing_true_positives`).
+    """
+    return await _answered(db, rows)
+
+
+@dataclass(frozen=True)
+class StandingSplit:
+    """The true positive runs of a set, split by whether the verdict stands.
+
+    ``standing`` holds the runs that :func:`standing_true_positives` would
+    read. ``superseded`` holds the ids of the runs that a later run of the
+    same alert or finding replaced, or that a follow-up answered. ``other``
+    holds the rest: a run that is not complete, a synthetic run, a backtest
+    replay or a pipeline fallback.
+    """
+
+    standing: list[Investigation]
+    superseded: set[str]
+    other: set[str]
+
+
+async def standing_split(db: AsyncSession, run_ids: Iterable[str]) -> StandingSplit:
+    """Split a set of true positive run ids by the rule of :func:`standing_true_positives`.
+
+    The rule is the same, with no window. Three queries for each chunk of
+    500 ids, and a fourth when a run has a follow-up.
+    """
+    wanted = sorted({str(i) for i in run_ids if i})
+    standing: list[Investigation] = []
+    superseded: set[str] = set()
+    for start in range(0, len(wanted), 500):
+        chunk = wanted[start : start + 500]
+        found = list(
+            (
+                await db.scalars(
+                    select(Investigation).where(Investigation.id.in_(chunk), *_standing_conds())
+                )
+            ).all()
+        )
+        replaced = await db.scalars(
+            select(Investigation.id).where(Investigation.id.in_(chunk), superseded_sql())
+        )
+        superseded.update(str(i) for i in replaced.all())
+        answered = await _answered(db, found)
+        superseded.update(answered)
+        standing.extend(inv for inv in found if inv.id not in answered)
+    kept = {inv.id for inv in standing}
+    return StandingSplit(
+        standing=standing,
+        superseded=superseded,
+        other={i for i in wanted if i not in kept and i not in superseded},
+    )
 
 
 async def alert_event_times(db: AsyncSession, run_ids: Sequence[str]) -> dict[str, datetime]:

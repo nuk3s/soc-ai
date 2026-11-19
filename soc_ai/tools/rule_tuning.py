@@ -142,7 +142,7 @@ def _agg_count(agg: dict[str, Any] | None) -> int:
         "(the ES proxy for false-positive vs true-positive), and a "
         "mute/monitor/none recommendation with a one-line reason. Also reports "
         "whether the alerts arrived as a recurring rate or as a burst "
-        "(is_burst) — a burst is never a tuning problem, and may be the event "
+        "(is_burst). A burst is never a tuning problem, and may be the event "
         "worth investigating. READ-ONLY: it nominates, it does not change "
         "Security Onion."
     ),
@@ -280,8 +280,8 @@ async def suggest_rule_tuning(
         )
     elif shape.is_burst and span_seconds is not None:
         shape_clause = (
-            f" — all of it inside {burst.span_phrase(span_seconds)} on "
-            f"{burst.plural(active_days or 1, 'active day')}, one burst rather than a"
+            f", all of it inside {burst.span_phrase(span_seconds)} on "
+            f"{burst.plural(active_days or 1, 'active day')}, one burst with no"
             " recurring rate"
         )
     else:
@@ -313,7 +313,7 @@ async def suggest_rule_tuning(
     if alert_count == 0:
         scope += (
             f"; this tool reads {_DATASET} only, so a rule carried by any other "
-            "source reads 0 here whatever it is really doing — that is an absence "
+            "source reads 0 here whatever it is really doing. That is an absence "
             "of evidence, not evidence of absence"
         )
         # The same distinction, one axis over: a zero earned by excluding an
@@ -328,8 +328,8 @@ async def suggest_rule_tuning(
         absence_note = imports_note(imported)
     summary = (
         f"'{rule_name}' fired {alert_count}× in {lookback_days}d{shape_clause} "
-        f"({fp} acked-benign / {tp} escalated / {nmi} untriaged){scope} — "
-        f"recommendation: {recommendation}" + absence_note
+        f"({fp} acked-benign / {tp} escalated / {nmi} untriaged){scope}. "
+        f"Recommendation: {recommendation}." + absence_note
     )
 
     return {

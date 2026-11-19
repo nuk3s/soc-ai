@@ -44,9 +44,8 @@ import {
   ago,
   agoFromLabel,
   rangeToSinceUntil,
-  timeLabel,
-  utcStamp,
 } from "../lib/timeRange";
+import { RelTime } from "../components/RelTime";
 import { Checkbox } from "../components/Controls";
 import {
   EmptyState,
@@ -65,6 +64,7 @@ import {
   verdictFilterFromSearch,
 } from "../lib/investigationFilters";
 import { plural } from "../lib/plural";
+import { partPhrases, partTone } from "../lib/truePositiveParts";
 import { CHIP_RUN_CLASS } from "../lib/tooltips";
 import { demoBlocked, useDemo } from "../lib/demo";
 import { useAsync } from "../lib/useAsync";
@@ -330,6 +330,12 @@ export function authorizationFromSearch(search: string): number | null {
   return Number.isInteger(id) && id > 0 ? id : null;
 }
 
+/** The filter of the true positives that wait, from the link of the
+ *  Dashboard tile: `?waits=true` (round "decide once", DC3). */
+export function waitsFromSearch(search: string): boolean {
+  return new URLSearchParams(search).get("waits") === "true";
+}
+
 // ---------------------------------------------------------------------------
 // The filters in the URL
 // ---------------------------------------------------------------------------
@@ -359,6 +365,7 @@ const FILTER_PARAMS: readonly string[] = [
   "authorization",
   "view",
   "clock",
+  "waits",
 ];
 
 /** The window the list opens on when the URL names none. A verdict link
@@ -519,8 +526,32 @@ export function hostLogMachine(r: InvestigationRow): string | null {
   return r.kind === "sigma" ? address : null;
 }
 
-/** The flow cell. A host-log alert names its machine. A flow keeps the pair. */
+/** The hover of the host list of a finding investigation with no pair. */
+export const FINDING_HOSTS_TITLE =
+  'The hosts that the finding names. The record holds no source and no target, so the row shows no direction.';
+
+/** The flow cell. A host-log alert names its machine. A finding
+ *  investigation with no source names the hosts of its finding with no
+ *  arrow, as its page does: a row read "— → <address>" (dogfood N5). A flow
+ *  keeps the pair. */
 function FlowCell({ r, dim = false }: { r: InvestigationRow; dim?: boolean }) {
+  const findingHosts = r.findingHosts ?? [];
+  if (findingHosts.length > 0) {
+    return (
+      <span
+        data-testid={`finding-hosts-${r.id}`}
+        title={FINDING_HOSTS_TITLE}
+        className={`inline-flex min-w-0 max-w-full flex-wrap items-center gap-x-1.5 text-[12px] ${dim ? "opacity-70" : ""}`}
+      >
+        <span className="flex-none text-faint">hosts</span>
+        {findingHosts.map((h) => (
+          <span key={h} className="break-all font-mono text-mono-amber">
+            {h}
+          </span>
+        ))}
+      </span>
+    );
+  }
   const machine = hostLogMachine(r);
   if (machine) {
     return (
@@ -626,18 +657,19 @@ export function WhenCell({
   }
   const gap = r.ts ? new Date(r.ts).getTime() - new Date(event).getTime() : 0;
   const later = Number.isFinite(gap) && gap > INVESTIGATED_LATER_MS;
-  const title = r.ts
-    ? `Event ${utcStamp(event)}. Investigated ${utcStamp(r.ts)}.`
-    : `Event ${utcStamp(event)}.`;
+  // Each relative time states the UTC time and the local time in its
+  // tooltip (round 3 part 2, P1). The cell gave the UTC time alone.
   return (
-    <div className={className} title={title} data-testid={`when-${r.id}`}>
-      <div>{timeLabel(event).text}</div>
+    <div className={className} data-testid={`when-${r.id}`}>
+      <div>
+        <RelTime iso={event} what="Event" />
+      </div>
       {later && r.ts && (
         <div
           data-testid={`investigated-${r.id}`}
           className="font-sans text-[11px] text-faint"
         >
-          investigated {ago(r.ts)}
+          investigated <RelTime iso={r.ts} what="Investigated" />
         </div>
       )}
     </div>
@@ -851,6 +883,26 @@ export function Investigations() {
       setOffset(0);
     }
   }, [location.search]);
+  // The true positives that wait, from the link of the Dashboard tile. The
+  // server reads the rule of the tile, so the list holds the counted rows.
+  const [waitsOnly, setWaitsOnly] = useState(() => waitsFromSearch(location.search));
+  useEffect(() => {
+    if (waitsFromSearch(location.search)) {
+      setWaitsOnly(true);
+      setOffset(0);
+    }
+  }, [location.search]);
+  const clearWaitsFilter = () => {
+    setWaitsOnly(false);
+    setOffset(0);
+    const next = new URLSearchParams(location.search);
+    next.delete("waits");
+    const qs = next.toString();
+    navigate(`${location.pathname}${qs ? `?${qs}` : ""}`, {
+      replace: true,
+      state: FILTER_WRITE,
+    });
+  };
   const clearAuthorizationFilter = () => {
     setAuthorizationFilter(null);
     setOffset(0);
@@ -938,6 +990,7 @@ export function Investigations() {
       next.delete("entity_label");
     }
     if (authorizationFilter == null) next.delete("authorization");
+    if (!waitsOnly) next.delete("waits");
     const search = next.toString() ? `?${next.toString()}` : "";
     if (search !== location.search)
       setSearchParams(next, { replace: true, state: FILTER_WRITE });
@@ -960,6 +1013,7 @@ export function Investigations() {
     clock,
     entityFilter?.value,
     authorizationFilter,
+    waitsOnly,
   ]);
 
   // useAsync captures pauseWhen at setup and can't see `data` there, so track
@@ -987,12 +1041,17 @@ export function Investigations() {
         clock: clock === "investigated" ? "investigated" : undefined,
         entity: entityFilter?.value,
         authorization: authorizationFilter ?? undefined,
+        waits: waitsOnly || undefined,
+        // The true positives view states the parts of its true positives.
+        tpParts: view === "true_positives" || undefined,
         limit: PAGE_SIZE,
         offset,
       }),
     [
       entityFilter?.value ?? "",
       authorizationFilter ?? 0,
+      waitsOnly,
+      view,
       range,
       custom,
       filterVerdicts.join(","),
@@ -1403,6 +1462,7 @@ export function Investigations() {
     setClock(id === "failed" ? "investigated" : "event");
     setEntityFilter(null);
     setAuthorizationFilter(null);
+    setWaitsOnly(false);
     setOffset(0);
     views.clearActive();
   };
@@ -1458,6 +1518,7 @@ export function Investigations() {
     // counted.
     if (!entityFilterFromSearch(location.search)) setEntityFilter(null);
     if (authorizationFromSearch(location.search) == null) setAuthorizationFilter(null);
+    if (!waitsFromSearch(location.search)) setWaitsOnly(false);
     windowChosen.current = true;
     setWidenedFor(null);
     setRange(f.range ?? impliedRange(f.verdicts, demo));
@@ -1595,6 +1656,19 @@ export function Investigations() {
             clock,
           })}
         </div>
+        {view === "true_positives" && data?.truePositiveParts && (
+          <div data-testid="inv-tp-parts" className="mt-0.5 text-[12.5px] text-text-2">
+            {plural(data.truePositiveParts.total, "true positive")}.{" "}
+            {partPhrases(data.truePositiveParts).map((part, i) => (
+              <Fragment key={part.key}>
+                {i > 0 && " "}
+                <span data-part={part.key} className={partTone(part)}>
+                  {part.text}
+                </span>
+              </Fragment>
+            ))}
+          </div>
+        )}
         {widenedFor && (
           <div
             data-testid="window-widened"
@@ -1737,6 +1811,23 @@ export function Investigations() {
             </button>
           </span>
         )}
+        {waitsOnly && (
+          <span
+            data-testid="inv-waits-filter"
+            title="The list shows only the true positives that wait on a decision. The Dashboard tile counts these investigations."
+            className="flex items-center gap-1.5 rounded-chip border border-danger/40 bg-danger/10 px-2 py-1 text-[12px] font-semibold text-danger"
+          >
+            True positives that wait
+            <button
+              type="button"
+              aria-label="Clear the filter of the true positives that wait"
+              onClick={clearWaitsFilter}
+              className="rounded px-0.5 text-danger hover:bg-danger/20"
+            >
+              ×
+            </button>
+          </span>
+        )}
         {authorizationFilter != null && (
           <span
             data-testid="inv-authorization-filter"
@@ -1778,7 +1869,7 @@ export function Investigations() {
             { value: "inconclusive", label: "Inconclusive" },
             // No 'Untriaged' option — see VERDICT_FILTER_VALUES: an
             // uninvestigated group has no row on this list at all.
-            { value: "pipeline_error", label: "Pipeline error" },
+            { value: "pipeline_error", label: "Failed" },
           ]}
           value={filterVerdicts}
           onChange={(v) => {
@@ -2196,7 +2287,7 @@ export function Investigations() {
                   : filterStatuses.length
                     ? "No investigation matches the status filter in this time range."
                     : errorState
-                      ? "No investigation matches the pipeline error filter in this time range."
+                      ? "No failed investigation matches this time range."
                       : range === "30d" && !custom
                         ? "No investigations in the last 30 days."
                         : "No investigations in this time range. Widen the time range above."}
@@ -2376,6 +2467,17 @@ export function Investigations() {
                       className="mt-0.5 min-w-0 whitespace-normal break-words text-[12px] leading-[1.45] text-faint"
                     >
                       {r.headline.trim()}
+                    </div>
+                  )}
+                  {/* The reason of the impact chip when the guard lowered
+                    "succeeded": a title can claim success beside "Attempted"
+                    (dogfood 2026-11-17, AA3). */}
+                  {r.impactNote && (
+                    <div
+                      data-testid={`inv-impact-note-${r.id}`}
+                      className="mt-0.5 min-w-0 whitespace-normal break-words text-[11.5px] leading-[1.45] text-dim"
+                    >
+                      {r.impactNote}
                     </div>
                   )}
                   {/* A wide row: the flow under the name, as on the Alerts

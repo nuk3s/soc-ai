@@ -317,7 +317,7 @@ describe('Alerts on a healthy grid with nothing in the window (D2 control)', () 
     mount();
     await screen.findByText('No open detection in this window. The list hides acknowledged and escalated groups. Widen the time range.');
 
-    expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window');
+    expect(headerLine()).toBe('0 untriaged · 0 detections · 0 events in window · acknowledged alerts hidden');
     expect(footerLine()).toBe('0 detections · grouped · select a row to expand its events');
     expect(chipTexts()).toEqual(['Mine0', 'In review0', 'Critical0', 'Needs decision0', 'All0']);
     expect(screen.queryByText("Could not load this view")).toBeNull();

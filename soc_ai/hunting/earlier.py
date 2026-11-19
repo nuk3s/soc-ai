@@ -708,8 +708,17 @@ async def earlier_for_objective(
     )
 
 
+# The join of a spec finding title: an em dash or an en dash between spaces in
+# a title stored before round 3 part 2, a colon now (P5). The class is built
+# from code points: it reads stored data, and no prose here holds a dash.
+_OLD_TITLE_JOIN_RE = re.compile(rf"\s+[{chr(0x2014)}{chr(0x2013)}]\s+")
+
+
 def _title_key(finding: Mapping[str, Any]) -> str:
-    return " ".join(str(finding.get("title") or "").split()).casefold()
+    """The dedupe key of a finding title. A title stored with the old dash
+    join and the same title with the colon join are one key."""
+    text = _OLD_TITLE_JOIN_RE.sub(": ", str(finding.get("title") or ""))
+    return " ".join(text.split()).casefold()
 
 
 def _findings_of(run: Hunt) -> list[dict[str, Any]]:

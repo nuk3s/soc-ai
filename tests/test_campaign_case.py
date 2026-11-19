@@ -716,9 +716,13 @@ def test_the_rows_the_threats_and_the_link_carry_the_case(client: TestClient) ->
     opened_at = _campaign(client, campaign_id)["case"]["openedAt"]
     (row,) = client.get("/api/v1/campaigns").json()["rows"]
     assert (row["decision"], row["case"]) == ("case", {"openedAt": opened_at})
+    # A case is a decision in force: the campaign leaves the red list of the
+    # confirmed threats, and the decided line counts it (round "decide once").
     threats = client.get("/api/v1/threats", params={"since": "2000-01-01T00:00:00Z"}).json()
-    (threat,) = [c for c in threats["campaigns"] if c["id"] == campaign_id]
-    assert (threat["decision"], threat["case"]) == ("case", {"openedAt": opened_at})
+    assert [c for c in threats["campaigns"] if c["id"] == campaign_id] == []
+    assert threats["decided"]["campaigns"] == 1
+    assert threats["decided"]["investigations"] >= 1
+    assert row["state"] == "case"
     run_id = _campaign(client, campaign_id)["members"][0]["runId"]
     link = client.get(f"/api/v1/investigations/{run_id}").json()["campaign"]
     assert link["decision"] == "case"

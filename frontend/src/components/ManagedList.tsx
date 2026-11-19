@@ -55,13 +55,14 @@ function compactCount(n: number): string {
   return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
 }
 
-/** Best-effort short date from an ISO-ish timestamp; falls back to the raw string. */
+/** Best-effort short date from an ISO-ish timestamp, the UTC day with its
+ *  zone: "2026-06-20 UTC" (round 3, T3). Falls back to the raw string. */
 function shortDate(value: string): string {
   const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? value : d.toLocaleDateString();
+  return Number.isNaN(d.getTime()) ? value : `${d.toISOString().slice(0, 10)} UTC`;
 }
 
-/** "31 hosts · 9.2k events · last 6/20/2026" from a detected row's evidence. */
+/** "31 hosts · 9.2k events · last 2026-06-20 UTC" from a detected row's evidence. */
 function provenanceLine(row: IdentifierRow): string | null {
   const ev = row.evidence;
   if (!ev) return null;

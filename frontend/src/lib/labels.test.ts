@@ -14,6 +14,7 @@ import {
   VERDICT_OPTIONS,
   chipProps,
   confidenceMeta,
+  huntStopLabel,
   confidenceText,
   confidenceWord,
   huntOutcome,
@@ -268,5 +269,27 @@ describe('humanize', () => {
   it('turns a key into words', () => {
     expect(humanize('could_not_run')).toBe('Could not run');
     expect(humanize('')).toBe('');
+  });
+});
+
+// F5: the Hunts list, the hunt page, the lead page and the campaign fold read
+// "Could not run", "Stopped with an error after 14 steps" and "Failed" for one
+// hunt. One function gives the words of a hunt that stopped.
+describe('huntStopLabel', () => {
+  it('states the stop and the steps of a hunt that ran steps', () => {
+    expect(huntStopLabel({ status: 'error', steps: 14 })).toBe('Stopped with an error after 14 steps');
+    expect(huntStopLabel({ status: 'cancelled', steps: 1 })).toBe('Cancelled after 1 step');
+    expect(huntStopLabel({ status: 'interrupted', steps: 3 })).toBe('Interrupted after 3 steps');
+  });
+
+  it('keeps Could not run for a hunt with no step', () => {
+    expect(huntStopLabel({ status: 'error', steps: 0 })).toBe('Could not run');
+    expect(huntStopLabel({ status: 'error' })).toBe('Could not run');
+  });
+
+  it('gives no words for a hunt that did not stop', () => {
+    // Negative control: a complete hunt with steps states its outcome.
+    expect(huntStopLabel({ status: 'complete', steps: 9 })).toBeNull();
+    expect(huntStopLabel({ status: 'running', steps: 2 })).toBeNull();
   });
 });

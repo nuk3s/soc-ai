@@ -65,7 +65,7 @@ describe('CampaignLeadsHunts', () => {
     expect(screen.getByTestId('hunt-page')).toBeInTheDocument();
   });
 
-  it('marks each change that can start a hunt beside the hunts', () => {
+  it('marks each change beside the hunts, and fills the changes that can start a hunt', () => {
     mount({
       changes: [
         ...(CAMPAIGN_HUNTED.changes ?? []),
@@ -74,7 +74,8 @@ describe('CampaignLeadsHunts', () => {
     });
     const changes = screen.getAllByTestId('hunt-change-mark');
     // The formed change and the new machine sit five minutes apart: one mark at this scale.
-    expect(changes.map((c) => c.getAttribute('data-types'))).toEqual(['formed party', 'stage']);
+    expect(changes.map((c) => c.getAttribute('data-types'))).toEqual(['formed party', 'stage', 'decided']);
+    expect(changes.map((c) => c.getAttribute('data-starts'))).toEqual(['yes', 'yes', 'no']);
     // The stage change wears the color of the stage it reached.
     expect(changes[1].querySelector('rect')?.getAttribute('fill')).toBe(STAGE_COLOR.action);
     expect(changes[0].querySelector('rect')?.getAttribute('fill')).toBe('rgb(var(--text-2))');
@@ -82,8 +83,30 @@ describe('CampaignLeadsHunts', () => {
     const tip = screen.getByTestId('hunt-mark-tooltip');
     expect(tip).toHaveTextContent('soc-ai formed the campaign.');
     expect(tip).toHaveTextContent('2 new machines joined the campaign: db-1, mail-1.');
-    // NEGATIVE CONTROL: a decision starts no hunt, so it draws no mark here.
-    expect(changes.some((c) => (c.getAttribute('data-types') ?? '').includes('decided'))).toBe(false);
+    expect(tip).not.toHaveTextContent('This change starts no hunt.');
+    // NEGATIVE CONTROL: a decision starts no hunt. N11: the lane read empty
+    // beside a fold that listed a close, so the decision draws a hollow mark
+    // whose hover says that it starts no hunt.
+    expect(changes[2].querySelector('rect')?.getAttribute('fill')).toBe('rgb(var(--surface-1))');
+    fireEvent.focus(within(changes[2]).getByRole('img'));
+    expect(screen.getByTestId('hunt-mark-tooltip')).toHaveTextContent('This change starts no hunt.');
+  });
+
+  it('reaches the newest change on the time axis', () => {
+    // N11: two changes after the newest hunt. The axis reaches them.
+    mount({
+      changes: [
+        ...(CAMPAIGN_HUNTED.changes ?? []),
+        { id: 9, type: 'decided', at: '2026-11-15T01:01:00Z', detail: { decision: 'closed', by: 'admin' } },
+      ],
+    });
+    const hunts = screen.getAllByTestId('hunt-mark');
+    const newestHunt = Math.max(...hunts.map(x));
+    const closed = screen.getAllByTestId('hunt-change-mark').find((c) => c.getAttribute('data-types') === 'decided')!;
+    expect(x(closed)).toBeGreaterThan(newestHunt);
+    // The mark sits on the plot, inside the width of the chart.
+    const width = Number(screen.getByTestId('campaign-hunt-marks').querySelector('svg')?.getAttribute('width'));
+    expect(x(closed)).toBeLessThan(width);
   });
 
   it('joins two hunts that sit too close to draw apart, and lists both in the hover', () => {
@@ -167,5 +190,24 @@ describe('CampaignLeadsHunts', () => {
     }
     expect(found).toEqual([]);
     expect(root.textContent).not.toMatch(/\bkinds?\b/i);
+  });
+
+  // F5: the fold read "Failed" for a hunt that the lead page states as
+  // "Stopped with an error after 14 steps". The fold reads the one function.
+  it('states the steps of a hunt that stopped, as the hunt page does', () => {
+    mount({
+      hunts: [
+        { id: 'hunt-stop', starter: 'lead', status: 'error', startedAt: '2026-10-28T22:52:00Z', findings: 0, threatFindings: 0, steps: 14 },
+        { id: 'hunt-none', starter: 'lead', status: 'error', startedAt: '2026-10-27T22:52:00Z', findings: 0, threatFindings: 0, steps: 0 },
+        ...CAMPAIGN_HUNTS,
+      ],
+    });
+    expect(screen.getByTestId('campaign-hunt-hunt-stop')).toHaveTextContent('Stopped with an error after 14 steps');
+    expect(screen.getByTestId('campaign-hunt-hunt-none')).toHaveTextContent('Could not run');
+    for (const id of ['hunt-stop', 'hunt-none']) {
+      expect(screen.getByTestId(`campaign-hunt-${id}`)).not.toHaveTextContent('Failed');
+    }
+    // Negative control: a complete hunt keeps its status word.
+    expect(screen.getByTestId('campaign-hunt-hunt-stage')).toHaveTextContent('Complete');
   });
 });

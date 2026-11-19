@@ -89,10 +89,10 @@ describe('tooltip vocabulary', () => {
 
   it('names whose severity a chip shows', () => {
     expect(TIP.severityTitle('High')).toBe(
-      'Rule severity: High. The detection rule that raised the alert sets it.',
+      'Alert severity: High. Security Onion records this level on the alert. The rule that raised the alert sets it.',
     );
     expect(TIP.severityTitle('Unknown')).toBe(
-      'Rule severity: none. The alert document carries no severity label.',
+      'Alert severity: none. The alert document carries no severity label.',
     );
     expect(TIP.severityTitle('High', 'finding')).toBe('Finding severity: High. The hunt reported it.');
   });

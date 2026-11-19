@@ -371,7 +371,7 @@ def format_inventory_block(inv: GridInventory) -> str:
             body = "no live events"
         if d.imported_count:
             body += f" · {_humanize_count(d.imported_count)} imported"
-        lines.append(f"- `{d.predicate}` — {body}{cat}")
+        lines.append(f"- `{d.predicate}`: {body}{cat}")
     return "\n".join(lines)
 
 

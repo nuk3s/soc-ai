@@ -62,6 +62,63 @@ describe('investigationLines', () => {
     ]);
   });
 
+  // Round 3 part 2 (W2): the true positives that the earlier close of a
+  // reopened campaign covered are a neutral line to the campaign.
+  it('states the true positives that the close of a reopened campaign covered as a neutral line', () => {
+    const parts = {
+      total: 30,
+      waiting: 2,
+      decided: 0,
+      authorized: 0,
+      superseded: 0,
+      other: 0,
+      campaigns: [],
+      earlier: 28,
+      earlierCampaigns: [
+        { id: 2, title: 'actor-a against web-1', investigations: 28, decision: 'closed', decidedAt: '2026-11-15T01:01:12Z' },
+      ],
+    };
+    const lines = investigationLines(40, 30, '/investigations?entity=ip%3Am1&range=all', parts);
+    expect(lines.map((l) => [l.text, l.tone, l.to])).toEqual([
+      ['2 true positive investigations of this host wait.', 'alarm', '/investigations?entity=ip%3Am1&range=all&verdict=true_positive&waits=true'],
+      [
+        '28 true positive investigations of this host are in a campaign that opened again. The close of 2026-11-15 covered them.',
+        'info',
+        '/campaigns/2',
+      ],
+    ]);
+  });
+
+  // Round "decide once" (DC5): the line splits by the parts of the true positives.
+  it('splits the line: the ones that wait as an alarm, the decided ones as a neutral line to the campaign', () => {
+    const parts = {
+      total: 51,
+      waiting: 3,
+      decided: 46,
+      authorized: 0,
+      superseded: 2,
+      other: 0,
+      campaigns: [{ id: 2, title: 'actor-a against web-1', state: 'closed', investigations: 46 }],
+    };
+    expect(investigationLines(139, 51, '/investigations?entity=ip%3Am1&range=all', parts)).toEqual([
+      {
+        text: '3 true positive investigations of this host wait.',
+        to: '/investigations?entity=ip%3Am1&range=all&verdict=true_positive&waits=true',
+        tone: 'alarm',
+        scope: 'all time',
+      },
+      {
+        text: '46 true positive investigations of this host are in a decided campaign.',
+        to: '/campaigns/2',
+        tone: 'info',
+        scope: 'all time',
+      },
+    ]);
+    // NEGATIVE CONTROL: nothing waits, so no line is an alarm.
+    const quiet = investigationLines(139, 51, '/x', { ...parts, waiting: 0, decided: 49 });
+    expect(quiet.map((l) => l.tone)).toEqual(['info']);
+  });
+
   it('adds no line when no investigation reached a true positive', () => {
     // NEGATIVE CONTROL: the block below the hero carries the count.
     expect(investigationLines(7, 0, '/x')).toEqual([]);

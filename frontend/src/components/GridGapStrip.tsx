@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { getGridGaps } from '../lib/api';
 import { cn } from '../lib/cn';
 import { plural } from '../lib/plural';
-import { absoluteTime, rangeToSinceUntil } from '../lib/timeRange';
+import { rangeToSinceUntil, utcStamp } from '../lib/timeRange';
 import type { GridGap } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import { GridGapReviewDrawer } from './GridGapReview';
@@ -33,12 +33,12 @@ import type { CustomRange } from './TimeRangeFilter';
  *  screen within a few minutes of the grid coming back. */
 const REFETCH_MS = 300_000;
 
-/** A gap edge in the console's one absolute format, with its zone:
- *  "2026-10-15 09:36 EDT". The strip said "Oct 18 14:00 UTC" above a
+/** A gap edge in the console's one absolute format, UTC with its zone:
+ *  "2026-10-15 13:36 UTC". The strip said "Oct 18 14:00 UTC" above a
  *  Dashboard panel that said "2026-10-19 09:15 EDT" (dogfood 2026-10-19,
- *  V1-S5). */
+ *  V1-S5). The one format is UTC since round 3, T3. */
 export function gapTime(iso: string): string {
-  return absoluteTime(iso);
+  return utcStamp(iso);
 }
 
 /** The plane of a sweep gap as the console writes it. The server holds the

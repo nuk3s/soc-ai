@@ -15720,6 +15720,674 @@
    ]
   },
   {
+   "id": "01DEMO3W000REGWFX93CGB0NBR",
+   "alert_es_id": "866MCMNvZfetE0tqSkdg",
+   "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+   "verdict": "false_positive",
+   "confidence": 0.86,
+   "rationale": null,
+   "summary": "ws-mkt-01 (10.20.10.21) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+   "report": {
+    "verdict": "false_positive",
+    "confidence": 0.86,
+    "summary": "ws-mkt-01 (10.20.10.21) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+    "citations": [
+     "tool t_query_events_oql returned 7 hits"
+    ],
+    "recommended_actions": [
+     {
+      "tool_name": "ack_alert",
+      "tool_args": {
+       "alert_id": "866MCMNvZfetE0tqSkdg"
+      },
+      "rationale": "A known backup client on its normal schedule."
+     }
+    ],
+    "field_reconciliation": null,
+    "validator_note": null,
+    "local_verdict": null
+   },
+   "src_ip": "10.20.10.21",
+   "dest_ip": "198.51.100.44",
+   "community_id": "1:VeEOhREv45CK/wEcmoexAm5YiGg=",
+   "status": "complete",
+   "started_by": "auto-triage",
+   "is_fallback": false,
+   "created_at": "2026-10-22T05:00:00",
+   "finished_at": "2026-10-22T05:01:48",
+   "events": [
+    {
+     "kind": "session_start",
+     "sequence": 1,
+     "payload": {
+      "alert_id": "866MCMNvZfetE0tqSkdg",
+      "pipeline": "synth_first"
+     }
+    },
+    {
+     "kind": "enriched_alert_context",
+     "sequence": 2,
+     "payload": {
+      "alert": {
+       "id": "866MCMNvZfetE0tqSkdg",
+       "timestamp": "2026-10-22T04:57:00.000Z",
+       "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+       "rule_uuid": null,
+       "severity_label": "high",
+       "severity_score": 3,
+       "network_community_id": "1:VeEOhREv45CK/wEcmoexAm5YiGg=",
+       "source_ip": "10.20.10.21",
+       "source_port": 51001,
+       "destination_ip": "198.51.100.44",
+       "destination_port": 443,
+       "host_name": "so-sensor-1",
+       "host_ip": [],
+       "user_name": null,
+       "message": null,
+       "tags": [],
+       "event_action": null,
+       "alert_action": "allowed",
+       "classtype": "Potential Corporate Privacy Violation",
+       "event_module": "suricata",
+       "event_dataset": "suricata.alert",
+       "event_category": "network"
+      },
+      "community_id_events": [],
+      "host_events": [],
+      "user_events": [],
+      "process_events": [],
+      "file_events": [],
+      "pivot_summary": null,
+      "host_alert_profile": null,
+      "prefetch_gaps": [],
+      "typed_zeek": null,
+      "enrichments": {}
+     }
+    },
+    {
+     "kind": "decision_template_match",
+     "sequence": 3,
+     "payload": {
+      "matched": false,
+      "template_id": null,
+      "verdict": null
+     }
+    },
+    {
+     "kind": "synth_round1_skipped",
+     "sequence": 4,
+     "payload": {
+      "reason": "definitely_investigate"
+     }
+    },
+    {
+     "kind": "investigation_loop_entered",
+     "sequence": 5,
+     "payload": {
+      "reason": "definitely_investigate",
+      "round1_verdict": null,
+      "round1_confidence": null
+     }
+    },
+    {
+     "kind": "model_response",
+     "sequence": 6,
+     "payload": {
+      "content": "I check whether ws-mkt-01 syncs to this service every day.",
+      "reasoning_trace": ""
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 7,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "args": "{\"query\": \"source.ip:10.20.10.21 AND destination.ip:198.51.100.44\", \"time_range_minutes\": 10080}",
+      "tool_call_id": "call-gb0nbr-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 8,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "result": {
+       "total": 7,
+       "summary": "one sync session each day of the week"
+      },
+      "tool_call_id": "call-gb0nbr-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "investigation_transcript",
+     "sequence": 9,
+     "payload": {
+      "round": 1,
+      "phase": "investigation_loop",
+      "evidence": [
+       "ws-mkt-01 syncs to 198.51.100.44 each day (tool t_query_events_oql)"
+      ],
+      "tentative_verdict": "false_positive",
+      "tentative_summary": "ws-mkt-01 (10.20.10.21) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule."
+     }
+    },
+    {
+     "kind": "citation_validation",
+     "sequence": 10,
+     "payload": {
+      "round": 1,
+      "counts": {
+       "valid": 1,
+       "strict": 1,
+       "semantic": 0
+      },
+      "total": 1,
+      "invalid_examples": [],
+      "valid_citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "coverage_ratio": 1.0,
+      "invalid_ratio": 0.0,
+      "per_citation": [
+       {
+        "citation": "tool t_query_events_oql returned 7 hits",
+        "kind": "tool",
+        "resolved": true,
+        "resolution_kind": "strict_tool"
+       }
+      ]
+     }
+    },
+    {
+     "kind": "triage_report",
+     "sequence": 11,
+     "payload": {
+      "verdict": "false_positive",
+      "confidence": 0.86,
+      "summary": "ws-mkt-01 (10.20.10.21) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+      "citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "recommended_actions": [
+       {
+        "tool_name": "ack_alert",
+        "tool_args": {
+         "alert_id": "866MCMNvZfetE0tqSkdg"
+        },
+        "rationale": "A known backup client on its normal schedule."
+       }
+      ],
+      "field_reconciliation": null,
+      "validator_note": null,
+      "local_verdict": null
+     }
+    },
+    {
+     "kind": "auto_ack_skipped",
+     "sequence": 12,
+     "payload": {
+      "es_id": "866MCMNvZfetE0tqSkdg",
+      "reason": "high_stakes",
+      "confidence": 0.86,
+      "threshold": 0.7
+     }
+    },
+    {
+     "kind": "done",
+     "sequence": 13,
+     "payload": {
+      "recommended_count": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "01DEMO29425DAYGSR564DY7FRV",
+   "alert_es_id": "uruE3LpSq7Fk0YcTRAek",
+   "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+   "verdict": "false_positive",
+   "confidence": 0.83,
+   "rationale": null,
+   "summary": "ws-hr-01 (10.20.10.31) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+   "report": {
+    "verdict": "false_positive",
+    "confidence": 0.83,
+    "summary": "ws-hr-01 (10.20.10.31) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+    "citations": [
+     "tool t_query_events_oql returned 7 hits"
+    ],
+    "recommended_actions": [
+     {
+      "tool_name": "ack_alert",
+      "tool_args": {
+       "alert_id": "uruE3LpSq7Fk0YcTRAek"
+      },
+      "rationale": "A known backup client on its normal schedule."
+     }
+    ],
+    "field_reconciliation": null,
+    "validator_note": null,
+    "local_verdict": null
+   },
+   "src_ip": "10.20.10.31",
+   "dest_ip": "198.51.100.44",
+   "community_id": "1:DxD3hzsOTrKNeEGm6igc+z5TgKQ=",
+   "status": "complete",
+   "started_by": "auto-triage",
+   "is_fallback": false,
+   "created_at": "2026-10-21T05:00:00",
+   "finished_at": "2026-10-21T05:01:48",
+   "events": [
+    {
+     "kind": "session_start",
+     "sequence": 1,
+     "payload": {
+      "alert_id": "uruE3LpSq7Fk0YcTRAek",
+      "pipeline": "synth_first"
+     }
+    },
+    {
+     "kind": "enriched_alert_context",
+     "sequence": 2,
+     "payload": {
+      "alert": {
+       "id": "uruE3LpSq7Fk0YcTRAek",
+       "timestamp": "2026-10-21T04:57:00.000Z",
+       "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+       "rule_uuid": null,
+       "severity_label": "high",
+       "severity_score": 3,
+       "network_community_id": "1:DxD3hzsOTrKNeEGm6igc+z5TgKQ=",
+       "source_ip": "10.20.10.31",
+       "source_port": 51002,
+       "destination_ip": "198.51.100.44",
+       "destination_port": 443,
+       "host_name": "so-sensor-1",
+       "host_ip": [],
+       "user_name": null,
+       "message": null,
+       "tags": [],
+       "event_action": null,
+       "alert_action": "allowed",
+       "classtype": "Potential Corporate Privacy Violation",
+       "event_module": "suricata",
+       "event_dataset": "suricata.alert",
+       "event_category": "network"
+      },
+      "community_id_events": [],
+      "host_events": [],
+      "user_events": [],
+      "process_events": [],
+      "file_events": [],
+      "pivot_summary": null,
+      "host_alert_profile": null,
+      "prefetch_gaps": [],
+      "typed_zeek": null,
+      "enrichments": {}
+     }
+    },
+    {
+     "kind": "decision_template_match",
+     "sequence": 3,
+     "payload": {
+      "matched": false,
+      "template_id": null,
+      "verdict": null
+     }
+    },
+    {
+     "kind": "synth_round1_skipped",
+     "sequence": 4,
+     "payload": {
+      "reason": "definitely_investigate"
+     }
+    },
+    {
+     "kind": "investigation_loop_entered",
+     "sequence": 5,
+     "payload": {
+      "reason": "definitely_investigate",
+      "round1_verdict": null,
+      "round1_confidence": null
+     }
+    },
+    {
+     "kind": "model_response",
+     "sequence": 6,
+     "payload": {
+      "content": "I check whether ws-hr-01 syncs to this service every day.",
+      "reasoning_trace": ""
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 7,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "args": "{\"query\": \"source.ip:10.20.10.31 AND destination.ip:198.51.100.44\", \"time_range_minutes\": 10080}",
+      "tool_call_id": "call-dy7frv-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 8,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "result": {
+       "total": 7,
+       "summary": "one sync session each day of the week"
+      },
+      "tool_call_id": "call-dy7frv-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "investigation_transcript",
+     "sequence": 9,
+     "payload": {
+      "round": 1,
+      "phase": "investigation_loop",
+      "evidence": [
+       "ws-hr-01 syncs to 198.51.100.44 each day (tool t_query_events_oql)"
+      ],
+      "tentative_verdict": "false_positive",
+      "tentative_summary": "ws-hr-01 (10.20.10.31) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule."
+     }
+    },
+    {
+     "kind": "citation_validation",
+     "sequence": 10,
+     "payload": {
+      "round": 1,
+      "counts": {
+       "valid": 1,
+       "strict": 1,
+       "semantic": 0
+      },
+      "total": 1,
+      "invalid_examples": [],
+      "valid_citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "coverage_ratio": 1.0,
+      "invalid_ratio": 0.0,
+      "per_citation": [
+       {
+        "citation": "tool t_query_events_oql returned 7 hits",
+        "kind": "tool",
+        "resolved": true,
+        "resolution_kind": "strict_tool"
+       }
+      ]
+     }
+    },
+    {
+     "kind": "triage_report",
+     "sequence": 11,
+     "payload": {
+      "verdict": "false_positive",
+      "confidence": 0.83,
+      "summary": "ws-hr-01 (10.20.10.31) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+      "citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "recommended_actions": [
+       {
+        "tool_name": "ack_alert",
+        "tool_args": {
+         "alert_id": "uruE3LpSq7Fk0YcTRAek"
+        },
+        "rationale": "A known backup client on its normal schedule."
+       }
+      ],
+      "field_reconciliation": null,
+      "validator_note": null,
+      "local_verdict": null
+     }
+    },
+    {
+     "kind": "done",
+     "sequence": 12,
+     "payload": {
+      "recommended_count": 1
+     }
+    }
+   ]
+  },
+  {
+   "id": "01DEMO7EB39C8XTJJFHECWMY2H",
+   "alert_es_id": "rCLL9t1Ha64jsRD85ML3",
+   "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+   "verdict": "false_positive",
+   "confidence": 0.55,
+   "rationale": null,
+   "summary": "ws-eng-03 (10.20.10.33) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+   "report": {
+    "verdict": "false_positive",
+    "confidence": 0.55,
+    "summary": "ws-eng-03 (10.20.10.33) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+    "citations": [
+     "tool t_query_events_oql returned 7 hits"
+    ],
+    "recommended_actions": [
+     {
+      "tool_name": "ack_alert",
+      "tool_args": {
+       "alert_id": "rCLL9t1Ha64jsRD85ML3"
+      },
+      "rationale": "A known backup client on its normal schedule."
+     }
+    ],
+    "field_reconciliation": null,
+    "validator_note": null,
+    "local_verdict": null
+   },
+   "src_ip": "10.20.10.33",
+   "dest_ip": "198.51.100.44",
+   "community_id": "1:rxncUFls9YNzIs+Pgi/Bhdj0lhg=",
+   "status": "complete",
+   "started_by": "auto-triage",
+   "is_fallback": false,
+   "created_at": "2026-10-20T08:00:00",
+   "finished_at": "2026-10-20T08:01:48",
+   "events": [
+    {
+     "kind": "session_start",
+     "sequence": 1,
+     "payload": {
+      "alert_id": "rCLL9t1Ha64jsRD85ML3",
+      "pipeline": "synth_first"
+     }
+    },
+    {
+     "kind": "enriched_alert_context",
+     "sequence": 2,
+     "payload": {
+      "alert": {
+       "id": "rCLL9t1Ha64jsRD85ML3",
+       "timestamp": "2026-10-20T07:57:00.000Z",
+       "rule_name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+       "rule_uuid": null,
+       "severity_label": "high",
+       "severity_score": 3,
+       "network_community_id": "1:rxncUFls9YNzIs+Pgi/Bhdj0lhg=",
+       "source_ip": "10.20.10.33",
+       "source_port": 51003,
+       "destination_ip": "198.51.100.44",
+       "destination_port": 443,
+       "host_name": "so-sensor-1",
+       "host_ip": [],
+       "user_name": null,
+       "message": null,
+       "tags": [],
+       "event_action": null,
+       "alert_action": "allowed",
+       "classtype": "Potential Corporate Privacy Violation",
+       "event_module": "suricata",
+       "event_dataset": "suricata.alert",
+       "event_category": "network"
+      },
+      "community_id_events": [],
+      "host_events": [],
+      "user_events": [],
+      "process_events": [],
+      "file_events": [],
+      "pivot_summary": null,
+      "host_alert_profile": null,
+      "prefetch_gaps": [],
+      "typed_zeek": null,
+      "enrichments": {}
+     }
+    },
+    {
+     "kind": "decision_template_match",
+     "sequence": 3,
+     "payload": {
+      "matched": false,
+      "template_id": null,
+      "verdict": null
+     }
+    },
+    {
+     "kind": "synth_round1_skipped",
+     "sequence": 4,
+     "payload": {
+      "reason": "definitely_investigate"
+     }
+    },
+    {
+     "kind": "investigation_loop_entered",
+     "sequence": 5,
+     "payload": {
+      "reason": "definitely_investigate",
+      "round1_verdict": null,
+      "round1_confidence": null
+     }
+    },
+    {
+     "kind": "model_response",
+     "sequence": 6,
+     "payload": {
+      "content": "I check whether ws-eng-03 syncs to this service every day.",
+      "reasoning_trace": ""
+     }
+    },
+    {
+     "kind": "tool_call",
+     "sequence": 7,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "args": "{\"query\": \"source.ip:10.20.10.33 AND destination.ip:198.51.100.44\", \"time_range_minutes\": 10080}",
+      "tool_call_id": "call-cwmy2h-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "tool_result",
+     "sequence": 8,
+     "payload": {
+      "tool_name": "t_query_events_oql",
+      "result": {
+       "total": 7,
+       "summary": "one sync session each day of the week"
+      },
+      "tool_call_id": "call-cwmy2h-1",
+      "phase": "investigation_loop",
+      "round": 1
+     }
+    },
+    {
+     "kind": "investigation_transcript",
+     "sequence": 9,
+     "payload": {
+      "round": 1,
+      "phase": "investigation_loop",
+      "evidence": [
+       "ws-eng-03 syncs to 198.51.100.44 each day (tool t_query_events_oql)"
+      ],
+      "tentative_verdict": "false_positive",
+      "tentative_summary": "ws-eng-03 (10.20.10.33) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule."
+     }
+    },
+    {
+     "kind": "citation_validation",
+     "sequence": 10,
+     "payload": {
+      "round": 1,
+      "counts": {
+       "valid": 1,
+       "strict": 1,
+       "semantic": 0
+      },
+      "total": 1,
+      "invalid_examples": [],
+      "valid_citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "coverage_ratio": 1.0,
+      "invalid_ratio": 0.0,
+      "per_citation": [
+       {
+        "citation": "tool t_query_events_oql returned 7 hits",
+        "kind": "tool",
+        "resolved": true,
+        "resolution_kind": "strict_tool"
+       }
+      ]
+     }
+    },
+    {
+     "kind": "triage_report",
+     "sequence": 11,
+     "payload": {
+      "verdict": "false_positive",
+      "confidence": 0.55,
+      "summary": "ws-eng-03 (10.20.10.33) synced files to the backup service at 198.51.100.44. The client of the service runs on the workstations of the team, and the flow matches its normal schedule.",
+      "citations": [
+       "tool t_query_events_oql returned 7 hits"
+      ],
+      "recommended_actions": [
+       {
+        "tool_name": "ack_alert",
+        "tool_args": {
+         "alert_id": "rCLL9t1Ha64jsRD85ML3"
+        },
+        "rationale": "A known backup client on its normal schedule."
+       }
+      ],
+      "field_reconciliation": null,
+      "validator_note": null,
+      "local_verdict": null
+     }
+    },
+    {
+     "kind": "auto_ack_skipped",
+     "sequence": 12,
+     "payload": {
+      "es_id": "rCLL9t1Ha64jsRD85ML3",
+      "reason": "below_threshold",
+      "confidence": 0.55,
+      "threshold": 0.7
+     }
+    },
+    {
+     "kind": "done",
+     "sequence": 13,
+     "payload": {
+      "recommended_count": 1
+     }
+    }
+   ]
+  },
+  {
    "id": "01DEMOHTJ6ERDECEC13462CNX3",
    "alert_es_id": "XFqAXKB8BmVx78gVsUGF",
    "rule_name": "ET INFO External IP Lookup Domain (ipify .org) in DNS Lookup",
@@ -38661,6 +39329,30 @@
     "created_at": "2026-09-28T12:00:00",
     "updated_at": "2026-10-18T12:00:00"
    }
+  ],
+  "rule_decisions": [
+   {
+    "id": 1,
+    "rule_name": "ET INFO External IP Lookup Domain (ipify .org) in DNS Lookup",
+    "decision": "standing",
+    "include_weak": false,
+    "note": "The IP lookups of the marketing tools. Known.",
+    "decided_by": "j.chen",
+    "decided_at": "2026-10-16T12:00:00",
+    "state": "done",
+    "alerts": 17,
+    "failed": 0,
+    "investigations": 1,
+    "acknowledged": 4,
+    "finished_at": "2026-10-16T12:01:00",
+    "ends_at": "2026-11-15T12:00:00",
+    "detail": {
+     "selected": 1,
+     "held": 0,
+     "cluster": 16,
+     "already": 0
+    }
+   }
   ]
  },
  "autotriage": {
@@ -39099,6 +39791,135 @@
     },
     "network": {
      "community_id": "1:m+fMJQ+jPuC6QOT+CKwvSmCnOIM=",
+     "transport": "tcp"
+    },
+    "host": {
+     "name": "so-sensor-1"
+    },
+    "observer": {
+     "name": "so-sensor-1"
+    }
+   }
+  },
+  {
+   "_index": "logs-suricata.alert-default",
+   "_id": "866MCMNvZfetE0tqSkdg",
+   "_source": {
+    "@timestamp": "2026-10-22T04:57:00.000Z",
+    "event": {
+     "kind": "alert",
+     "dataset": "suricata.alert",
+     "module": "suricata",
+     "category": "network",
+     "severity": 3,
+     "severity_label": "high",
+     "acknowledged": false,
+     "escalated": false
+    },
+    "tags": [
+     "alert"
+    ],
+    "rule": {
+     "name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+     "uuid": null,
+     "category": "Potential Corporate Privacy Violation"
+    },
+    "source": {
+     "ip": "10.20.10.21",
+     "port": 51001
+    },
+    "destination": {
+     "ip": "198.51.100.44",
+     "port": 443
+    },
+    "network": {
+     "community_id": "1:VeEOhREv45CK/wEcmoexAm5YiGg=",
+     "transport": "tcp"
+    },
+    "host": {
+     "name": "so-sensor-1"
+    },
+    "observer": {
+     "name": "so-sensor-1"
+    }
+   }
+  },
+  {
+   "_index": "logs-suricata.alert-default",
+   "_id": "uruE3LpSq7Fk0YcTRAek",
+   "_source": {
+    "@timestamp": "2026-10-21T04:57:00.000Z",
+    "event": {
+     "kind": "alert",
+     "dataset": "suricata.alert",
+     "module": "suricata",
+     "category": "network",
+     "severity": 3,
+     "severity_label": "high",
+     "acknowledged": false,
+     "escalated": false
+    },
+    "tags": [
+     "alert"
+    ],
+    "rule": {
+     "name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+     "uuid": null,
+     "category": "Potential Corporate Privacy Violation"
+    },
+    "source": {
+     "ip": "10.20.10.31",
+     "port": 51002
+    },
+    "destination": {
+     "ip": "198.51.100.44",
+     "port": 443
+    },
+    "network": {
+     "community_id": "1:DxD3hzsOTrKNeEGm6igc+z5TgKQ=",
+     "transport": "tcp"
+    },
+    "host": {
+     "name": "so-sensor-1"
+    },
+    "observer": {
+     "name": "so-sensor-1"
+    }
+   }
+  },
+  {
+   "_index": "logs-suricata.alert-default",
+   "_id": "rCLL9t1Ha64jsRD85ML3",
+   "_source": {
+    "@timestamp": "2026-10-20T07:57:00.000Z",
+    "event": {
+     "kind": "alert",
+     "dataset": "suricata.alert",
+     "module": "suricata",
+     "category": "network",
+     "severity": 3,
+     "severity_label": "high",
+     "acknowledged": false,
+     "escalated": false
+    },
+    "tags": [
+     "alert"
+    ],
+    "rule": {
+     "name": "ET POLICY Dropbox.com Offsite File Backup in Use",
+     "uuid": null,
+     "category": "Potential Corporate Privacy Violation"
+    },
+    "source": {
+     "ip": "10.20.10.33",
+     "port": 51003
+    },
+    "destination": {
+     "ip": "198.51.100.44",
+     "port": 443
+    },
+    "network": {
+     "community_id": "1:rxncUFls9YNzIs+Pgi/Bhdj0lhg=",
      "transport": "tcp"
     },
     "host": {

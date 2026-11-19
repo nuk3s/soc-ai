@@ -225,8 +225,8 @@ def _empty_result(summary: str, evidence: dict[str, Any], provenance: Provenance
     description=(
         "Local first-seen / prevalence oracle: has this host talked to this "
         "dest/domain before, and how rare is it? Learned from the events index "
-        "only (no external calls), over this grid's own live telemetry — "
-        "imported captures and replayed corpora are not part of the baseline."
+        "only (no external calls), over this grid's own live telemetry. "
+        "Imported captures and replayed corpora are not part of the baseline."
     ),
 )
 async def prevalence(
@@ -404,7 +404,7 @@ async def prevalence(
         evidence["imported_matches"] = imported
         summary = (
             f"No prior events for {subject} in the last {lookback_days}d "
-            f"({denominator_note(provenance)}) — first-seen (no baseline). "
+            f"({denominator_note(provenance)}). First-seen, with no baseline. "
             f"This pairing/host appears novel." + imports_note(imported)
         )
         return _empty_result(summary, evidence, provenance)
@@ -438,18 +438,19 @@ async def prevalence(
     if is_novel:
         summary = (
             f"{subject}: seen on a single day only "
-            f"({count_str} event(s), first/last {first_seen}, {scope}) — novel, no baseline."
+            f"({count_str} event(s), first/last {first_seen}, {scope}). It is novel and "
+            "has no baseline."
         )
     elif rarity == "concentrated":
         summary = (
-            f"{subject}: concentrated — {count_str} event(s) packed into just "
+            f"{subject}: concentrated. {count_str} event(s) packed into only "
             f"{distinct_days} distinct day(s) (first {first_seen}, last {last_seen}) "
             f"in the last {lookback_days}d, {scope}. Heavy short-span activity, not a "
             f"long-running baseline."
         )
     else:
         summary = (
-            f"{subject}: {rarity} — {count_str} event(s) across {distinct_days} "
+            f"{subject}: {rarity}. {count_str} event(s) across {distinct_days} "
             f"distinct day(s) (first {first_seen}, last {last_seen}) in the last "
             f"{lookback_days}d, {scope}."
         )

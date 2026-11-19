@@ -4704,7 +4704,7 @@ class TestAutoInvestigateHealth:
         rows = _rows()
         row = rows[f"inv-failed:{fallback}"]
         assert row["tone"] == "danger"
-        assert row["title"] == "Triage failed, pipeline error: ET FALLBACK rule"
+        assert row["title"] == "Triage failed: ET FALLBACK rule"
         assert row["href"] == f"/investigation/{fallback}"
         assert f"inv-done:{fallback}" not in rows
         assert rows[f"inv-done:{verdict}"]["title"] == "Verdict false_positive: ET VERDICT rule"

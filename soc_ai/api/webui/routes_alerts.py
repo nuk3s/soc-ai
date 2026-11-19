@@ -32,12 +32,19 @@ from soc_ai.api.webui._shared import (
 from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import DEFAULT_ALERT_LABELS, DEFAULT_ALERTS_QUERY, Settings
 from soc_ai.errors import OqlValidationError
-from soc_ai.so_client.elastic import ElasticClient, GridPartialResultsError
+from soc_ai.event_time import utc_text
+from soc_ai.so_client import rejected_query
+from soc_ai.so_client.elastic import (
+    ElasticClient,
+    GridPartialResultsError,
+    GridQueryRejectedError,
+)
 from soc_ai.so_client.fields import detection_kind
 from soc_ai.store import assignments as assign_svc
 from soc_ai.store import authorized_activity as authorized_svc
 from soc_ai.store import detection_overrides as override_svc
 from soc_ai.store import escalations as esc_svc
+from soc_ai.store import first_line
 from soc_ai.store import grid_gaps as gaps_svc
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.models import Investigation
@@ -186,6 +193,30 @@ def _grid_unavailable(exc: BaseException | None = None) -> dict[str, str]:
     if isinstance(exc, GridPartialResultsError):
         return {"reason": "grid_unavailable", "hint": _partial_read_hint(exc)}
     return _GRID_UNAVAILABLE
+
+
+def _query_rejected(exc: GridQueryRejectedError) -> HTTPException:
+    """The 400 for an analyst's query that the grid answered and rejected.
+
+    The grid is up: the query is wrong for the type of a field on the shards
+    that map the field (production 2026-11-19). The shard story of the 503 sent
+    the analyst to the shard allocation of a healthy cluster. The hint holds
+    the reason text of Elasticsearch and what to correct, in the
+    ``{reason, hint}`` shape of every other refused filter.
+    """
+    return api_error(400, "query_rejected", rejected_query.analyst_hint(exc))
+
+
+def _grid_read_error(exc: BaseException, *, analyst_query: str | None) -> HTTPException:
+    """The answer to a failed grid read of a route that runs an analyst's query.
+
+    A rejected query answers 400 ``query_rejected`` when the request carries
+    a query that the analyst wrote. With no such query the search is soc-ai's
+    own, and it keeps the 503 of today: the analyst has nothing to correct.
+    """
+    if isinstance(exc, GridQueryRejectedError) and (analyst_query or "").strip():
+        return _query_rejected(exc)
+    return HTTPException(status_code=503, detail=_grid_unavailable(exc))
 
 
 def _es_api_error_http(exc: ApiError) -> HTTPException:
@@ -425,6 +456,15 @@ class AlertGroupOut(BaseModel):
     # The active campaign of the run behind the standing verdict (``invId``),
     # or null.
     campaign: CampaignLinkOut | None = None
+    # The source and the target of the run behind ``invId`` and of the run
+    # behind ``windowInvId`` (first_line.run_ends). The row shows the hosts of
+    # the run whose verdict it shows. ``src`` and ``dst`` name the newest
+    # alert of the group, and a row with a true positive pill named the flow
+    # of a later false positive (dogfood 2026-11-17, AA4).
+    verdictSrc: str | None = None
+    verdictDst: str | None = None
+    windowSrc: str | None = None
+    windowDst: str | None = None
 
 
 # The siblings one row lists. The count names the rest.
@@ -659,6 +699,11 @@ async def _verdict_mix(
         by_id = {inv.id: inv for inv in found}
         worst = {rule: by_id[k[2]] for rule, k in worst_id.items() if k[2] in by_id}
     return counts, worst
+
+
+def _run_ends(run: Investigation | None) -> tuple[str | None, str | None]:
+    """The source and the target of one run of a row, or two Nones."""
+    return first_line.run_ends(run) if run is not None else (None, None)
 
 
 def _worse_than(
@@ -1013,8 +1058,9 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             raise oql_refusal(exc) from exc
         if isinstance(exc, TimeoutError | TransportError):
             # Fail fast with a clean error instead of hanging the console while
-            # the ES client retries a slow/unreachable Security Onion grid.
-            raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+            # the ES client retries a slow/unreachable Security Onion grid. A
+            # filter that the grid rejected is the analyst's to correct (400).
+            raise _grid_read_error(exc, analyst_query=q) from exc
         if isinstance(exc, ApiError):
             # An ES ApiError (e.g. BadRequestError) is NOT a TransportError. Map
             # it here so a bad query is a 400, not an unhandled 500.
@@ -1121,6 +1167,7 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
             reason = f"Verdict from 1 of {g.count} events investigated"
         window_run = worst_runs.get(g.rule_name)
         worst_verdict, worst_conf, worst_inv = _worse_than(window_run, verdict)
+        verdict_ends, window_ends = _run_ends(_inv), _run_ends(window_run)
         analyst = (
             analyst_by_alert.get(inv_svc.alert_group_id(_inv) or "") if _inv is not None else None
         )
@@ -1194,6 +1241,10 @@ async def list_alerts(  # noqa: PLR0915 - one linear join of the grid rows and t
                 headline=_headline(_inv, marks),
                 windowHeadline=_headline(window_run, marks),
                 campaign=link_for(campaigns, inv_id),
+                verdictSrc=verdict_ends[0],
+                verdictDst=verdict_ends[1],
+                windowSrc=window_ends[0],
+                windowDst=window_ends[1],
             )
         )
     return AlertQueueOut(groups=out, truncated=page.truncated, other_docs=page.other_docs)
@@ -1534,7 +1585,7 @@ async def list_group_events(
     except OqlValidationError as exc:
         raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        raise _grid_read_error(exc, analyst_query=q) from exc
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
 
@@ -1689,7 +1740,7 @@ def _pick_representative(
         shape = f"The most common flow is {src_ip or '—'} → {dst_label}."
     reason = (
         f"{shape} {max_count} of {len(events)} events match it."
-        f" The representative is the newest of them, from {representative.timestamp}."
+        f" The representative is the newest of them, from {utc_text(representative.timestamp)}."
     )
     return representative, max_count, reason
 
@@ -1741,7 +1792,7 @@ async def get_representative(
     except OqlValidationError as exc:
         raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        raise _grid_read_error(exc, analyst_query=q) from exc
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
 

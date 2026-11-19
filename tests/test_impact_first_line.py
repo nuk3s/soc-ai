@@ -477,6 +477,21 @@ def test_the_stored_line_stands_while_its_verdict_stands() -> None:
     )
 
 
+def test_the_page_builds_the_line_from_the_hosts_data_of_now() -> None:
+    """W6: the stored line holds the role at the end of the run. The page states the role of now.
+
+    A page read "actor (workstation)" in a chip and "actor (server)" in the
+    line below. The chip reads the Hosts data of now.
+    """
+    stored = f"True positive. Impact: attempted. devbox (server) {SRC} to mainsrv (server) {DST}."
+    report = {"first_line": stored, "impact": "attempted"}
+    assert first_line.of_run(_row(report=report), LABELS, now=True) == (
+        f"True positive. Impact: attempted. devbox {SRC} to mainsrv (server) {DST}."
+    )
+    # A negative control: with no ask for now, the stored line stands.
+    assert first_line.of_run(_row(report=report), LABELS) == stored
+
+
 def test_a_pipeline_error_and_a_run_with_no_verdict_have_no_line() -> None:
     fallback = {"resolution": {"provenance": "pipeline_fallback"}}
     assert first_line.of_run(_row(verdict="needs_more_info", report=fallback), {}) is None
@@ -795,6 +810,19 @@ def test_the_list_and_the_page_return_the_impact_and_the_first_line(client: Test
     assert detail["impactChange"] is None
     assert old_detail["impact"] is None
     assert old_detail["firstLine"] == rows[old]["firstLine"]
+
+    # W6: a line stored with a role that the Hosts data no longer holds. The
+    # page states the role of now, as its host chips do.
+    aged = (
+        "True positive. Impact: attempted. "
+        "devbox (server) 10.40.50.7 to mainsrv (server) 10.20.30.5."
+    )
+    moved = _seed_run(client, "a-moved", report={"impact": "attempted", "first_line": aged})
+    with patch("soc_ai.api.webui._timeline._alert_ack_state", AsyncMock(return_value=None)):
+        page = client.get(f"/api/v1/investigations/{moved}").json()
+    assert page["firstLine"] == (
+        f"True positive. Impact: attempted. devbox {SRC} to mainsrv (server) {DST}."
+    )
 
 
 def test_the_list_row_states_the_headline_of_the_run(client: TestClient) -> None:

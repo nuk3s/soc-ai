@@ -30,7 +30,7 @@ import { demoBlocked, useDemo } from '../lib/demo';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList } from '../lib/sweepErrors';
 import { useAsync } from '../lib/useAsync';
-import { absTime } from '../lib/timeRange';
+import { UtcTime } from '../components/UtcTime';
 import { useToast } from '../lib/toast';
 import type { AdminUser, AuditChainVerifyResult, ConnTestResult, DangerSetting, Me, Setting, SettingGroup } from '../lib/types';
 import { ConfigNav, ConfigNavSelect } from './ConfigNav';
@@ -43,6 +43,7 @@ import {
   keyToSectionId,
   keyToSectionTitle,
 } from '../lib/configLayout';
+import { utcTimesInText } from '../lib/timeRange';
 
 /** Nearest scrollable ancestor (the AppShell's overflow-y-auto content pane). */
 function scrollContainerOf(el: HTMLElement): HTMLElement | null {
@@ -1915,7 +1916,7 @@ export function Config() {
       // the smaller number while the CLI and the bell showed the larger.
       const what =
         result.blast_radius || result.newest_break_detail || result.first_break_detail;
-      const kindNote = what ? ` ${what.replace(/\.$/, '')}.` : '';
+      const kindNote = what ? ` ${utcTimesInText(what).replace(/\.$/, '')}.` : '';
       return `Chain tampered. ${tally}${cappedNote}${trailing}${kindNote}`;
     }
     if (result.capped) {
@@ -1967,7 +1968,7 @@ export function Config() {
           )}
           {idents?.last_scan?.last_scan && !scanInFlight && (
             <span className="text-[11px] text-faint">
-              last scan: {absTime(idents.last_scan.last_scan)}
+              last scan: <UtcTime iso={idents.last_scan.last_scan} />
             </span>
           )}
           <button
@@ -2406,7 +2407,7 @@ export function Config() {
                       {u.disabled ? 'disabled' : 'enabled'}
                     </span>
                     {u.lastLoginAt && (
-                      <span title={absTime(u.lastLoginAt, { zone: true })}>last sign-in {absTime(u.lastLoginAt)}</span>
+                      <span>last sign-in <UtcTime iso={u.lastLoginAt} /></span>
                     )}
                   </div>
                   {u.status && (

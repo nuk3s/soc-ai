@@ -19,7 +19,7 @@ import {
   type QualityEvalStatus,
   type QualityTrend,
 } from '../lib/api';
-import { absTime, agoWords, timeLabel } from '../lib/timeRange';
+import { agoWords, timeLabel, utcStamp } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import type { Config } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
@@ -244,7 +244,7 @@ function autoInvestigate(read: JobsRead, now: number): JobRow {
         ...facts,
         paused: true,
         outcome: 'failed',
-        result: `Paused until ${absTime(s.paused_until, { zone: true })}. The last ${plural(s.failed_in_a_row ?? 0, 'investigation')} failed.`,
+        result: `Paused until ${utcStamp(s.paused_until)}. The last ${plural(s.failed_in_a_row ?? 0, 'investigation')} failed.`,
         resultTitle: s.alarm_error ?? null,
       },
       now,

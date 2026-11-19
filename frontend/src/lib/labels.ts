@@ -271,6 +271,31 @@ export function outcomeMeta(outcome: string | null | undefined): LabelMeta {
   return meta(humanize(outcome ?? '') || 'No outcome', 'muted');
 }
 
+/** The words of a hunt that stopped after it ran steps: "Stopped with an
+ *  error after 14 steps". Null for a hunt that ran no step and for a hunt
+ *  that did not stop: "Could not run" is for a hunt with no step (dogfood
+ *  2026-11-17, b08). */
+export function stoppedHuntWords(h: { status?: string | null; steps?: number | null }): string | null {
+  const n = h.steps ?? 0;
+  if (n <= 0) return null;
+  const steps = `${n} ${n === 1 ? 'step' : 'steps'}`;
+  if (h.status === 'error') return `Stopped with an error after ${steps}`;
+  if (h.status === 'cancelled') return `Cancelled after ${steps}`;
+  if (h.status === 'interrupted') return `Interrupted after ${steps}`;
+  return null;
+}
+
+/** The words of a hunt that stopped, for every surface that names its
+ *  status: the Hunts list, the hunt page, the lead page and the campaign
+ *  fold. The four read "Could not run", "Failed" and "Stopped with an error
+ *  after 14 steps" for one hunt before (dogfood 2026-11-17, F5). A hunt that
+ *  stopped after steps states the stop and the steps. A hunt that stopped
+ *  with no step "Could not run". Null for a hunt that did not stop. */
+export function huntStopLabel(h: { status?: string | null; steps?: number | null }): string | null {
+  if (!STOPPED.has(h.status ?? '')) return null;
+  return stoppedHuntWords(h) ?? OUTCOME_LABELS.could_not_run.label;
+}
+
 /** "could_not_run" and the API's "failed" both read "Could not run".
  *  With the phase counts, `investigating` reads "Investigating 2 of 3
  *  findings" and `threats_confirmed` reads the count sentence of threatCountSentence. */

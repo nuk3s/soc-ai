@@ -19,12 +19,22 @@ positive finding investigation. The alert count of a pair counts the alert
 events of its confirmed rules. ``other_alerts`` counts every other rule. The
 service reads the verdict of each other rule from the store.
 
+The read of a campaign that is not ended goes to now (:func:`read_window`).
+A later alert of a confirmed rule between the same machines takes its verdict
+from an earlier investigation and gets no investigation of its own, so the
+investigations alone do not show it. ``last_alert_at`` of the stored read
+holds the time of the last such alert. A campaign that ended reads to its last
+event plus :data:`WINDOW_PAD`. Such an alert keeps the campaign open, so the
+end check (:func:`read_end`) reads the horizon after the last activity of an
+ended campaign once more.
+
 Every time is a naive UTC ``datetime``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -167,6 +177,26 @@ class Timeline:
 
 
 @dataclass(frozen=True)
+class LaterAlerts:
+    """The alert events of the confirmed rules after ``after``, all pairs.
+
+    ``after`` is the newest investigation event of the campaign, or the
+    boundary of its decision when that is later. Such an alert takes its
+    verdict from an earlier investigation and gets no investigation of its
+    own. ``rules`` counts the distinct rules, and ``last_at`` is the time of
+    the last such alert event. ``known`` is False when the grid did not
+    answer the count: no surface states it, and the next read of the same
+    time does not ask again before :data:`soc_ai.campaigns.service.EVENTS_MAX_AGE`.
+    """
+
+    after: datetime
+    alerts: int = 0
+    rules: int = 0
+    last_at: datetime | None = None
+    known: bool = True
+
+
+@dataclass(frozen=True)
 class CampaignEvents:
     """The events of a campaign.
 
@@ -175,7 +205,13 @@ class CampaignEvents:
     ``alerts`` sums the alerts of the pairs, and ``rules`` counts the distinct
     confirmed rules with an event. ``findings`` counts the true positive
     finding investigations. ``records`` sums the records of the pairs, and is
-    None unless the source is the grid.
+    None unless the source is the grid. ``last_alert_at`` is the time of the
+    last alert event of a confirmed rule of a pair, or None with no alert.
+    ``later`` holds the alert events of the confirmed rules after the newest
+    investigation event, or None when the read did not count them.
+    ``read_to`` is the end of the window of a grid read: the page states the
+    alert events until then, and a close covers them (G3). None for a read
+    of an earlier release and for the events that the investigations hold.
     """
 
     source: str = SOURCE_NONE
@@ -186,6 +222,9 @@ class CampaignEvents:
     records: int | None = None
     pairs: tuple[PairEvents, ...] = ()
     timeline: Timeline = field(default_factory=Timeline)
+    last_alert_at: datetime | None = None
+    later: LaterAlerts | None = None
+    read_to: datetime | None = None
 
     @classmethod
     def from_json(cls, data: Any) -> CampaignEvents:
@@ -328,11 +367,20 @@ def findings_of(draft_or_members: CampaignDraft | Iterable[Member]) -> int:
     return sum(1 for m in _positives(draft_or_members) if m.run.kind == KIND_FINDING)
 
 
-def events_basis(pairs: Iterable[PairSpec], start: datetime, end: datetime) -> str:
+def events_basis(
+    pairs: Iterable[PairSpec], start: datetime, end: datetime, *, to_now: bool = False
+) -> str:
     """A SHA-1 over what a grid read reads: the pairs, their addresses, their confirmed rules
-    and the window. A new basis needs a new read."""
+    and the window. A new basis needs a new read.
+
+    ``to_now`` marks the read of a campaign that is not ended: it goes to the
+    time of the read, so the basis holds the mark and no time.
+    """
+    window = [start.isoformat(), end.isoformat()]
+    if to_now:
+        window.append("now")
     content = {
-        "window": [start.isoformat(), end.isoformat()],
+        "window": window,
         "pairs": sorted(
             [
                 p.source,
@@ -435,7 +483,12 @@ def _summary(
         records=records,
         pairs=tuple(ordered),
         timeline=timeline,
+        last_alert_at=_last_of(ordered),
     )
+
+
+def _last_of(pairs: Iterable[PairEvents]) -> datetime | None:
+    return max((p.last_at for p in pairs if p.alerts and p.last_at is not None), default=None)
 
 
 def stored_events(
@@ -506,6 +559,20 @@ def _iso(at: datetime) -> str:
     return at.isoformat() + "Z"
 
 
+def read_window(
+    start: datetime, end: datetime, until: datetime | None = None
+) -> tuple[datetime, datetime]:
+    """The window of a grid read of a campaign: from ``start`` less :data:`WINDOW_PAD`.
+
+    ``until`` is the end of the read of a campaign that is not ended: the
+    time of the read. With None the read ends at ``end`` plus
+    :data:`WINDOW_PAD`, the rule of a campaign that ended.
+    """
+    lo = start - WINDOW_PAD
+    hi = until if until is not None else end + WINDOW_PAD
+    return lo, max(lo, hi)
+
+
 # The levels of a record that hold its two addresses: the top level, and the
 # envelope. A Sigma alert of Security Onion holds the matched record under
 # ``event_data`` (soc_ai.so_client.fields.envelope) and no address at its top
@@ -534,9 +601,16 @@ def _between(a: Sequence[str], b: Sequence[str]) -> dict[str, Any]:
 
 
 def _search(
-    pairs: Sequence[PairSpec], lo: datetime, hi: datetime, interval: str
+    pairs: Sequence[PairSpec],
+    lo: datetime,
+    hi: datetime,
+    interval: str,
+    after: datetime | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The query and the aggregations of one read for all pairs.
+
+    With ``after``, the aggregation ``later`` counts the alert events of the
+    confirmed rules after that time, by rule, with the time of the last.
 
     The aggregation names avoid ``rules``, ``out``, ``in`` and ``volume``: the
     demo grid answers those names with the Alerts page and the host page.
@@ -599,6 +673,26 @@ def _search(
                 }
             },
         }
+        if after is not None:
+            aggs["later"] = {
+                "filter": {
+                    "bool": {
+                        "filter": [
+                            {"range": {"@timestamp": {"gt": _iso(after)}}},
+                            {
+                                "bool": {
+                                    "should": list(confirmed.values()),
+                                    "minimum_should_match": 1,
+                                }
+                            },
+                        ]
+                    }
+                },
+                "aggs": {
+                    "by_rule": {"terms": {"field": "rule.name", "size": MAX_RULES}},
+                    "last": {"max": {"field": "@timestamp"}},
+                },
+            }
     return query, aggs
 
 
@@ -630,11 +724,42 @@ def _key_time(bucket: Mapping[str, Any]) -> datetime | None:
     return naive_utc(bucket.get("key_as_string"))
 
 
+def _later(value: Any, after: datetime | None, *, asked: bool) -> LaterAlerts | None:
+    """The aggregation ``later`` of a read, or None when the read did not count it.
+
+    A read with no confirmed rule asks for no count: no alert event of the
+    campaign is later. A grid that did not answer the aggregation states no
+    count, never 0: ``known`` is False.
+    """
+    held = _mapping(value)
+    if after is None:
+        return None
+    if not asked:
+        return LaterAlerts(after=after)
+    if not held:
+        return LaterAlerts(after=after, known=False)
+    names = {
+        rule_name_key(str(item["key"]))
+        for item in _list(_mapping(held.get("by_rule")).get("buckets"))
+        if isinstance(item.get("key"), str) and item.get("key") and _count(item.get("doc_count"))
+    }
+    alerts = _count(held.get("doc_count"))
+    return LaterAlerts(
+        after=after,
+        alerts=alerts,
+        rules=len(names),
+        last_at=_metric_time(held.get("last")) if alerts else None,
+    )
+
+
 def _parse(
     pairs: Sequence[PairSpec],
     aggregations: Mapping[str, Any],
     seconds: int,
     read_at: datetime,
+    after: datetime | None = None,
+    *,
+    asked_later: bool = False,
 ) -> CampaignEvents:
     by_pair = _mapping(_mapping(aggregations.get("pairs")).get("buckets"))
     by_confirmed = _mapping(_mapping(aggregations.get("confirmed")).get("buckets"))
@@ -673,7 +798,7 @@ def _parse(
                 other_alerts=max(0, _count(alerts.get("doc_count")) - held),
             )
         )
-    return _summary(
+    summary = _summary(
         SOURCE_GRID,
         out,
         _timeline(seconds, lanes),
@@ -681,21 +806,27 @@ def _parse(
         read_at=read_at,
         records=sum(p.records or 0 for p in out),
     )
+    return dataclasses.replace(
+        summary, later=_later(aggregations.get("later"), after, asked=asked_later)
+    )
 
 
 async def _read(
     elastic: ElasticClient,
     settings: Settings,
     pairs: Sequence[PairSpec],
-    start: datetime,
-    end: datetime,
+    lo: datetime,
+    hi: datetime,
+    after: datetime | None = None,
 ) -> CampaignEvents:
-    lo, hi = start - WINDOW_PAD, end + WINDOW_PAD
     interval, seconds = choose_interval(lo, hi)
     read_at = datetime.now(UTC).replace(tzinfo=None)
     if not pairs:
-        return CampaignEvents(source=SOURCE_GRID, read_at=read_at, records=0)
-    query, aggs = _search(pairs, lo, hi, interval)
+        later = LaterAlerts(after=after) if after is not None else None
+        return CampaignEvents(
+            source=SOURCE_GRID, read_at=read_at, records=0, later=later, read_to=hi
+        )
+    query, aggs = _search(pairs, lo, hi, interval, after)
     result = await elastic.search(
         settings.events_index_pattern,
         query,
@@ -708,7 +839,8 @@ async def _read(
     if not isinstance(aggregations.get("pairs"), Mapping):
         # A grid that did not evaluate the aggregations states no count.
         raise ValueError("the grid answered with no aggregation of the pairs")
-    return _parse(pairs, aggregations, seconds, read_at)
+    got = _parse(pairs, aggregations, seconds, read_at, after, asked_later="later" in aggs)
+    return dataclasses.replace(got, read_to=hi)
 
 
 async def read_events(
@@ -718,9 +850,14 @@ async def read_events(
     pairs: Sequence[PairSpec],
     start: datetime,
     end: datetime,
+    until: datetime | None = None,
+    after: datetime | None = None,
 ) -> CampaignEvents | None:
-    """The events of the grid between the pairs, from ``start`` less 30 minutes to ``end``
-    plus 30 minutes. None when the read fails or takes more than :data:`READ_TIMEOUT_S`.
+    """The events of the grid between the pairs in :func:`read_window`. None when the read
+    fails or takes more than :data:`READ_TIMEOUT_S`.
+
+    With ``after`` the same search counts the alert events of the confirmed
+    rules after that time (:class:`LaterAlerts`).
 
     The read covers the :data:`MAX_PAIRS` pairs with the most investigations.
     ``findings`` is 0: the caller knows the members. A partial result of the
@@ -730,9 +867,10 @@ async def read_events(
         (p for p in pairs if p.source_addresses and p.target_addresses),
         key=lambda p: (-p.investigations, p.source, p.target),
     )[:MAX_PAIRS]
+    lo, hi = read_window(start, end, until)
     try:
         return await asyncio.wait_for(
-            _read(elastic, settings, covered, start, end), timeout=READ_TIMEOUT_S
+            _read(elastic, settings, covered, lo, hi, after), timeout=READ_TIMEOUT_S
         )
     except Exception:
         _LOGGER.warning(_READ_LINE, exc_info=True)
@@ -778,8 +916,21 @@ def _dig(source: Mapping[str, Any], path: str) -> Any:
     return held
 
 
-def _scope_query(pairs: Sequence[PairSpec], lo: datetime, hi: datetime) -> dict[str, Any]:
-    """The alert events of the confirmed rules between the pairs, not yet acknowledged."""
+def _scope_query(
+    pairs: Sequence[PairSpec],
+    lo: datetime,
+    hi: datetime,
+    *,
+    after: bool = False,
+    open_only: bool = True,
+) -> dict[str, Any]:
+    """The alert events of the confirmed rules between the pairs, not yet acknowledged.
+
+    ``after`` leaves ``lo`` out of the window: an alert at the time that a
+    decision covers is no later activity. ``open_only`` False keeps the
+    acknowledged and the escalated alert events too: the end check counts
+    each alert as activity (:func:`read_end`).
+    """
     clauses = [
         {
             "bool": {
@@ -791,24 +942,23 @@ def _scope_query(pairs: Sequence[PairSpec], lo: datetime, hi: datetime) -> dict[
         }
         for p in pairs
     ]
-    return {
-        "bool": {
-            "filter": [
-                {"range": {"@timestamp": {"gte": _iso(lo), "lte": _iso(hi)}}},
-                _ALERT_CLAUSE,
-                {"bool": {"should": clauses, "minimum_should_match": 1}},
-                {
-                    "bool": {
-                        "must_not": [
-                            {"term": {"event.acknowledged": True}},
-                            {"term": {"event.escalated": True}},
-                        ]
-                    }
-                },
-            ],
-            "must_not": synth_scope_must_not(False),
-        }
-    }
+    filters: list[dict[str, Any]] = [
+        {"range": {"@timestamp": {"gt" if after else "gte": _iso(lo), "lte": _iso(hi)}}},
+        _ALERT_CLAUSE,
+        {"bool": {"should": clauses, "minimum_should_match": 1}},
+    ]
+    if open_only:
+        filters.append(
+            {
+                "bool": {
+                    "must_not": [
+                        {"term": {"event.acknowledged": True}},
+                        {"term": {"event.escalated": True}},
+                    ]
+                }
+            }
+        )
+    return {"bool": {"filter": filters, "must_not": synth_scope_must_not(False)}}
 
 
 async def read_close_scope(
@@ -818,12 +968,14 @@ async def read_close_scope(
     pairs: Sequence[PairSpec],
     start: datetime,
     end: datetime,
+    until: datetime | None = None,
 ) -> CloseScope:
     """The alert events that a close acknowledges: one grid read. Never raises.
 
     The alert events of the confirmed rules between the machines of each
-    pair, in the window of :func:`read_events`, that Security Onion has not
-    acknowledged or escalated. The query leaves those out, and the flags of
+    pair, in :func:`read_window`, that Security Onion has not acknowledged or
+    escalated. ``until`` is the end of the grid read that the page states, or
+    the time that a close covers (G3). The query leaves those out, and the flags of
     each hit leave out the rest: an index that does not map the flags still
     holds them in the document. A failed or slow read gives ``alerts`` None.
     """
@@ -837,7 +989,7 @@ async def read_close_scope(
         result = await asyncio.wait_for(
             elastic.search(
                 settings.events_index_pattern,
-                _scope_query(covered, start - WINDOW_PAD, end + WINDOW_PAD),
+                _scope_query(covered, *read_window(start, end, until)),
                 size=CLOSE_SCOPE_MAX + 1,
                 source=["rule.name", "event.acknowledged", "event.escalated"],
                 sort=[{"@timestamp": {"order": "asc"}}],
@@ -865,6 +1017,160 @@ async def read_close_scope(
     capped = len(result.hits) > CLOSE_SCOPE_MAX
     kept = tuple(ids[:CLOSE_SCOPE_MAX])
     return CloseScope(alerts=len(kept), rules=len(rules), capped=capped, alert_ids=kept)
+
+
+# ── The activity after a close (G4) ────────────────────────────────────────
+
+# The most alert events that one check of a closed campaign reads.
+ACTIVITY_MAX = 200
+
+_ACTIVITY_LINE = (
+    "campaigns: soc-ai could not read the grid for new activity of a closed campaign. "
+    "The campaign stays closed. The next read tries again."
+)
+
+
+@dataclass(frozen=True)
+class Activity:
+    """The open alert events of the confirmed rules after the time that a close covers.
+
+    ``alerts`` counts them, at most :data:`ACTIVITY_MAX`. ``rules`` counts
+    their distinct rules. ``first_at`` and ``last_at`` bound them.
+    """
+
+    alerts: int = 0
+    rules: int = 0
+    first_at: datetime | None = None
+    last_at: datetime | None = None
+
+
+async def read_activity(
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    pairs: Sequence[PairSpec],
+    after: datetime,
+    until: datetime,
+) -> Activity | None:
+    """The alert events that open a closed campaign again: one grid read. Never raises.
+
+    The alert events of the confirmed rules between the machines of each
+    pair after ``after`` and until ``until`` that Security Onion has not
+    acknowledged or escalated, as :func:`read_close_scope` reads them. None
+    when the read fails or takes more than :data:`READ_TIMEOUT_S`: a grid that
+    does not answer opens nothing.
+    """
+    covered = sorted(
+        (p for p in pairs if p.source_addresses and p.target_addresses and p.confirmed),
+        key=lambda p: (-p.investigations, p.source, p.target),
+    )[:MAX_PAIRS]
+    if not covered or until <= after:
+        return Activity()
+    try:
+        result = await asyncio.wait_for(
+            elastic.search(
+                settings.events_index_pattern,
+                _scope_query(covered, after, until, after=True),
+                size=ACTIVITY_MAX,
+                source=["@timestamp", "rule.name", "event.acknowledged", "event.escalated"],
+                sort=[{"@timestamp": {"order": "asc"}}],
+                require_complete=True,
+            ),
+            timeout=READ_TIMEOUT_S,
+        )
+    except Exception:
+        _LOGGER.warning(_ACTIVITY_LINE, exc_info=True)
+        return None
+    times: list[datetime] = []
+    rules: set[str] = set()
+    for hit in result.hits:
+        source = hit.get("_source")
+        held = source if isinstance(source, Mapping) else {}
+        if _dig(held, "event.acknowledged") is True or _dig(held, "event.escalated") is True:
+            continue
+        at = naive_utc(_dig(held, "@timestamp"))
+        if at is None or at <= after or at > until:
+            continue
+        times.append(at)
+        name = _dig(held, "rule.name")
+        if isinstance(name, str) and name:
+            rules.add(rule_name_key(name))
+    return Activity(
+        alerts=len(times),
+        rules=len(rules),
+        first_at=min(times, default=None),
+        last_at=max(times, default=None),
+    )
+
+
+# ── The end check (E2) ─────────────────────────────────────────────────────
+
+_END_LINE = (
+    "campaigns: soc-ai could not read the grid for the end of a campaign. "
+    "The campaign keeps its state. The next wake tries again."
+)
+
+
+@dataclass(frozen=True)
+class EndRead:
+    """The alert events of the confirmed rules after the last activity of a campaign.
+
+    ``alerts`` counts them, and ``last_at`` is the time of the last, or None
+    with none. An acknowledged alert counts: activity is activity.
+    """
+
+    alerts: int = 0
+    last_at: datetime | None = None
+
+
+async def read_end(
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    pairs: Sequence[PairSpec],
+    after: datetime,
+    until: datetime,
+) -> EndRead | None:
+    """The alert events that keep an ended campaign open: one grid read. Never raises.
+
+    The alert events of the confirmed rules between the machines of each
+    pair after ``after`` and until ``until``, with any acknowledge state.
+    ``after`` is the last activity of the campaign, and ``until`` is at most
+    one horizon later. The read covers the :data:`MAX_PAIRS` pairs with the
+    most investigations, as :func:`read_events` does. None when the read
+    fails, takes more than :data:`READ_TIMEOUT_S` or states no time of the
+    last alert: a grid that does not answer changes nothing.
+    """
+    covered = sorted(
+        (p for p in pairs if p.source_addresses and p.target_addresses and p.confirmed),
+        key=lambda p: (-p.investigations, p.source, p.target),
+    )[:MAX_PAIRS]
+    if not covered or until <= after:
+        return EndRead()
+    try:
+        result = await asyncio.wait_for(
+            elastic.search(
+                settings.events_index_pattern,
+                _scope_query(covered, after, until, after=True, open_only=False),
+                size=0,
+                aggs={"last": {"max": {"field": "@timestamp"}}},
+                track_total_hits=True,
+                require_complete=True,
+            ),
+            timeout=READ_TIMEOUT_S,
+        )
+        last = (result.aggregations or {}).get("last")
+        if not isinstance(last, Mapping):
+            # A grid that did not evaluate the aggregation states no time.
+            raise ValueError("the grid answered with no time of the last alert")
+    except Exception:
+        _LOGGER.warning(_END_LINE, exc_info=True)
+        return None
+    alerts = result.total if result.total > 0 else 0
+    at = _metric_time(last) if alerts else None
+    if at is not None and (at <= after or at > until):
+        at = None
+    return EndRead(alerts=alerts, last_at=at)
 
 
 # ── The stored value ───────────────────────────────────────────────────────
@@ -944,19 +1250,57 @@ def _events_of(data: Any) -> CampaignEvents:
             _count(seconds) or STORED_BUCKET_SECONDS,
             tuple(lanes),
         ),
+        # A read of an earlier release holds no last alert time: its pairs give it.
+        last_alert_at=(
+            naive_utc(held.get("last_alert_at")) if "last_alert_at" in held else _last_of(pairs)
+        ),
+        later=_later_of(held.get("later")),
+        read_to=naive_utc(held.get("read_to")),
     )
 
 
+def _later_of(value: Any) -> LaterAlerts | None:
+    held = _mapping(value)
+    after = naive_utc(held.get("after"))
+    if after is None:
+        return None
+    return LaterAlerts(
+        after=after,
+        alerts=_count(held.get("alerts")),
+        rules=_count(held.get("rules")),
+        last_at=naive_utc(held.get("last_at")),
+        known=held.get("known") is not False,
+    )
+
+
+def last_alert_of(value: Any) -> datetime | None:
+    """The time of the last alert event of a confirmed rule of a stored grid read, or None.
+
+    None for a value that holds no grid read. A read of an earlier release
+    holds no such field, so the pairs give the time.
+    """
+    held = _mapping(value)
+    if held.get("source") != SOURCE_GRID:
+        return None
+    if "last_alert_at" in held:
+        return naive_utc(held.get("last_alert_at"))
+    return CampaignEvents.from_json(held).last_alert_at
+
+
 __all__ = [
+    "ACTIVITY_MAX",
     "CLOSE_SCOPE_MAX",
     "INTERVALS",
     "MAX_PAIRS",
     "READ_TIMEOUT_S",
+    "Activity",
     "Bucket",
     "CampaignEvents",
     "CloseScope",
     "DatasetRecords",
+    "EndRead",
     "Lane",
+    "LaterAlerts",
     "PairEvents",
     "PairSpec",
     "RuleEvents",
@@ -965,7 +1309,11 @@ __all__ = [
     "choose_interval",
     "events_basis",
     "findings_of",
+    "last_alert_of",
+    "read_activity",
     "read_close_scope",
+    "read_end",
     "read_events",
+    "read_window",
     "stored_events",
 ]

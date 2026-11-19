@@ -18,8 +18,9 @@ import {
   HostInvestigations,
   investigationsHref,
   useHostInvestigations,
+  windowSince,
 } from '../components/HostInvestigations';
-import { HostKpis } from '../components/HostKpis';
+import { HostKpis, windowWords } from '../components/HostKpis';
 import { Panel, PanelHeader } from '../components/Panel';
 import {
   EmptyState,
@@ -54,12 +55,14 @@ import {
   investigationLines,
   leadLines,
   verdictLines,
+  verdictWindow,
 } from '../lib/hostSituation';
 import { listUrlToReturnTo, machineHref, type HostsLocationState } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList, sweepFailureSentence } from '../lib/sweepErrors';
-import { absTime, rangeToSinceUntil } from '../lib/timeRange';
+import { rangeToSinceUntil } from '../lib/timeRange';
+import { UtcTime } from '../components/UtcTime';
 import type {
   Dossier,
   DossierRefreshStatus,
@@ -459,12 +462,20 @@ export function HostDetail() {
     [situationKey],
     { refetchInterval: 60_000 },
   );
+  // The verdict lines and the Alerts card read the observations of the page
+  // window (dogfood 2026-11-17, AB1). The lead lines keep their own scope:
+  // an open lead is work that waits, whatever its age.
+  const verdictScope = verdictWindow(range);
   const observationsRead = useAsync(
     () =>
       situationKey
-        ? getObservations(situationKey, VERDICT_DAYS).then((res) => ({ key: situationKey, rows: res.observations }))
+        ? getObservations(situationKey, verdictScope.days).then((res) => ({
+            key: situationKey,
+            days: verdictScope.days,
+            rows: res.observations,
+          }))
         : Promise.resolve(null),
-    [situationKey],
+    [situationKey, verdictScope.days],
     { refetchInterval: 300_000 },
   );
   const hostLeads = leadsRead.data && leadsRead.data.key === situationKey ? leadsRead.data.rows : [];
@@ -472,6 +483,8 @@ export function HostDetail() {
     leadTotal.data && leadTotal.data.key === situationKey ? leadTotal.data.total : null;
   const hostObservations =
     observationsRead.data && observationsRead.data.key === situationKey ? observationsRead.data.rows : [];
+  const hostObservationsScope =
+    observationsRead.data?.days === VERDICT_DAYS ? verdictWindow('7d').scope : verdictWindow('24h').scope;
   const verdictCount = alertVerdicts(hostObservations).length;
 
   // The chat panel's scope line prefers the name a human uses: the SAME
@@ -490,28 +503,31 @@ export function HostDetail() {
   // reads every address and name. An address page reads its address.
   const investigationKey = machine ? machine.key : situationKey;
   const investigations = useHostInvestigations(investigationKey);
-  // The confirmed threats of this host over 30 days: the same route and the
-  // same row the Dashboard panel lists for it. The strip under the header
-  // shows nothing when the host has no row.
-  const threatsKey = `host|${investigationKey}`;
+  // The Investigations block counts and lists the investigations whose event
+  // falls in the page window (dogfood 2026-11-17, AB1). The hero line above
+  // keeps the read of all time and says so.
+  const windowInvestigations = useHostInvestigations(investigationKey, shownRange);
+  // The confirmed threats of this host in the page window: the same route
+  // and the same row the Dashboard panel lists for it. The strip under the
+  // header shows nothing when the host has no row. It read 30 days under a
+  // 24h toggle (dogfood 2026-11-17, AB1).
+  const threatsKey = `host|${shownRange}|${investigationKey}`;
   const hostThreats = useThreats(
     threatsKey,
-    () =>
-      investigationKey
-        ? { since: new Date(Date.now() - 30 * 86_400_000).toISOString(), host: investigationKey }
-        : null,
+    () => (investigationKey ? { since: windowSince(shownRange), host: investigationKey } : null),
     300_000,
   );
   const investigationList =
     investigations.data && investigations.data.key === investigationKey ? investigations.data.list : null;
   const situation = [
     ...leadLines(hostLeads, hostLeadTotal),
-    ...verdictLines(hostObservations),
+    ...verdictLines(hostObservations, Date.now(), hostObservationsScope),
     ...(investigationList
       ? investigationLines(
           investigationList.total,
           investigationList.truePositives,
           investigationsHref(investigationKey, hostname ?? ip),
+          investigationList.truePositiveParts,
         )
       : []),
   ];
@@ -1052,7 +1068,7 @@ export function HostDetail() {
                 <AlertTriangle size={14} className="mt-0.5 flex-none" />
                 <span>
                   A different machine may hold this address since{' '}
-                  {absTime(dossier.identity_rebound_at)}. The declarations below may describe a host
+                  <UtcTime iso={dossier.identity_rebound_at} />. The declarations below may describe a host
                   that no longer holds this address.
                 </span>
               </div>
@@ -1150,7 +1166,11 @@ export function HostDetail() {
             />
             {/* The threat on this host and its one next step, directly under
                 the header (review 2026-11-12, ui-hunt 7). */}
-            <HostThreatStrip read={hostThreats} readKey={threatsKey} />
+            <HostThreatStrip
+              read={hostThreats}
+              readKey={threatsKey}
+              windowLabel={`last ${windowWords(shownRange)}`}
+            />
             <GridGapStrip range={shownRange} className="mb-3" />
 
             {undo && (
@@ -1195,11 +1215,11 @@ export function HostDetail() {
                 <HostInvestigations
                   entityKey={investigationKey}
                   label={hostname ?? ip}
-                  read={investigations}
+                  read={windowInvestigations}
                 />
               )}
               <LeadsStrip entityKey={ip} entityLabel={hostname ?? ip} status="all" className="mb-3" />
-              <HostObservations entityKey={ip} className="mb-3" />
+              <HostObservations entityKey={ip} className="mb-3" days={verdictScope.days} />
             </div>
 
             {/* Every address of the machine, and its containers. */}

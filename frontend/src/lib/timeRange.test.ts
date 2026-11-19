@@ -10,33 +10,59 @@ import {
   ago,
   agoFromLabel,
   formatDuration,
+  localTitle,
   rangeToSinceUntil,
   timeLabel,
+  timeTitle,
   utcStamp,
+  utcTimesInText,
   utcWindow,
 } from './timeRange';
 
+// Round 3, T3: a page shows an absolute time in UTC with the label, in the
+// form of the investigation page. The tooltip of an absolute time states the
+// local time with its zone. A relative time stays.
 describe('absTime', () => {
   const at = '2026-10-02T12:10:28Z';
-  // The zone the test machine runs in, in the short form the formatter uses.
-  const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
-    .formatToParts(new Date(at))
-    .find((p) => p.type === 'timeZoneName')!.value;
 
-  it('states the time zone when it is asked to', () => {
-    const text = absTime(at, { zone: true });
-    expect(text.endsWith(zone)).toBe(true);
-    expect(text.startsWith(absTime(at))).toBe(true);
+  it('states the time in UTC with the zone, to the second', () => {
+    expect(absTime(at)).toBe('2026-10-02 12:10:28 UTC');
+    expect(absTime(at)).toBe(utcStamp(at, { seconds: true }));
   });
 
-  it('leaves the zone out by default', () => {
-    // Negative control: the tooltips keep the short form.
-    expect(absTime(at).endsWith(zone)).toBe(false);
+  it('reads one instant the same in any form of the wire value', () => {
+    expect(absTime('2026-10-02T08:10:28-04:00')).toBe('2026-10-02 12:10:28 UTC');
+    expect(absTime('2026-10-02T12:10:28.512+00:00')).toBe('2026-10-02 12:10:28 UTC');
   });
 
-  it('keeps the dash and the raw string with the zone option', () => {
-    expect(absTime(null, { zone: true })).toBe('—');
-    expect(absTime('not-a-date', { zone: true })).toBe('not-a-date');
+  it('keeps the dash and the raw string', () => {
+    // Negative control: no value reads as a time.
+    expect(absTime(null)).toBe('—');
+    expect(absTime('')).toBe('—');
+    expect(absTime('not-a-date')).toBe('not-a-date');
+  });
+});
+
+describe('localTitle and timeTitle', () => {
+  const at = '2026-10-02T12:10:28Z';
+
+  it('states the local time with its zone in the tooltip of an absolute time', () => {
+    expect(localTitle(at, { timeZone: 'America/New_York' })).toBe('Local time: 2026-10-02 08:10 EDT');
+    expect(localTitle(at, { timeZone: 'UTC' })).toBe('Local time: 2026-10-02 12:10 UTC');
+  });
+
+  it('states the UTC time and the local time in the tooltip of a relative time', () => {
+    expect(timeTitle(at, { timeZone: 'America/New_York' })).toBe(
+      '2026-10-02 12:10 UTC. Local time: 2026-10-02 08:10 EDT',
+    );
+  });
+
+  it('gives no tooltip for no value', () => {
+    // Negative control: no value gives no "Local time: " with no time.
+    expect(localTitle(null)).toBeUndefined();
+    expect(localTitle('not-a-date')).toBeUndefined();
+    expect(timeTitle(null)).toBe('');
+    expect(timeTitle('not-a-date')).toBe('not-a-date');
   });
 });
 
@@ -138,7 +164,8 @@ describe('timeLabel and agoFromLabel', () => {
     const iso = new Date(now - 4 * 86_400_000).toISOString();
     const label = timeLabel(iso, now);
     expect(label.text).toBe('4d ago');
-    expect(label.title).toBe(absoluteTime(iso));
+    expect(label.title).toBe(timeTitle(iso));
+    expect(label.title.startsWith(`${utcStamp(iso)}. Local time: `)).toBe(true);
   });
 
   it('adds "ago" to a server label and leaves other text alone', () => {
@@ -218,5 +245,24 @@ describe('utcStamp and utcWindow', () => {
   it('is the same function the lead words export', () => {
     expect(leadWords.utcStamp).toBe(utcStamp);
     expect(leadWords.utcWindow).toBe(utcWindow);
+  });
+});
+
+describe('utcTimesInText (AA5)', () => {
+  it('writes each ISO instant of prose in the one UTC form of the page', () => {
+    expect(utcTimesInText('At 2026-11-04T15:36:54Z the host sent one SYN.')).toBe(
+      'At 2026-11-04 15:36:54 UTC the host sent one SYN.',
+    );
+    expect(utcTimesInText('From 2026-11-04T10:36:54.120-05:00 on.')).toBe('From 2026-11-04 15:36:54 UTC on.');
+    // A time with no zone is UTC, the clock of the text the server writes.
+    expect(utcTimesInText('Window 2026-11-04T15:36 to 2026-11-04T16:36.')).toBe(
+      'Window 2026-11-04 15:36 UTC to 2026-11-04 16:36 UTC.',
+    );
+  });
+
+  it('leaves text that holds no ISO instant (NEGATIVE CONTROL)', () => {
+    const text = 'Version 1.6.0 ran on 2026-11-04 at 15:36 UTC from 192.0.2.10:51820.';
+    expect(utcTimesInText(text)).toBe(text);
+    expect(utcTimesInText('2026-13-45T99:99Z')).toBe('2026-13-45T99:99Z');
   });
 });

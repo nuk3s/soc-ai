@@ -17,6 +17,7 @@
 // ---------------------------------------------------------------------------
 
 import { LEAD_COVERED } from './campaignWords';
+import { DECIDE_ON_RULE, ruleDecisionHeadWords } from './ruleDecision';
 import { ACTION_VERB } from '../components/ActionCard';
 import type { LeadDetail } from './api';
 import {
@@ -149,12 +150,19 @@ export interface InvestigationFlowOptions {
   /** The run reached a terminal state with no verdict, or the client gave up
    *  on it. The page computes this, so the strip and the page agree. */
   failed?: boolean;
+  /** The run is an open false positive that waits on one decision for its
+   *  rule (round 3, part 2: F5). The strip names that step. */
+  ruleDecision?: { href: string; count: number } | null;
   /** An action of this run was executed in this tab, before the next read. */
   actedHere?: boolean;
   /** The run writes nothing: a backtest replay. */
   noWrites?: boolean;
   /** The run is inside an authorized activity scope. It requests no case. */
   authorized?: boolean;
+  /** A campaign with a decision in force holds the run: the sentence of the
+   *  decision ("The analyst closed the campaign on {date}. No action
+   *  waits."). The strip then names no write as the next step (OW4). */
+  campaignDecided?: string | null;
 }
 
 /** The flow of one investigation, for the alert drawer and the page. */
@@ -267,7 +275,13 @@ export function investigationFlow(
     // settle an escalate: after an override to true positive the strip read
     // the old auto-ack as the action (R2-D22).
     const waiting = pending.filter((a) => a.tag !== 'ack');
-    if (opts.authorized && !applied) {
+    if (opts.campaignDecided && !applied) {
+      // The analyst decided on the campaign that holds the run. No action
+      // waits, and the strip asked for an escalate (dogfood 2026-11-17, N12).
+      action.state = 'done';
+      action.note = 'none waits';
+      action.title = opts.campaignDecided;
+    } else if (opts.authorized && !applied) {
       // The run matches an authorized activity. No action waits, and the
       // strip names no write as the next step.
       action.state = 'done';
@@ -276,6 +290,14 @@ export function investigationFlow(
     } else if (!opts.actedHere && !inv.supersededBy && waiting.length > 0) {
       action.state = 'next';
       action.control = controlWords(waiting.map((a) => a.tag));
+    } else if (opts.ruleDecision && opts.ruleDecision.count > 0 && !applied && !inv.supersededBy) {
+      // The acknowledge waits on one decision for the rule, and no queue
+      // holds it alone. The strip read "Acknowledge, next" beside "0 actions
+      // wait for you" (dogfood 2026-11-19, D8).
+      action.state = 'next';
+      action.control = DECIDE_ON_RULE;
+      action.to = opts.ruleDecision.href;
+      action.title = `${ruleDecisionHeadWords(opts.ruleDecision.count)} ${DECIDE_ON_RULE}.`;
     } else if (applied) {
       action.state = 'done';
     } else if (inv.supersededBy) {
@@ -646,5 +668,5 @@ export function huntFlow(hunt: FlowHunt, leadId: number | null = null): FlowStep
               : undefined,
     title: 'This hunt. It returns findings. soc-ai investigates each threat finding when the hunt ends.',
   };
-  return settle([...huntOrigin(hunt, leadId), huntStep, ...huntTail(hunt, 'Re-hunt')]);
+  return settle([...huntOrigin(hunt, leadId), huntStep, ...huntTail(hunt, 'Hunt again')]);
 }

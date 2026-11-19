@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -67,6 +67,7 @@ async def recorded_run(
     finding_ordinal: int | None = None,
     is_synth_eval: bool = False,
     subject: dict[str, Any] | None = None,
+    finding_hosts: Sequence[str] | None = None,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Wrap *event_stream* with the investigation recorder tee.
 
@@ -89,6 +90,10 @@ async def recorded_run(
     ``subject`` (optional, D2): the hunt-subject record
     (``HuntSubject.as_record()``), persisted on the row at birth. None is the
     ordinary alert subject.
+
+    ``finding_hosts`` (optional): the hosts of the promoted finding of a
+    finding run. The row stores the flow of the anchor only when it touches
+    one of them. None on every other run.
     """
     recorder = InvestigationRecorder(
         state.db_sessionmaker,
@@ -100,6 +105,7 @@ async def recorded_run(
         finding_ordinal=finding_ordinal,
         is_synth_eval=is_synth_eval,
         subject=subject,
+        finding_hosts=finding_hosts,
     )
     inv_id = await recorder.start()
 
@@ -357,6 +363,11 @@ async def run_recorded(
         # lack the attribute — absent means the prod default, not opted in).
         is_synth_eval=is_synth_eval or bool(getattr(ctx, "include_synth", False)),
         subject=subject.as_record() if subject is not None else None,
+        finding_hosts=(
+            subject.promoted_hosts()
+            if subject is not None and subject.promoted_finding is not None
+            else None
+        ),
     ):
         yield name, data
 

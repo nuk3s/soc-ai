@@ -1213,6 +1213,9 @@ describe('Hosts list: findings and the last grid event', () => {
     // The header states the window of each count.
     const header = screen.getByRole('columnheader', { name: /Findings/ });
     expect(header.getAttribute('title')).toMatch(/last 7 days/);
+    // N15: the label states the window too, without a hover.
+    expect(within(header).getByTestId('header-scope-findings').textContent).toBe(' · 7d');
+    expect(header.textContent).toBe('Findings · 7d');
   });
 
   it('reads the newest grid event of the page in one request', async () => {

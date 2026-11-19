@@ -630,7 +630,7 @@ async def revoke_record(
         )
     ).all()
     for campaign in held:
-        decisions.write_revoked(db, campaign, by=by, now=now)
+        decisions.write_revoked(db, campaign, by=by, now=now, label=getattr(row, "label", None))
     return row, changed
 
 

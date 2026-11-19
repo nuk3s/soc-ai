@@ -3,6 +3,7 @@ import type { CampaignMember } from '../../lib/api';
 import { VIEW_HUNT, stageLabel } from '../../lib/campaignWords';
 import { utcStamp } from '../../lib/timeRange';
 import { ImpactChip } from '../ConfirmedThreats';
+import { FindingNameNote } from '../FindingNameNote';
 import { UNKNOWN, UNKNOWN_TONE } from '../Kpi';
 import { runHref } from './shared';
 
@@ -57,6 +58,7 @@ export function CampaignFindings({ members }: { members: CampaignMember[] }) {
                 <Link to={runHref(m.runId)} className="break-words text-accent hover:underline">
                   {m.label}
                 </Link>
+                <FindingNameNote note={m.nameNote} className="mt-1" />
                 {m.huntId && (
                   <div className="mt-0.5">
                     <Link

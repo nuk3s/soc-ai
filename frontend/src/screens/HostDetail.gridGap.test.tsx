@@ -6,7 +6,7 @@
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 import type {
   Dossier,
   DossierField,
@@ -207,7 +207,7 @@ describe('the host page grid gap strip', () => {
     mount('/hosts/agent%3Aea2d');
     await screen.findByTestId('host-hero');
     expect((await screen.findByTestId('grid-gap')).textContent).toBe(
-      `Most hosts sent no network flow documents from ${absoluteTime('2026-10-15T13:36:00Z')} to ${absoluteTime('2026-10-15T14:21:00Z')} (45 min). Counts in this window are incomplete.`,
+      `Most hosts sent no network flow documents from ${utcStamp('2026-10-15T13:36:00Z')} to ${utcStamp('2026-10-15T14:21:00Z')} (45 min). Counts in this window are incomplete.`,
     );
   });
 

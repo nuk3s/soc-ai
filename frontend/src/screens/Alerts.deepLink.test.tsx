@@ -179,7 +179,7 @@ describe('Alerts verdict filter actually filters', () => {
     );
     expect(screen.queryByText(GROUP.name)).toBeNull();
     expect(screen.getByText(/untriaged ·/).textContent).toBe(
-      '0 untriaged · 0 detections · 0 events in window',
+      '0 untriaged · 0 detections · 0 events in window · acknowledged alerts hidden',
     );
   });
 });

@@ -192,7 +192,9 @@ def test_one_request_runs_the_pending_action_scan_once(client: TestClient) -> No
 
     _seed_run(client, "INV-NMI", alert_id="es-nmi", verdict="needs_more_info")
     _seed_run(client, "INV-TP", alert_id="es-tp", verdict="true_positive", actions=[_ESCALATE])
-    real = routes_meta.pending_action_runs
+    # The scan of the one rule (OW2): the pending actions are its runs with
+    # a waiting action.
+    real = routes_meta.needs_you_runs
     calls: list[tuple[Any, Any]] = []
 
     async def counted(db: Any, **kwargs: Any) -> dict[str, int]:
@@ -207,7 +209,7 @@ def test_one_request_runs_the_pending_action_scan_once(client: TestClient) -> No
             "soc_ai.api.webui.routes_alerts.untriaged_group_count",
             AsyncMock(return_value=(1, False)),
         ),
-        patch.object(routes_meta, "pending_action_runs", counted),
+        patch.object(routes_meta, "needs_you_runs", counted),
     ):
         body = _needs_you(client)
         assert len(calls) == 1

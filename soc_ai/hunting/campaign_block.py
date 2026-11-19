@@ -37,8 +37,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
+from soc_ai.campaigns.ladder import held_by
 from soc_ai.campaigns.types import ROLE_ACTOR, STAGES, TRUE_POSITIVE, naive_utc
 from soc_ai.campaigns.words import stage_words
 from soc_ai.detection.untrusted import UNTRUSTED_BEGIN, UNTRUSTED_END
@@ -261,8 +262,12 @@ def render(facts: CampaignFacts) -> str:
     elif rest > 1:
         machines += f"; {rest} more machines are not shown"
     lines.append(f"- Machines: {machines}.")
+    # A stage that a later stage proves earlier states that time, with "by".
+    earlier = held_by(dict(facts.stages))
     reached = [
-        f"{words} at {_stamp(at)}"
+        f"{words} by {_stamp(earlier[stage].at)}"
+        if stage in earlier
+        else f"{words} at {_stamp(at)}"
         for stage, at in facts.stages
         if (words := stage_words(stage)) is not None
     ]
@@ -313,7 +318,7 @@ async def blocks_for_hunt(
 
 
 async def _blocks(db: Any, scope: Scope, hours: int, now: datetime) -> tuple[CampaignBlock, ...]:
-    from soc_ai.hunting.weight import decay_horizon_hours  # noqa: PLC0415 - light import graph
+    from soc_ai.campaigns.service import open_sql  # noqa: PLC0415 - heavy module
 
     cutoff = now - timedelta(hours=hours)
     query = select(Campaign).where(Campaign.status == _STATUS_ACTIVE)
@@ -322,9 +327,9 @@ async def _blocks(db: Any, scope: Scope, hours: int, now: datetime) -> tuple[Cam
             return ()
         query = query.where(Campaign.id == int(scope.campaign_id))
     else:
-        # Open: the last event is inside one horizon. Or an event in the window.
-        opened = now - timedelta(hours=decay_horizon_hours())
-        query = query.where(Campaign.last_event >= min(opened, cutoff))
+        # Open: the last activity is inside one horizon, the end rule of the
+        # campaign pages. Or an event in the window.
+        query = query.where(or_(open_sql(now), Campaign.last_event >= cutoff))
     rows = list(
         (
             await db.scalars(

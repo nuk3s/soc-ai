@@ -186,6 +186,6 @@ describe('the same-flow chip', () => {
   it('shows a sibling with no verdict as a pipeline error', () => {
     const { chip } = renderChip({ siblings: [sib({ verdict: null })] });
     fireEvent.click(chip);
-    expect(screen.getByTestId('same-flow-popover').textContent).toContain('Pipeline error');
+    expect(screen.getByTestId('same-flow-popover').textContent).toContain('Failed');
   });
 });

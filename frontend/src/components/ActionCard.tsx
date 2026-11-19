@@ -3,8 +3,12 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { getActionScope, type ActionScope, type InvestigationCampaign } from '../lib/api';
 import { campaignHolds } from '../lib/campaignDecision';
-import { ACTION_CAMPAIGN_NOTE, OPEN_CAMPAIGN } from '../lib/campaignWords';
+import { ACTION_CAMPAIGN_NOTE, OPEN_CAMPAIGN, campaignDecidedNoWait } from '../lib/campaignWords';
+import { utcStamp } from '../lib/timeRange';
 import type { ActionTag, CaseLink, RecommendedAction } from '../lib/types';
+import type { InvestigationRuleDecision } from '../lib/api';
+import { DECIDE_ON_RULE, OPEN_RULE_DECISION, ruleOpenWords, ruleReceiptWords } from '../lib/ruleDecision';
+import { RULE_ICON } from './rule/RuleRowFacts';
 
 // ---------------------------------------------------------------------------
 // One recommended action, from the recommendation to the record.
@@ -121,21 +125,15 @@ export const ACK_COUNTING = 'soc-ai is counting the alerts this ack covers.';
 export const ACK_COUNT_FAILED =
   'soc-ai could not count the alerts. The ack covers the unacknowledged alerts of this rule from the last 7 days.';
 
-/** "Oct 19, 03:12 UTC": the local date, clock time and zone of an ISO
- *  instant, or null when it does not parse. A bare "03:12" named no day and
- *  no zone (dogfood 2026-10-19, R2-D17). */
+/** "2026-10-19 03:12 UTC": the date, clock time and zone of an ISO instant,
+ *  or null when it does not parse. A bare "03:12" named no day and no zone
+ *  (dogfood 2026-10-19, R2-D17). The form is the one of the investigation
+ *  page (utcStamp): the page showed one event in three forms (AA5). */
 export function clockTime(iso: string | null | undefined): string | null {
   if (!iso) return null;
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return null;
-  return d.toLocaleString([], {
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-    timeZoneName: 'short',
-  });
+  return utcStamp(d.toISOString());
 }
 
 /** "Executed by auto-ack at 03:12": who or what wrote, and when. A record
@@ -200,6 +198,7 @@ export function ActionCard({
   casesComplete = false,
   findingCase = false,
   campaign = null,
+  ruleDecision = null,
 }: {
   action: RecommendedAction;
   /** The position of the action in the report. The server keys on it. */
@@ -234,6 +233,10 @@ export function ActionCard({
   /** The campaign of the investigation. When the campaign holds it, the card
    *  names the campaign and sends the analyst there. The write stays. */
   campaign?: InvestigationCampaign | null;
+  /** Set when the investigation is an open false positive. The open
+   *  Acknowledge states the open false positives of its rule and links the
+   *  rule page. */
+  ruleDecision?: InvestigationRuleDecision | null;
 }) {
   const Icon = ACTION_ICON[action.tag];
   const tagStyle = ACTION_TAG_COLOR[action.tag];
@@ -261,6 +264,9 @@ export function ActionCard({
   // of the investigation. The server sends the same sentence as `note` with
   // the code `campaign`, so the card states it once.
   const ownCampaignNote = !!campaign && campaignHolds(campaign);
+  // A campaign with a decision in force asks for nothing (OW4): the card
+  // states the decision in place of "Open the case on the campaign."
+  const decidedNoWait = ownCampaignNote ? campaignDecidedNoWait(campaign) : null;
   // The server states why a write can act against an analyst verdict. The
   // row of the pending-action list reads the same rule (R1-I1 follow-up).
   const blockedReason = action.blockedReason || undefined;
@@ -416,6 +422,25 @@ export function ActionCard({
               {action.pendingNote}
             </div>
           )}
+          {/* An open false positive: one decision for the whole rule. */}
+          {action.tag === 'ack' && ruleDecision && ruleDecision.count > 0 && (
+            <div
+              data-testid="action-rule-decision"
+              className="mt-1 flex flex-wrap items-baseline gap-x-2 gap-y-0.5 pl-[31px] text-[12px] leading-[1.5] text-text-2"
+            >
+              <span className="min-w-0 break-words">
+                <RULE_ICON size={11} aria-hidden className="mr-1 inline-block align-[-1px] text-dim" />
+                {ruleOpenWords(ruleDecision.count)}
+              </span>
+              <Link
+                to={ruleDecision.href}
+                className="inline-flex flex-none items-center gap-0.5 font-semibold text-accent hover:underline"
+              >
+                {DECIDE_ON_RULE}
+                <ArrowUpRight size={12} aria-hidden />
+              </Link>
+            </div>
+          )}
           {/* An ack the record calls done and the grid does not show. The
               card offers it again and names the earlier write. */}
           {action.appliedBy && (
@@ -440,7 +465,7 @@ export function ActionCard({
                     {'. '}
                   </>
                 )}
-                {blockedReason}
+                {decidedNoWait ?? blockedReason}
               </span>
               {campaignHref && (
                 <Link
@@ -462,7 +487,7 @@ export function ActionCard({
                 <Network size={11} aria-hidden className="mr-1 inline-block align-[-1px] text-dim" />
                 {ACTION_CAMPAIGN_NOTE.before}
                 <span className="font-semibold">{campaign.title.trim()}</span>
-                {ACTION_CAMPAIGN_NOTE.after}
+                {decidedNoWait ? `. ${decidedNoWait}` : ACTION_CAMPAIGN_NOTE.after}
               </span>
               <Link
                 to={`/campaigns/${campaign.id}`}
@@ -594,12 +619,25 @@ export function ActionCard({
             className="flex items-center gap-2 text-[12.5px] font-semibold"
             style={{ color: '#3fb950' }}
           >
-            {applied
-              ? action.appliedNote === 'Already acknowledged'
-                ? '✓ Already acknowledged in Security Onion'
-                : `✓ ${executedLine(action.appliedBy ?? 'auto-ack', action.appliedAt)}`
-              : `✓ ${executedLine(executedBy ?? 'you', new Date().toISOString())}`}
+            {applied && action.ruleDecisionReceipt
+              ? `✓ ${ruleReceiptWords(action.ruleDecisionReceipt.at ?? action.appliedAt)}`
+              : applied
+                ? action.appliedNote === 'Already acknowledged'
+                  ? '✓ Already acknowledged in Security Onion'
+                  : `✓ ${executedLine(action.appliedBy ?? 'auto-ack', action.appliedAt)}`
+                : `✓ ${executedLine(executedBy ?? 'you', new Date().toISOString())}`}
           </div>
+          {/* The receipt of a rule decision links the decision. */}
+          {applied && action.ruleDecisionReceipt?.href && (
+            <Link
+              to={action.ruleDecisionReceipt.href}
+              data-testid="action-rule-receipt-link"
+              className="mt-0.5 inline-flex items-center gap-0.5 text-[12px] font-semibold text-accent hover:underline"
+            >
+              {OPEN_RULE_DECISION}
+              <ArrowUpRight size={12} aria-hidden />
+            </Link>
+          )}
           {(message || (applied && action.appliedDetail)) && (
             <div data-testid="action-result" className="mt-1 text-[12px] leading-[1.5] text-dim">
               {message || action.appliedDetail}

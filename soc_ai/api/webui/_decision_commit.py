@@ -35,6 +35,8 @@ FAILED_KIND: dict[str, str] = {
     "campaign_case_retry": "campaign_case_failed",
     "authorized_activity_created": "authorized_activity_create_failed",
     "authorized_activity_revoked": "authorized_activity_revoke_failed",
+    "rule_decision_made": "rule_decision_failed",
+    "rule_decision_ended": "rule_decision_failed",
 }
 
 

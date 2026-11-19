@@ -56,8 +56,9 @@ vi.mock('../lib/api', async (importOriginal) => ({
   }),
 }));
 
-import { getAlerts, getAutoTriageStatus, getHealth, listInvestigations } from '../lib/api';
+import { getAlerts, getAutoTriageStatus, getHealth, getThreats, listInvestigations } from '../lib/api';
 import { Dashboard } from './Dashboard';
+import { absTime, localTitle } from '../lib/timeRange';
 
 function Where() {
   const loc = useLocation();
@@ -82,6 +83,12 @@ beforeEach(() => {
   vi.mocked(listInvestigations).mockReset().mockResolvedValue(page() as never);
   vi.mocked(getAutoTriageStatus).mockReset().mockResolvedValue({ active: false, hunted: 0, total: 0 } as never);
   vi.mocked(getHealth).mockReset().mockResolvedValue(null as never);
+  vi.mocked(getThreats).mockReset().mockResolvedValue({
+    window: { since: '2026-10-08T00:00:00Z', until: '2026-10-09T00:00:00Z' },
+    rows: [],
+    authorized: [],
+    total: 0,
+  });
 });
 
 describe('the window in the URL (D22)', () => {
@@ -113,10 +120,23 @@ describe('the window in the URL (D22)', () => {
 });
 
 describe('the links carry the window (D7)', () => {
+  // "Open them" shows when a true positive waits. Under a count of 0 the tile
+  // states that none waits.
+  beforeEach(() => {
+    vi.mocked(getThreats).mockResolvedValue({
+      window: { since: '2026-10-08T00:00:00Z', until: '2026-10-09T00:00:00Z' },
+      rows: [],
+      authorized: [],
+      total: 2,
+      waiting: 2,
+      waitingHosts: 1,
+    });
+  });
+
   it('"Open them" and "View all" name the preset window', async () => {
     mount('/dashboard?range=7d');
     const open = await screen.findByRole('link', { name: 'Open them' });
-    expect(open.getAttribute('href')).toBe('/investigations?range=7d&verdict=true_positive');
+    expect(open.getAttribute('href')).toBe('/investigations?range=7d&verdict=true_positive&waits=true');
     expect(screen.getByRole('link', { name: /View all/ }).getAttribute('href')).toBe('/investigations?range=7d');
   });
 
@@ -128,6 +148,17 @@ describe('the links carry the window (D7)', () => {
     expect(p.get('from')).toBe('2026-10-08T00:00');
     expect(p.get('to')).toBe('2026-10-09T00:00');
     expect(p.get('verdict')).toBe('true_positive');
+    expect(p.get('waits')).toBe('true');
+  });
+
+  it('the Alert events tile opens the Alerts list it counts (AA6)', async () => {
+    // The tile counts acknowledged alerts, and the list hides them by
+    // default: one window read 9,598 on the tile and 1,877 on the list.
+    mount('/dashboard?range=7d');
+    const link = await screen.findByTestId('alert-events-link');
+    expect(link.getAttribute('href')).toBe('/alerts?range=7d&hide_acked=false');
+    expect(link.textContent).toBe('Show in Alerts');
+    expect(screen.getByTestId('alert-events-sub').textContent).toContain('acknowledged alerts included');
   });
 });
 
@@ -153,7 +184,7 @@ describe('the store-read tiles in a grid outage (D26)', () => {
     } as never);
     mount();
     await waitFor(() => expect(screen.getAllByTestId('tile-incomplete').length).toBeGreaterThanOrEqual(2));
-    const tp = screen.getByText('True positives · 24h').closest('div.px-4') as HTMLElement;
+    const tp = screen.getByText('True positives that wait · 24h').closest('div.px-4') as HTMLElement;
     expect(within(tp).queryByTestId('tile-incomplete')).toBeNull();
     // The banner names the grid with the one term.
     expect(screen.getByRole('alert').textContent).toContain('The grid is not reachable.');
@@ -169,7 +200,8 @@ describe('the clocks (D9)', () => {
     expect((await screen.findByTestId('outcomes-clock')).textContent).toBe(
       'The chart counts the alert groups with an alert in this window.',
     );
-    expect((await screen.findByTestId('tp-hosts')).textContent).toBe('on 0 hosts in this window');
+    // No "on 0 hosts" under a count of 0.
+    expect((await screen.findByTestId('tp-hosts')).textContent).toBe('None waits in this window.');
     expect(screen.getByTestId('confirmed-threats-title').textContent).toBe('Confirmed threats · last 24 hours');
   });
 });
@@ -184,7 +216,11 @@ describe('the Auto-Investigate times (D11)', () => {
     mount();
     const t = await screen.findByTestId('autotriage-last-batch-time');
     expect(t.getAttribute('dateTime')).toBe(at);
-    expect(t.getAttribute('title')).toBe('23 minutes ago');
+    // Round 3, T3: the time reads in UTC with the label. The tooltip states
+    // the age and the local time with its zone.
+    expect(t.textContent).toBe(absTime(at));
+    expect(t.textContent!.endsWith(' UTC')).toBe(true);
+    expect(t.getAttribute('title')).toBe(`23 minutes ago. ${localTitle(at)}`);
   });
 
   it('dates a degraded sweep', async () => {

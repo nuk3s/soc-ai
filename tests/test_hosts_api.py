@@ -634,6 +634,18 @@ def test_resolve_answers_404_for_nothing(estate: TestClient) -> None:
     assert response.json()["detail"]["reason"] == "no_host"
 
 
+def test_resolve_answers_empty_on_request_for_nothing(estate: TestClient) -> None:
+    """N17: the entity page of an external address asks with ``empty=true``
+    and gets 200 with three nulls, so it makes no request that fails."""
+    response = estate.get("/api/v1/hosts/resolve", params={"value": "203.0.113.9", "empty": "true"})
+
+    assert response.status_code == 200
+    assert response.json() == {"key": None, "primary_ip": None, "matched": None}
+    # Negative control: a machine still resolves with the flag on.
+    found = estate.get("/api/v1/hosts/resolve", params={"value": "nexus", "empty": "true"}).json()
+    assert (found["key"], found["matched"]) == ("agent:a-nexus", "name")
+
+
 def test_the_machine_page_lists_every_address_and_the_primary_dossier(
     estate: TestClient,
 ) -> None:

@@ -614,9 +614,9 @@ def test_a_four_hour_burst_on_a_flat_host_departs() -> None:
     assert departure.statistic_value == 90.0
     assert departure.run_start == _WEDNESDAY + timedelta(hours=14)
     assert departure.run_end == _WEDNESDAY + timedelta(hours=18)
-    assert departure.peak_label == "Wednesday 14:00"
+    assert departure.peak_label == "Wednesday 14:00 UTC"
     assert departure.sample_ids == ("h14", "h15", "h16", "h17")
-    assert "on Wednesday 14:00 is 1000 per hour" in result.note
+    assert "on Wednesday 14:00 UTC is 1000 per hour" in result.note
     assert "The baseline expects 100 per hour at that hour of the week" in result.note
     assert "The departure lasted 4 hours" in result.note
 
@@ -634,13 +634,14 @@ def test_the_same_burst_on_a_host_whose_monday_morning_is_like_that_does_not() -
 
 def test_the_hour_of_the_week_is_named_in_the_deployment_zone() -> None:
     """A burst from 20:00 to 23:59 UTC on a Wednesday starts at 16:00 in New
-    York, inside working hours there. The cell and the label are local."""
+    York, inside working hours there. The cell and the label are local, and
+    the label names its zone."""
     burst = {20: 1000.0, 21: 1000.0, 22: 1000.0, 23: 1000.0}
     profile = _series_profile(_flat)
     local = _rate("above", profile, _day(_WEDNESDAY, burst), tz="America/New_York")
     utc = _rate("above", profile, _day(_WEDNESDAY, burst), tz="UTC")
-    assert [(d.member, d.peak_label) for d in local.departures] == [("work", "Wednesday 16:00")]
-    assert [(d.member, d.peak_label) for d in utc.departures] == [("off", "Wednesday 20:00")]
+    assert [(d.member, d.peak_label) for d in local.departures] == [("work", "Wednesday 16:00 EDT")]
+    assert [(d.member, d.peak_label) for d in utc.departures] == [("off", "Wednesday 20:00 UTC")]
 
 
 def test_one_hour_just_over_the_bar_needs_a_second_hour() -> None:

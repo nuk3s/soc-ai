@@ -11,8 +11,9 @@ them from here:
 * ``threat_found``: at least one finding claims a threat.
 * ``no_threat``: the hunt tested its objective and found no threat.
 * ``no_answer``: the hunt ran and could not test its objective. Every finding
-  is a visibility gap, a part of the run failed, or the narrative says that the
-  answer can be neither confirmed nor ruled out.
+  is a visibility gap, a part of the run failed, or the hunt holds no
+  observation finding and the narrative says that the answer can be neither
+  confirmed nor ruled out.
 * ``could_not_run``: the hunt stopped (error, cancel or restart), or every
   finding is the record that a query failed.
 * ``running``: the hunt has not ended.
@@ -278,7 +279,14 @@ def public_outcome(
         return "could_not_run"
     if internal in ("gap", "failed"):
         return "no_answer"
-    if _NO_ANSWER_RE.search(narrative or ""):
+    # The narrative test decides only for a hunt that holds no conclusion of
+    # its own. A hunt with an observation finding looked, explained what it
+    # saw and found no threat. Its "cannot be confirmed or ruled out" sentence
+    # names a coverage limit, the same caveat a gap finding beside an
+    # observation is in hunt_outcome. Prod hunt 01M7G85Z... read "No answer"
+    # over 8 observations and "found no malicious activity" (dogfood N2).
+    concluded = any(finding_category(f) != "visibility_gap" for f in rows)
+    if not concluded and _NO_ANSWER_RE.search(narrative or ""):
         return "no_answer"
     return "no_threat"
 

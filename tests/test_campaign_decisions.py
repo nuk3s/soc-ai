@@ -192,11 +192,11 @@ async def test_a_new_event_a_higher_stage_and_a_new_machine_each_open_the_close_
         assert row is not None
         assert (row.decision, row.close_reason, row.decision_basis) == (None, None, None)
         reopened = [d for t, d in await _changes(db) if t == "reopened"]
-        assert reopened == [{"cause": cause}]
+        assert [d["cause"] for d in reopened] == [cause]
         # One more rebuild with nothing new writes no second reopen.
         await service.rebuild(db)
     async with maker() as db:
-        assert [d for t, d in await _changes(db) if t == "reopened"] == [{"cause": cause}]
+        assert [d["cause"] for t, d in await _changes(db) if t == "reopened"] == [cause]
 
 
 async def test_a_rerun_of_an_old_investigation_with_the_same_event_time_keeps_the_close(
@@ -291,7 +291,36 @@ async def test_a_merge_that_adds_machines_to_a_closed_campaign_opens_it_again(
         kept = await db.get(Campaign, older)
         assert kept is not None
         assert (kept.status, kept.decision) == ("active", None)
-        assert [d for t, d in await _changes(db, older) if t == "reopened"] == [{"cause": "party"}]
+        assert [d["cause"] for t, d in await _changes(db, older) if t == "reopened"] == ["party"]
+
+
+async def test_a_reopen_by_the_rebuild_keeps_the_decision_that_it_ended(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """SD1: the ``reopened`` change of a rebuild holds the close in ``was``."""
+    campaign_id = await _closed_campaign(maker)
+    async with maker() as db:
+        row = await db.get(Campaign, campaign_id)
+        assert row is not None
+        row.decision_note = "The red team ended the test."
+        await db.commit()
+        decided_at, basis = row.decided_at, dict(row.decision_basis or {})
+    await _rebuild_with(maker, alert_id="alert-n", event_hours_ago=0.5)
+    async with maker() as db:
+        (detail,) = [d for t, d in await _changes(db) if t == "reopened"]
+    assert decided_at is not None
+    assert detail == {
+        "cause": "activity",
+        "was": {
+            "decision": "closed",
+            "reason": "test_over",
+            "note": "The red team ended the test.",
+            "by": "analyst",
+            "decidedAt": decided_at.isoformat(),
+            "basis": basis,
+        },
+    }
+    assert basis["last_event"] and basis["parties"]
 
 
 def test_a_basis_that_soc_ai_cannot_read_covers_nothing() -> None:

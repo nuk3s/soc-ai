@@ -2,7 +2,7 @@ import { Network } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
 import { getHealth, type Health, type HealthComponent } from '../lib/api';
-import { absoluteTime, agoWords } from '../lib/timeRange';
+import { agoWords, timeTitle } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
 import { Panel, PanelHeader } from './Panel';
@@ -199,7 +199,7 @@ export function StatusDependenciesPanel() {
           </ul>
           <div className="border-t border-border px-[15px] py-2.5 text-[11.5px] leading-[1.55] text-faint">
             soc-ai reads the grid and calls the model gateway. A row that is not up names the
-            reason. {checked && <span title={absoluteTime(checkedAt ?? null)}>{checked}</span>}
+            reason. {checked && <span title={timeTitle(checkedAt ?? null)}>{checked}</span>}
           </div>
         </>
       )}

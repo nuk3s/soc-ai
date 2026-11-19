@@ -9,6 +9,7 @@ import type { GridGapBenignResult, GridGapHit, GridGapHits, GridGapHold } from '
 import { useAsync } from '../lib/useAsync';
 import { Drawer } from './Drawer';
 import { LoadingInline } from './States';
+import { UtcTime } from './UtcTime';
 
 // ---------------------------------------------------------------------------
 // The review of one grid gap.
@@ -294,7 +295,7 @@ function ReviewBody({
                   </Link>
                 )}
                 <span className="basis-full text-[11.5px] text-dim">
-                  {`Events ${utcWindow(hit.event_start, hit.event_end)}.`}
+                  Events <UtcTime iso={hit.event_start} to={hit.event_end} seconds={false} />.
                 </span>
                 {(hit.reasons ?? []).map((reason) => (
                   <span key={reason} className="basis-full text-[11.5px] text-warn">

@@ -492,7 +492,7 @@ describe('AnalyticDrawer, a system demotion', () => {
     expect(within(newest).getByTestId('version-system').textContent).toBe('soc-ai');
     expect(newest.textContent).toContain(`"${REASON}"`);
     const evidence = within(newest).getByTestId('version-evidence');
-    expect(evidence.textContent).toContain('42 hits in 24 h · budget 10 a day');
+    expect(evidence.textContent).toContain('42 hits in 24 h · daily hit limit 10');
     expect(evidence.textContent).toContain('precision 0.10 on 10 hunted leads');
     expect(evidence.textContent).toContain('floor 0.30');
     // A system demotion carries evidence, and no approval receipts.
@@ -559,7 +559,7 @@ describe('AnalyticDrawer, a system demotion', () => {
 describe('breachLine', () => {
   it('reads the hours the budget read, after an approval inside the day', () => {
     expect(breachLine({ rule: 'fire_budget', hits: 4, budget: 3, window_hours: 3 })).toBe(
-      '4 hits in 3 h · budget 3 a day',
+      '4 hits in 3 h · daily hit limit 3',
     );
   });
 

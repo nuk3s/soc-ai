@@ -205,6 +205,9 @@ class HostActivity:
     volume: list[VolumePoint] = field(default_factory=list)
     users: list[UserSeen] | None = None
     alerts_7d: int = 0
+    # The alerts of the chosen range, 24 hours or 7 days. The page counts its
+    # Alerts card with it, so the card follows the 24h and 7d buttons.
+    alerts: int = 0
     latest_investigation: LatestInvestigation | None = None
     # The ranked fold held more than MAX_PEERS peers, so rows fell off the end.
     peers_truncated: bool = False
@@ -635,8 +638,8 @@ def _detection_scope(ip: str) -> dict[str, Any]:
 
 async def _fetch_alert_edges(
     elastic: ElasticClient, settings: Settings, *, ip: str, window: str
-) -> tuple[int, set[str]]:
-    """``(alerts over 7d, peers that alerted within the chosen range)``.
+) -> tuple[int, int, set[str]]:
+    """``(alerts over 7d, alerts in the chosen range, peers that alerted in it)``.
 
     One search for both. The 7-day count is the query's total; the in-range peers
     come out of a filter sub-aggregation, so narrowing the flag to the visible
@@ -678,7 +681,13 @@ async def _fetch_alert_edges(
         if bucket.get("key")
     }
     alerted.discard(ip)
-    return result.total, alerted
+    # The documents of the chosen range: the filter bucket's own count. The
+    # host page counts its Alerts card over the window of its 24h and 7d
+    # buttons (dogfood 2026-11-17, AB1). The 7-day total stays for an older
+    # page.
+    recent = aggregations.get("recent")
+    in_window = int(recent.get("doc_count") or 0) if isinstance(recent, dict) else 0
+    return result.total, min(in_window, result.total), alerted
 
 
 def _uniquely_claimed(aggregations: dict[str, Any]) -> bool:
@@ -885,7 +894,7 @@ async def fetch_host_activity(
     # Unwrapped in priority order: the connection pass is the panel's spine, so
     # when the grid is down it is its error the analyst should be shown.
     aggregations = _unwrap(conn_out).aggregations or {}
-    alerts_7d, alerted = _unwrap(edges_out)
+    alerts_7d, alerts_in_window, alerted = _unwrap(edges_out)
     users, users_truncated = _unwrap(users_out)
     latest = _unwrap(latest_out)
 
@@ -914,6 +923,7 @@ async def fetch_host_activity(
         volume=_fold_volume(aggregations),
         users=users,
         alerts_7d=alerts_7d,
+        alerts=alerts_in_window,
         latest_investigation=latest,
         peers_truncated=peers_truncated,
         users_truncated=users_truncated,

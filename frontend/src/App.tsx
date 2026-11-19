@@ -3,6 +3,7 @@ import { Link, Navigate, Route, Routes, useLocation, useParams } from 'react-rou
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { RouteFallback } from './components/States';
 import { getMe } from './lib/api';
+import { useConsoleTimeZone } from './lib/clock';
 import { lazyWithReload } from './lib/lazyWithReload';
 import { AppShell } from './shell/AppShell';
 
@@ -34,6 +35,7 @@ const Login = lazyWithReload(() => import('./screens/Login').then((m) => ({ defa
 const Notifications = lazyWithReload(() => import('./screens/Notifications').then((m) => ({ default: m.Notifications })));
 const Operate = lazyWithReload(() => import('./screens/Operate').then((m) => ({ default: m.Operate })));
 const Runbooks = lazyWithReload(() => import('./screens/Runbooks').then((m) => ({ default: m.Runbooks })));
+const RuleDecision = lazyWithReload(() => import('./screens/RuleDecision').then((m) => ({ default: m.RuleDecision })));
 
 /**
  * The /entity/:value route.
@@ -107,6 +109,11 @@ function RootRoute() {
 }
 
 export function App() {
+  // The local zone of the console (round 4, C4). A change of the second
+  // clock renders the routes again, so each tooltip that a page builds with
+  // timeTitle or localTitle states the new zone with no reload. A route
+  // keeps its state: only its elements are new.
+  useConsoleTimeZone();
   return (
     <Suspense fallback={<RouteFallback />}>
       {/* Boundary above the routes: a crash in Login (or any route render)
@@ -123,6 +130,7 @@ export function App() {
             <Route path="/investigation/:id" element={<InvestigationPage />} />
             <Route path="/notifications" element={<Notifications />} />
             <Route path="/needs-you" element={<NeedsYou />} />
+            <Route path="/needs-you/rule/:ruleKey" element={<RuleDecision />} />
             <Route path="/hunts" element={<Hunts />} />
             <Route path="/hunts/:id" element={<HuntDetail />} />
             <Route path="/leads/:id" element={<LeadDetail />} />

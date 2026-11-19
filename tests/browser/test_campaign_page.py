@@ -193,7 +193,7 @@ def test_the_tooltip_of_a_graphic_stays_whole_in_the_window(
     _no_failure(page)
 
 
-_LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision"}
+_LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision", "state"}
 
 
 def _link(row: dict[str, Any], *, differs: bool = False) -> dict[str, Any]:
@@ -204,6 +204,7 @@ def _link(row: dict[str, Any], *, differs: bool = False) -> dict[str, Any]:
         "stage": row["stage"],
         "differs": differs,
         "decision": row["decision"],
+        "state": row["state"],
     }
 
 
@@ -225,7 +226,11 @@ def test_the_investigations_of_the_demo_name_their_campaign(demo_mode_stack: dic
     assert all(r["campaign"] is None for r in others)
     seed = next(m for m in detail["members"] if m["link"] == "seed")
     page = _get(base, f"/api/v1/investigations/{seed['runId']}")
-    assert page["campaign"] == _link(row)
+    # The investigation page also states when the analyst decided on the
+    # campaign (round "decide once" part 2, OW4).
+    decided = row.get("decision") is not None
+    assert {k: v for k, v in page["campaign"].items() if k != "decidedAt"} == _link(row)
+    assert (page["campaign"]["decidedAt"] is not None) == decided
 
 
 def test_the_alert_groups_and_the_host_pages_of_the_demo_name_the_campaign(
@@ -471,6 +476,7 @@ def test_the_top_bar_the_tile_and_the_needs_you_page_state_one_number(
         + count["investigations_waiting"]
         + count["leads_needing_decision"]
         + count["untriaged_groups"]
+        + count["rules_waiting"]
     )
 
     _open(page, base, "/needs-you")
@@ -496,3 +502,56 @@ def test_the_top_bar_the_tile_and_the_needs_you_page_state_one_number(
     expect(lines.first).to_be_visible(timeout=_WAIT_MS)
     assert sum(_number(text) for text in lines.all_inner_texts()) == count["decisions"]
     expect(page.get_by_text("last all")).to_have_count(0)
+
+
+# Round 3, T4: a check script saw no move of the campaign page after two
+# wheel steps of 900 px in a 1440 x 1000 window. The script sent the wheel at
+# the pointer's start point (0, 0), off the content. The document never
+# scrolls: the content pane of the shell does. A wheel over the top of the page
+# moves the page, and no element of the campaign page holds the wheel.
+_SCROLL_STATE = """(h1) => {
+  let pane = h1.parentElement;
+  while (pane && !/(auto|scroll)/.test(getComputedStyle(pane).overflowY)) {
+    pane = pane.parentElement;
+  }
+  return {pane: pane ? pane.scrollTop : null,
+          room: pane ? pane.scrollHeight - pane.clientHeight : 0,
+          window: window.scrollY, top: h1.getBoundingClientRect().top};
+}"""
+
+
+def test_a_wheel_over_the_top_of_the_campaign_page_moves_the_page(
+    page: Page, demo_mode_stack: dict
+) -> None:
+    base = demo_mode_stack["base_url"]
+    row, _detail = _campaign(base)
+    page.set_viewport_size({"width": 1440, "height": 1000})
+    _open(page, base, f"/campaigns/{row['id']}")
+    title = page.get_by_role("heading", level=1, name=row["title"])
+    expect(title).to_be_visible(timeout=_WAIT_MS)
+    h1 = title.element_handle()
+    before = page.evaluate(_SCROLL_STATE, h1)
+    assert before["pane"] == 0 and before["room"] > 0, before
+
+    # Negative control: the wheel of the script, at (0, 0), moves nothing.
+    page.mouse.wheel(0, 900)
+    page.wait_for_timeout(500)
+    assert page.evaluate(_SCROLL_STATE, h1) == before
+
+    box = title.bounding_box()
+    assert box is not None
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.wheel(0, 900)
+    page.wait_for_function(
+        "([h1, top]) => h1.getBoundingClientRect().top < top",
+        arg=[h1, before["top"]],
+        timeout=_WAIT_MS,
+    )
+    page.wait_for_timeout(300)
+    after = page.evaluate(_SCROLL_STATE, h1)
+    moved = min(900, before["room"])
+    assert after["pane"] == moved, after
+    assert round(before["top"] - after["top"]) == moved, (before, after)
+    # The document itself never scrolls. A check that reads window.scrollY
+    # or calls window.scrollBy sees no move on any page of the console.
+    assert after["window"] == 0

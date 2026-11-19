@@ -37,12 +37,13 @@
 <text x="1000" y="163" font-size="11" font-weight="700" fill="#8b949e" text-anchor="end" letter-spacing="1">QUESTION</text>
 <text x="760" y="186" font-size="13" font-weight="600" fill="#e6edf3">Observations on one entity</text>
 <text x="760" y="203" font-size="13" font-weight="600" fill="#e6edf3">that are worth one look.</text>
-<text x="760" y="225" font-size="12.5" fill="#e6edf3">soc-ai hunts each new lead.</text>
-<text x="760" y="242" font-size="12.5" fill="#e6edf3">A clean hunt closes it.</text>
-<text x="760" y="259" font-size="12.5" fill="#e6edf3">A verdict on each threat closes it.</text>
-<text x="760" y="276" font-size="12.5" fill="#e6edf3">A lead of a campaign waits on</text>
-<text x="760" y="293" font-size="12.5" fill="#e6edf3">the campaign.</text>
-<text x="760" y="310" font-size="12.5" fill="#e6edf3">Any other lead waits on you.</text>
+<text x="760" y="224" font-size="12.5" fill="#e6edf3">soc-ai hunts each new lead.</text>
+<text x="760" y="239" font-size="12.5" fill="#e6edf3">A clean lead hunt closes it.</text>
+<text x="760" y="254" font-size="12.5" fill="#e6edf3">Another hunt writes its answer.</text>
+<text x="760" y="269" font-size="12.5" fill="#e6edf3">A verdict on each threat closes it.</text>
+<text x="760" y="284" font-size="12.5" fill="#e6edf3">A lead of a campaign waits on</text>
+<text x="760" y="299" font-size="12.5" fill="#e6edf3">the campaign.</text>
+<text x="760" y="314" font-size="12.5" fill="#e6edf3">Any other lead waits on you.</text>
 <text x="760" y="336" font-size="12.5" fill="#8b949e">Screen: Hunts › Leads.</text>
 <rect x="1136" y="136" width="272" height="216" rx="10" fill="#161b22" stroke="#58a6ff" stroke-width="1.5"/>
 <text x="1152" y="164" font-size="18" font-weight="700" fill="#e6edf3">Hunt</text>
@@ -139,9 +140,11 @@
 <circle cx="62" cy="889.5" r="4" fill="#d29922"/>
 <text x="74" y="894" font-size="13.5" font-weight="600" fill="#e6edf3">Leads that need a decision</text>
 <circle cx="362" cy="889.5" r="4" fill="#d29922"/>
-<text x="374" y="894" font-size="13.5" font-weight="600" fill="#e6edf3">Alert groups with no verdict</text>
-<text x="56" y="936" font-size="12.5" fill="#e6edf3">The oldest first. An item stays until it has a decision.</text>
-<text x="56" y="958" font-size="12.5" fill="#e6edf3">The top bar, the Dashboard and the Needs you page state the same number.</text>
+<text x="374" y="894" font-size="13.5" font-weight="600" fill="#e6edf3">Rules with open false positives</text>
+<circle cx="62" cy="913.5" r="4" fill="#d29922"/>
+<text x="74" y="918" font-size="13.5" font-weight="600" fill="#e6edf3">Alert groups with no verdict</text>
+<text x="56" y="948" font-size="12.5" fill="#e6edf3">The most important first. An item stays until it has a decision.</text>
+<text x="56" y="970" font-size="12.5" fill="#e6edf3">The top bar, the Dashboard and the Needs you page state the same number.</text>
 <rect x="890" y="812" width="300" height="200" rx="10" fill="#161b22" stroke="#d29922" stroke-width="1.5"/>
 <text x="906" y="840" font-size="16" font-weight="700" fill="#e6edf3">Your decision on a campaign</text>
 <text x="906" y="862" font-size="13" font-weight="600" fill="#e6edf3">One decision for the whole activity.</text>

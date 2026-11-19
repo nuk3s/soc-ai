@@ -20,7 +20,7 @@ from soc_ai.api.webui._shared import (
     _iso_z,
     router,
 )
-from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
+from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_read_error
 from soc_ai.config import Settings
 from soc_ai.errors import OqlValidationError
 from soc_ai.so_client.elastic import ElasticClient
@@ -146,6 +146,11 @@ class AckGroupIn(BaseModel):
     severity: str | None = None
     from_: str | None = None
     to: str | None = None
+    # The investigation whose card "No automatic action" made the press
+    # (round "decide once" part 2, OW1). soc-ai records the acknowledge or
+    # the escalate on it, so the true positive waits on no surface. The
+    # Alerts console sends none.
+    investigation_id: str | None = Field(default=None, max_length=64)
 
     model_config = {"populate_by_name": True}
 
@@ -331,6 +336,62 @@ class AckGroupOut(BaseModel):
     remaining: int = 0
 
 
+async def _record_settled(
+    request: Request, body: AckGroupIn, action: str, *, alerts: int, caller: str
+) -> None:
+    """Record the acknowledge or the escalate of the card "No automatic action".
+
+    The card of the run page writes through the group routes, and nothing
+    in the store tied the press to the investigation: the true positive
+    still waited on the tile, the panel and the host page. The record is an
+    investigation event (:data:`action_rules.SETTLED_EVENT`) beside the
+    receipts of the applied actions. soc-ai records it only when Security
+    Onion holds one or more alerts of the group acknowledged or on a case
+    after the press, and only for the investigation of the same rule. A
+    failed record never fails the write: the write is done.
+    """
+    if not body.investigation_id or alerts <= 0:
+        return
+    from sqlalchemy import func, select  # noqa: PLC0415 - lazy
+
+    from soc_ai.store.auth import utcnow  # noqa: PLC0415 - lazy
+    from soc_ai.store.models import Investigation, InvestigationEvent  # noqa: PLC0415 - lazy
+
+    try:
+        async with request.app.state.db_sessionmaker() as db:
+            inv = await db.get(Investigation, body.investigation_id)
+            if inv is None:
+                return
+            name = inv.rule_name or f"Alert {inv.alert_es_id or inv.id}"
+            if name != body.rule_name:
+                return
+            last = await db.scalar(
+                select(func.max(InvestigationEvent.sequence)).where(
+                    InvestigationEvent.investigation_id == inv.id
+                )
+            )
+            await inv_svc.append_events(
+                db,
+                inv.id,
+                [
+                    {
+                        "sequence": int(last or 0) + 1,
+                        "kind": action_rules.SETTLED_EVENT,
+                        "payload": {
+                            "action": action,
+                            "by": caller,
+                            "at": utcnow().isoformat(),
+                            "alerts": alerts,
+                        },
+                    }
+                ],
+            )
+    except Exception:  # the write is done; the record is best effort
+        logging.getLogger(__name__).warning(
+            "the record of a settled %s failed (continuing)", action, exc_info=True
+        )
+
+
 @router.post("/alerts/ack-group", response_model=AckGroupOut)
 async def ack_group(
     request: Request,
@@ -368,7 +429,7 @@ async def ack_group(
     except OqlValidationError as exc:
         raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        raise _grid_read_error(exc, analyst_query=body.q) from exc
     except ApiError as exc:
         # An ES ApiError is NOT a TransportError — without this arm an ES 4xx
         # still escapes the tuple above as an unhandled 500.
@@ -385,6 +446,7 @@ async def ack_group(
         )
 
     remaining = _remaining(matched, already_acked + len(events), more=more)
+    await _record_settled(request, body, "ack", alerts=acked + already_acked, caller=caller)
     if more:
         logging.getLogger(__name__).warning(
             "ack-group capped at %d events for rule %r, %d left (caller=%s)",
@@ -702,7 +764,7 @@ async def escalate_group(
     except OqlValidationError as exc:
         raise oql_refusal(exc) from exc
     except (TimeoutError, TransportError) as exc:
-        raise HTTPException(status_code=503, detail=_grid_unavailable(exc)) from exc
+        raise _grid_read_error(exc, analyst_query=body.q) from exc
     except ApiError as exc:
         raise _es_api_error_http(exc) from exc
 
@@ -740,6 +802,9 @@ async def escalate_group(
     )
 
     remaining = _remaining(matched, len(handled) + len(events), more=more)
+    await _record_settled(
+        request, body, "escalate", alerts=escalated + already_escalated, caller=caller
+    )
     if more:
         logging.getLogger(__name__).warning(
             "escalate-group capped at %d events for rule %r, %d left (caller=%s)",

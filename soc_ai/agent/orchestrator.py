@@ -1323,6 +1323,26 @@ async def _earlier_true_positive_holds_ack(
     return held
 
 
+async def _standing_rule_decision(ctx: InvestigationContext, rule_name: str | None) -> int | None:
+    """The id of the standing rule decision in force for the rule, or None.
+
+    Round 3 (RS5): the analyst decided once on the false positives of the
+    rule, and let soc-ai acknowledge each later false positive of it. That
+    decision lifts the hold ``high_stakes`` and no other guard. It ends after
+    its term, when the analyst ends it, and at once when an investigation of
+    the rule gets a true positive verdict.
+
+    FAILS CLOSED. No store on the context, no rule name, and a store that
+    does not answer give None, and the hold stays.
+    """
+    if not rule_name:
+        return None
+    from soc_ai.webui.rule_decisions import standing_for_rules  # noqa: PLC0415
+
+    found = await standing_for_rules(ctx.db_sessionmaker, [rule_name])
+    return (found or {}).get(rule_name)
+
+
 async def maybe_auto_ack_fp(
     report: TriageReport,
     es_id: str,
@@ -1347,7 +1367,9 @@ async def maybe_auto_ack_fp(
     - ``investigated`` — the run retrieved something
     - the report SUPPORTS ITSELF — it cites something, and what it cites
       resolved (see ``citation_coverage`` below)
-    - the alert is NOT high-stakes (see :func:`_is_high_stakes_alert`)
+    - the alert is NOT high-stakes (see :func:`_is_high_stakes_alert`), or
+      a standing rule decision of the analyst is in force for its rule
+      (:func:`_standing_rule_decision`); the decision lifts this hold only
     - no analyst verdict other than false positive stands on the alert, on
       this run or on any earlier run of it (see :func:`_analyst_verdict_holds_ack`)
     - no earlier run of the alert leaned true positive
@@ -1503,7 +1525,13 @@ async def maybe_auto_ack_fp(
             },
         )
         return uncited_ev
-    if _is_high_stakes_alert(alert):
+    rule_decision: int | None = None
+    high_stakes = _is_high_stakes_alert(alert)
+    if high_stakes:
+        # The analyst lifted this one hold for the rule with a standing rule
+        # decision (round 3, RS5). Every other guard above and below stays.
+        rule_decision = await _standing_rule_decision(ctx, alert.rule_name)
+    if high_stakes and rule_decision is None:
         # Blast-radius cap: never auto-write an ack on a high-stakes alert, even
         # on a confident FP. The verdict stands; a human must ack it.
         _LOGGER.info(
@@ -1556,15 +1584,10 @@ async def maybe_auto_ack_fp(
         _LOGGER.warning("auto-ack unexpected error for alert %s: %s", es_id, exc)
         success = False
 
-    ack_ev: StepEvent = emit_ev(
-        "auto_ack",
-        {
-            "es_id": es_id,
-            "confidence": report.confidence,
-            "threshold": settings.auto_ack_fp_threshold,
-            "success": success,
-        },
+    ack_payload = await _auto_ack_payload(
+        report, es_id, ctx=ctx, success=success, rule_decision=rule_decision, alert=alert
     )
+    ack_ev: StepEvent = emit_ev("auto_ack", ack_payload)
     try:
         await audit_ev(ack_ev)
     except Exception as exc:
@@ -1572,6 +1595,37 @@ async def maybe_auto_ack_fp(
     # Yield is caller's responsibility — we return the event for the caller to yield.
     # (Generators can't be called from non-generator helpers in Python.)
     return ack_ev
+
+
+async def _auto_ack_payload(
+    report: TriageReport,
+    es_id: str,
+    *,
+    ctx: InvestigationContext,
+    success: bool,
+    rule_decision: int | None,
+    alert: SoAlert,
+) -> dict[str, Any]:
+    """The payload of the ``auto_ack`` event.
+
+    An acknowledge that rests on a standing rule decision of the analyst
+    names the decision, and the decision counts it (round 3, RS5).
+    """
+    payload: dict[str, Any] = {
+        "es_id": es_id,
+        "confidence": report.confidence,
+        "threshold": ctx.settings.auto_ack_fp_threshold,
+        "success": success,
+    }
+    if rule_decision is None:
+        return payload
+    from soc_ai.webui import rule_decisions as rule_decisions_svc  # noqa: PLC0415
+
+    payload["rule_decision"] = rule_decision
+    payload["rule_key"] = rule_decisions_svc.rule_key(alert.rule_name or "")
+    if success:
+        await rule_decisions_svc.count_under(ctx.db_sessionmaker, {rule_decision: 1})
+    return payload
 
 
 async def _maybe_auto_ack_fp_gated(

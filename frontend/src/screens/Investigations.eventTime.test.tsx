@@ -79,8 +79,14 @@ describe('the When cell', () => {
     const cell = await screen.findByTestId('when-OLD');
     expect(cell.firstElementChild?.textContent).toBe('17d ago');
     expect(screen.getByTestId('investigated-OLD').textContent).toBe('investigated 1h ago');
-    expect(cell.getAttribute('title')).toMatch(
-      /^Event \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Investigated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$/,
+    // Round 3 part 2, P1: each relative time states the UTC time and the
+    // local time with its zone. The cell gave the UTC time alone.
+    const [event, investigated] = cell.querySelectorAll('[data-time="relative"]');
+    expect(event.getAttribute('title')).toMatch(
+      /^Event \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/,
+    );
+    expect(investigated.getAttribute('title')).toMatch(
+      /^Investigated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/,
     );
   });
 

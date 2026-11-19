@@ -46,4 +46,21 @@ describe('CommandPalette view entries', () => {
     fireEvent.click(screen.getByRole('option', { name: /My queue\s+View/ }));
     expect(navigateMock).toHaveBeenCalledWith('/alerts?view=mine');
   });
+
+  // NY4. The palette reaches the one list of every decision.
+  it('"Needs you" opens the Needs you page', async () => {
+    await openPalette();
+    fireEvent.click(screen.getByRole('option', { name: /^Needs you/ }));
+    expect(navigateMock).toHaveBeenCalledWith('/needs-you');
+  });
+
+  // OW5. One term for the decisions that wait: the palette holds "Needs you"
+  // and no "Needs decision".
+  it('holds one term for the decisions that wait', async () => {
+    await openPalette();
+    expect(screen.getAllByRole('option', { name: /^Needs you/ })).toHaveLength(1);
+    expect(screen.queryByRole('option', { name: /Needs decision/ })).toBeNull();
+    // NEGATIVE CONTROL: the other views of the Alerts screen stay.
+    expect(screen.getByRole('option', { name: /Critical alerts\s+View/ })).toBeTruthy();
+  });
 });

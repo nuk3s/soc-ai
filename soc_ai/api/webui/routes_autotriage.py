@@ -17,8 +17,13 @@ from soc_ai.api.webui._errors import oql_refusal
 from soc_ai.api.webui._shared import (
     router,
 )
-from soc_ai.api.webui.routes_alerts import _GRID_UNAVAILABLE, _es_api_error_http
+from soc_ai.api.webui.routes_alerts import (
+    _GRID_UNAVAILABLE,
+    _es_api_error_http,
+    _query_rejected,
+)
 from soc_ai.errors import OqlValidationError
+from soc_ai.so_client.elastic import GridQueryRejectedError
 from soc_ai.webui import alerts_query as aq
 from soc_ai.webui import autotriage as at
 
@@ -288,6 +293,11 @@ async def start_auto_triage(request: Request, body: AutoTriageIn) -> AutoTriageS
         # what it could and could not see. See _planning_budget_spent.
         if isinstance(exc, TimeoutError) and planning_budget.expired():
             raise _planning_budget_spent(status, budget) from exc
+        if not selected and isinstance(exc, GridQueryRejectedError) and (body.q or "").strip():
+            # The grid answered and rejected the analyst's filter. The grid is
+            # up, so the slot is released with no degraded mark.
+            status.active = False
+            raise _query_rejected(exc) from exc
         # Nothing could be READ, so there is no claim to make about the backlog.
         # This used to fall through to the "nothing to hunt" 200 below: the queue
         # showed as drained for the whole blind window, which is the worst thing

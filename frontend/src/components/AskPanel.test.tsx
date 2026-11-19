@@ -93,6 +93,18 @@ describe('the button', () => {
     expect(screen.queryByRole('button', { name: 'Ask soc-ai' })).toBeNull();
   });
 
+  // Round 4, C5: with no room the top bar hides the words "about this host"
+  // whole (index.css). The name of the button keeps the full label.
+  it('keeps the words about the object in their own part and the full name', () => {
+    render(<App />);
+    expect(screen.getByRole('button', { name: 'Ask soc-ai' }).querySelector('.topbar-ask-about')).toBeNull();
+    go('Host A page');
+    const button = screen.getByRole('button', { name: 'Ask soc-ai about this host' });
+    expect(button.querySelector('.topbar-ask-about')?.textContent).toBe(' about this host');
+    expect(button.textContent).toBe('Ask soc-ai about this host');
+    expect(button.getAttribute('title')).toMatch(/^Ask soc-ai about this host\. The shortcut is /);
+  });
+
   it('is absent on a page with no object when the general chat is off', () => {
     render(<App generalEnabled={false} />);
     expect(screen.queryByRole('button', { name: /^Ask soc-ai/ })).toBeNull();

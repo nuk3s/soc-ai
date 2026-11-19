@@ -99,6 +99,20 @@ describe('an investigation that judges one finding', () => {
     expect(screen.getByText(PROMPT).getAttribute('title')).toBe(SUBJECT_OBJECTIVE_CONTEXT);
   });
 
+  it('states the name note of the finding under its text (AA2)', () => {
+    const note = 'The text names web-2. The hosts of this finding do not include web-2.';
+    mount(inv({ promotedFinding: { ...inv().promotedFinding!, nameNote: note } }));
+    const block = screen.getByTestId('promoted-finding');
+    expect(within(block).getByTestId('finding-name-note')).toHaveTextContent(note);
+    // The model text stays as it is.
+    expect(block).toHaveTextContent('HTTP service executes id command as root');
+  });
+
+  it('shows no name note for a finding with none (NEGATIVE CONTROL)', () => {
+    mount(inv({ promotedFinding: { ...inv().promotedFinding!, nameNote: null } }));
+    expect(screen.queryByTestId('finding-name-note')).toBeNull();
+  });
+
   it('names the finding after an admin deleted the hunt', () => {
     // The API reads the finding from the stored subject: the ordinal and the
     // title, with no hosts, no detail and no evidence (routes_hunts

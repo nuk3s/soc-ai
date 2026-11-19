@@ -2,6 +2,7 @@ import { useMemo, useRef, useState } from 'react';
 import type {
   CampaignAuthorizationRecord,
   CampaignChange,
+  CampaignHuntAnswer,
   CampaignEvents,
   CampaignLadderStep,
   CampaignMember,
@@ -14,9 +15,12 @@ import {
   changeMarkLabel,
   changeMarkWords,
   expiryMarkLabel,
+  huntAnswerMarkLabel,
+  huntAnswerSentence,
   partyName,
   periodBandWords,
   provedWords,
+  stageFlagWords,
   stageLabel,
   timelineNote,
 } from '../../lib/campaignWords';
@@ -116,6 +120,8 @@ export function CampaignTimeline({
   selection,
   onSelect,
   authorization = null,
+  answer = null,
+  since = null,
 }: {
   events: CampaignEvents | null | undefined;
   members: CampaignMember[];
@@ -127,6 +133,12 @@ export function CampaignTimeline({
   onSelect: (next: CampaignSelection | null) => void;
   /** The authorization on the campaign. Its period is a band. */
   authorization?: Pick<CampaignAuthorizationRecord, 'label' | 'at' | 'startsAt' | 'expiresAt' | 'state'> | null;
+  /** The newest answer of a hunt that read the campaign. It is a mark at
+   *  the time that the hunt started. */
+  answer?: CampaignHuntAnswer | null;
+  /** A campaign that opened again: the span after the boundary of the
+   *  earlier decision is a band in the warning tone, with its words (SD3). */
+  since?: { boundary: string; words: string } | null;
 }) {
   const [ref, width] = useElementWidth<HTMLDivElement>(1080);
   const [zoom, setZoom] = useState<[number, number] | null>(null);
@@ -148,7 +160,7 @@ export function CampaignTimeline({
       c.type === 'decided' &&
       c.detail?.decision === 'case' &&
       caseTimes.some((t) => Math.abs(t - Date.parse(c.at)) <= CASE_TWIN_MS);
-    return all
+    const marks = all
       .filter((c) => MARKED.has(c.type) && !twin(c))
       .map((c) => ({
         key: `change-${c.id}`,
@@ -165,9 +177,23 @@ export function CampaignTimeline({
         comment: c.type === 'case_comment',
         id: c.id,
       }))
-      .filter((d) => !Number.isNaN(d.t))
-      .sort((a, b) => a.t - b.t || a.id - b.id);
-  }, [changes]);
+      .filter((d) => !Number.isNaN(d.t));
+    // The newest hunt that read the campaign, in the tone of its answer.
+    const answerAt = answer?.huntAt ? Date.parse(answer.huntAt) : Number.NaN;
+    if (answer && !Number.isNaN(answerAt)) {
+      marks.push({
+        key: `answer-${answer.huntId}`,
+        type: 'hunt_answer',
+        t: answerAt,
+        text: huntAnswerMarkLabel(answer.outcome),
+        words: huntAnswerSentence('campaign', answer),
+        color: answer.outcome === 'new_activity' ? 'rgb(var(--danger))' : 'rgb(var(--text-2))',
+        comment: false,
+        id: Number.MAX_SAFE_INTEGER,
+      });
+    }
+    return marks.sort((a, b) => a.t - b.t || a.id - b.id);
+  }, [changes, answer]);
   // The period of the authorization: from its start to the expiry, or to the
   // revoke, the newest revoke after the create.
   const period = useMemo(() => {
@@ -221,11 +247,16 @@ export function CampaignTimeline({
     if (times.length === 0) return null;
     // A future expiry does not stretch the axis: the band then runs to now.
     const now = Date.now();
-    const marks = [...decisions.map((d) => d.t), ...(period ? [period.from, Math.min(period.to, now)] : [])];
+    const sinceAt = since ? Date.parse(since.boundary) : Number.NaN;
+    const marks = [
+      ...decisions.map((d) => d.t),
+      ...(period ? [period.from, Math.min(period.to, now)] : []),
+      ...(Number.isNaN(sinceAt) ? [] : [sinceAt]),
+    ];
     const lo = Math.min(Math.min(...times) - bucket / 2, ...marks);
     const hi = Math.max(Math.max(...times) + bucket / 2, ...marks);
     return padDomain(lo, hi);
-  }, [lanes, bucket, decisions, period]);
+  }, [lanes, bucket, decisions, period, since]);
   if (!note || !full || lanes.length === 0) return null;
 
   const [d0, d1] = zoom ?? full;
@@ -236,7 +267,11 @@ export function CampaignTimeline({
   // The first time of each reached stage, in two rows when two labels meet.
   const flags = ladder
     .filter((s) => s.reached && s.firstAt)
-    .map((s) => ({ stage: s.stage, t: Date.parse(s.firstAt as string) }))
+    .map((s) => ({
+      stage: s.stage,
+      t: Date.parse(s.firstAt as string),
+      words: stageFlagWords(s.stage, s.firstAt as string, s.heldBy ?? null),
+    }))
     .filter((f) => !Number.isNaN(f.t) && f.t >= d0 && f.t <= d1)
     .sort((a, b) => a.t - b.t || stageRank(a.stage) - stageRank(b.stage));
   // A name takes the first of three rows that has room. With no room it does
@@ -433,12 +468,42 @@ export function CampaignTimeline({
               </g>
             )}
 
+            {/* The span after the earlier decision: a band behind the lanes
+                and a bar on the axis, in the warning tone, to the right end. */}
+            {since && !Number.isNaN(Date.parse(since.boundary)) && Date.parse(since.boundary) <= d1 && (
+              <g data-testid="timeline-since" pointerEvents="none" role="img" aria-label={since.words}>
+                <title>{since.words}</title>
+                <rect
+                  x={Math.max(GUTTER, scale(Date.parse(since.boundary)))}
+                  y={top}
+                  width={Math.max(1, GUTTER + plot - Math.max(GUTTER, scale(Date.parse(since.boundary))))}
+                  height={lanes.length * LANE}
+                  fill="rgb(var(--warn))"
+                  opacity={0.07}
+                />
+                <rect
+                  data-testid="timeline-since-bar"
+                  x={Math.max(GUTTER, scale(Date.parse(since.boundary)))}
+                  y={top + lanes.length * LANE - 3}
+                  width={Math.max(1, GUTTER + plot - Math.max(GUTTER, scale(Date.parse(since.boundary))))}
+                  height={3}
+                  fill="rgb(var(--warn))"
+                  opacity={0.55}
+                />
+              </g>
+            )}
+
             {/* The first time of each stage: a hairline down the lanes, a mark and its name. */}
             {placed.map((f) => {
               const y = f.row * FLAG_ROW + 9;
               return (
-                <g key={f.stage} data-testid="timeline-flag" data-stage={f.stage} pointerEvents="none">
+                <g key={f.stage} data-testid="timeline-flag" data-stage={f.stage} role="img" aria-label={f.words}>
+                  {/* The hover states the time of the mark and, for a stage
+                      that a later stage holds, the earlier "by" time of the
+                      ladder (dogfood 2026-11-17, N11). */}
+                  <title>{f.words}</title>
                   <line
+                    pointerEvents="none"
                     x1={f.x}
                     x2={f.x}
                     y1={y + 5}
@@ -463,6 +528,7 @@ export function CampaignTimeline({
                       y={y + 3.5}
                       textAnchor={f.left ? 'end' : 'start'}
                       className="fill-text-2 text-[11px]"
+                      pointerEvents="none"
                     >
                       {stageLabel(f.stage)}
                     </text>

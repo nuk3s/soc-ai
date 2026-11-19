@@ -48,12 +48,14 @@ export const FLOW_LINK_LABEL = 'How this flows';
 export const FLOW_ALT =
   'The flow from the grid to your decision, in three rows. On the sweep path an analytic ' +
   'finds a hit, and hits on one entity form a lead. soc-ai hunts the lead, and the hunt ' +
-  'returns findings. soc-ai investigates each threat finding that names an entity. On the ' +
+  'returns findings. A clean lead hunt closes the lead. Another hunt that reads a lead or a ' +
+  'campaign closes nothing: it writes its answer on the lead or the campaign. ' +
+  'soc-ai investigates each threat finding that names an entity. On the ' +
   'alert path soc-ai investigates one alert of each group. The investigation ends in a ' +
   'verdict. A confirmed attack starts or joins a campaign. A true positive or needs more info ' +
   'verdict of an alert writes an observation that can form a lead. Needs you lists the work ' +
-  'that waits on you. You decide once on a campaign, and soc-ai writes the action to ' +
-  'Security Onion.';
+  'that waits on you. A rule with open false positives waits there for one decision. You ' +
+  'decide once on a campaign, and soc-ai writes the action to Security Onion.';
 
 /** The sentences under the chart: the flow in one line, then one definition
  *  for each box in the order the chart reads, then the two verbs. */

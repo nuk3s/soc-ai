@@ -1,5 +1,5 @@
 import { type QualityPoint, type QualityTrend, getQualityTrend } from '../lib/api';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
 import { LoadingInline } from './States';
 
@@ -95,7 +95,7 @@ export function QualityLastRun() {
       ) : error && !data ? (
         <span className="text-dim">The console could not read the last evaluation result.</span>
       ) : data ? (
-        <p data-testid="quality-last-run-text" title={latest ? absTime(latest.ts) : undefined}>
+        <p data-testid="quality-last-run-text" title={latest ? timeTitle(latest.ts) : undefined}>
           {lastRunSentences(data).join(' ')}
         </p>
       ) : null}

@@ -10,7 +10,7 @@ import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 import { listHref } from '../lib/hostsList';
-import { absTime } from '../lib/timeRange';
+import { absTime, localTitle } from '../lib/timeRange';
 import type { MachineSummary } from '../lib/types';
 import { HostsSummary, roleSlices } from './HostsSummary';
 
@@ -276,17 +276,16 @@ describe('HostsSummary — the counts are dated, once', () => {
   });
 
   // N6 of the 2026-10-05 verification. The note read "Oct 02, 2026, 08:10:28
-  // AM" for a sweep at 12:10 UTC, with no zone.
+  // AM" for a sweep at 12:10 UTC, with no zone. Round 3, T3: the date is in
+  // UTC with the label, and its tooltip states the local time with its zone.
   it('states the time zone of the date it gives', () => {
     mount(SUMMARY, { scheduleEnabled: false });
     const asOf = screen.getByTestId('hosts-as-of');
-    expect(asOf.textContent).toBe(
-      `the list shows the state as of ${absTime(SUMMARY.last_sweep_at, { zone: true })}`,
-    );
-    const zone = new Intl.DateTimeFormat(undefined, { timeZoneName: 'short' })
-      .formatToParts(new Date(SUMMARY.last_sweep_at!))
-      .find((p) => p.type === 'timeZoneName')!.value;
-    expect(asOf.textContent!.endsWith(zone)).toBe(true);
+    expect(asOf.textContent).toBe(`the list shows the state as of ${absTime(SUMMARY.last_sweep_at)}`);
+    expect(asOf.textContent!.endsWith(' UTC')).toBe(true);
+    const stamp = asOf.querySelector('time')!;
+    expect(stamp.getAttribute('title')).toBe(localTitle(SUMMARY.last_sweep_at));
+    expect(stamp.getAttribute('title')).toMatch(/^Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
   });
 
   it('adds no date when the schedule runs', () => {

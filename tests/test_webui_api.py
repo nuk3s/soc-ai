@@ -2656,7 +2656,7 @@ def test_build_actions_explains_pending_ack_after_auto_ack_skip() -> None:
     high_stakes = SimpleNamespace(kind="auto_ack_skipped", payload={"reason": "high_stakes"})
     a = _build_actions([high_stakes], report)[0]
     assert a.applied is False
-    assert a.pendingNote is not None and "acknowledges a high or critical alert" in a.pendingNote
+    assert a.pendingNote is not None and "The alert is high or critical" in a.pendingNote
 
     below = SimpleNamespace(
         kind="auto_ack_skipped",

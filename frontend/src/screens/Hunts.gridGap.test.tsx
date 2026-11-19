@@ -8,7 +8,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { DemoProvider } from '../lib/demo';
 import type { GridGap } from '../lib/types';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -57,7 +57,7 @@ describe('the Hunts grid gap strip', () => {
   it('names the gap above an empty hunt list', async () => {
     renderHunts();
     expect((await screen.findByTestId('grid-gap')).textContent).toBe(
-      `The grid is unreadable since ${absoluteTime('2026-10-15T13:36:00Z')} (93 h so far). Counts in this window are incomplete.`,
+      `The grid is unreadable since ${utcStamp('2026-10-15T13:36:00Z')} (93 h so far). Counts in this window are incomplete.`,
     );
     expect(await screen.findByText('No hunts yet')).toBeTruthy();
   });

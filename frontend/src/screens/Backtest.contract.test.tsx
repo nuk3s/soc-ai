@@ -124,7 +124,16 @@ describe('Backtest result claims', () => {
     // 07:00:00" with no zone.
     await mount(scored(1, 2));
     const ran = await screen.findByTestId('backtest-ran-at');
-    expect(ran.textContent).toMatch(/^Ran \d+(?:d|mo|y) ago, at 2026-08-0[78] \d{2}:\d{2} \S+$/);
+    // Round 3, T3: the absolute time is UTC with the label. Its tooltip states
+    // the local time with its zone.
+    expect(ran.textContent).toMatch(/^Ran \d+(?:d|mo|y) ago, at 2026-08-08 \d{2}:\d{2}:\d{2} UTC$/);
+    expect(ran.querySelector('[data-time="absolute"]')?.getAttribute('title')).toMatch(
+      /^Local time: 2026-08-0[78] \d{2}:\d{2} \S+$/,
+    );
+    // Round 3 part 2, P1: the relative time states both clocks in its tooltip.
+    expect(ran.querySelector('[data-time="relative"]')?.getAttribute('title')).toMatch(
+      /^2026-08-08 \d{2}:\d{2} UTC\. Local time: 2026-08-0[78] \d{2}:\d{2} \S+$/,
+    );
     expect(ran.textContent).not.toMatch(/Aug/);
   });
 

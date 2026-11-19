@@ -15,7 +15,8 @@ import {
   leftToYou,
 } from '../components/LeadsStrip';
 import { CampaignChip } from '../components/campaign/CampaignChip';
-import { Definition } from '../components/Definition';
+import { LeadCampaignContext, LeadOtherHunts } from '../components/LeadCampaignContext';
+import { HowLeadsWork } from '../components/HowLeadsWork';
 import { FlowStrip } from '../components/FlowStrip';
 import { LeadTimeline } from '../components/LeadTimeline';
 import {
@@ -48,6 +49,7 @@ import { entityPath } from '../lib/entityPath';
 import { useTabTitle } from '../lib/useTabTitle';
 import { type FlowHunt, leadFlow } from '../lib/flowSteps';
 import { isIpKey } from '../lib/ip';
+import { campaignCloseReasonWords } from '../lib/campaignWords';
 import { kindLabel } from '../lib/kinds';
 import { formedFromBacktest, holdSentence, type LeadDecisionFields } from '../lib/leadDecisions';
 import {
@@ -63,8 +65,8 @@ import {
   huntAgainWords,
 } from '../lib/leadWords';
 import { plural } from '../lib/plural';
-import { chipProps, huntOutcome, outcomeLabel, outcomeMeta, statusLabel } from '../lib/labels';
-import { absTime, ago } from '../lib/timeRange';
+import { chipProps, huntOutcome, huntStopLabel, outcomeLabel, outcomeMeta, statusLabel } from '../lib/labels';
+import { ago, timeTitle } from '../lib/timeRange';
 import {
   ACTION_HUNT,
   ACTION_HUNT_NOW,
@@ -78,9 +80,7 @@ import {
   CHIP_TYPE,
   INVESTIGATION_GONE,
   LEAD_ACTION_EFFECT,
-  LEAD_LEGEND,
   LEAD_VERDICT_EFFECT,
-  LEGEND_AUTO_HUNT,
   RELATED_REASON,
   REPEATS_AFTER_CLOSE,
   WEIGHT_AT_FORMATION,
@@ -91,6 +91,7 @@ import {
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
 import { useChatScope } from '../lib/chatScope';
+import { RelTime } from '../components/RelTime';
 
 // ---------------------------------------------------------------------------
 // Lead detail — one lead, its timeline and its actions.
@@ -435,7 +436,7 @@ export function LeadDetail() {
               className="text-[11.5px] text-dim"
               title={CHIP_DISMISS_REASON}
             >
-              reason: {dismissReasonLabel(d.dismissed_reason)}
+              reason: {campaignCloseReasonWords(dismissReasonLabel(d.dismissed_reason), d.campaign_context)}
             </span>
           )
         )}
@@ -601,9 +602,14 @@ export function LeadDetail() {
           closedBySocAi: closedByHunt(d) || closedOnVerdicts(d),
           campaignTitle: held ? d.campaign?.title : null,
           dismissedReason: d.dismissed_reason,
+          campaignReopened: Boolean(d.campaign_context?.closed_with_campaign && d.campaign_context.reopened_at),
           machineName,
         })}
       </div>
+      {/* LH4 and LH3: the campaign of the lead and its decision, the
+          authorized observations, and the newest answer of a hunt that read
+          the lead. */}
+      <LeadCampaignContext lead={d} />
       {/* C8 and F5: what each button does, in plain view, and the meaning of
           "left to you". The page printed the hunt line over every open lead,
           so a hunted lead read "Hunt this lead." and offered no such button.
@@ -682,14 +688,6 @@ export function LeadDetail() {
           </span>
         </div>
       )}
-      {/* What a lead is, under the title. An analyst who lands here from a link
-          never saw the line the Hunts page carries. */}
-      <Definition of="lead" className="mt-1" />
-      {/* The four states, once, under the actions. The strip carries the same
-          line, so a state means one thing on both. */}
-      <div data-testid="lead-legend" className="mt-1 text-[11px] text-faint">
-        {autoHunt ? `${LEAD_LEGEND} ${LEGEND_AUTO_HUNT}` : LEAD_LEGEND}
-      </div>
       {/* C2: why this is a lead is the first sentence of the state line at
           the top. The header read the numbers of the scoring, and the analyst
           asked what happened. */}
@@ -697,7 +695,7 @@ export function LeadDetail() {
         className="mt-1.5 flex flex-wrap items-center gap-2 text-[12px] text-dim"
         data-tour="lead-weight"
       >
-        <span title={absTime(d.formed_at)}>formed {ago(d.formed_at)}</span>
+        <span title={timeTitle(d.formed_at)}>formed {ago(d.formed_at)}</span>
         <span className="text-faint">·</span>
         <button
           type="button"
@@ -795,6 +793,11 @@ export function LeadDetail() {
           {`The hunt did not close this lead. ${holdSentence(d)} Decide on the lead.`}
         </div>
       )}
+      {/* What a lead is, the four states and who starts a hunt, behind one
+          closed disclosure after the facts of the lead (dogfood 2026-11-17,
+          N8). The strip of the Hunts page and the host page carries the same
+          disclosure, so a state means one thing on each. */}
+      <HowLeadsWork autoHunt={autoHunt} className="mt-2" legendTestId="lead-legend" noteTestId="lead-note" />
       {/* A second hunt on one lead is a real thing to want and a common
           mis-click. The confirm names the hunt that already exists. */}
       {confirmAgain && (
@@ -892,14 +895,28 @@ export function LeadDetail() {
                     >
                       {huntName(h)}
                     </Link>
-                    {/* The screen word, with the sentence that states it. The
-                        row printed the raw API word and explained nothing. */}
-                    <span className="text-dim" title={huntStatusTitle(h.status, 'row')}>
-                      {statusLabel(h.status)}
-                    </span>
+                    {/* A hunt that stopped says so in one chip, in the
+                        words of the list, the hunt page and the campaign
+                        fold. "Could not run" is for a hunt with no step
+                        (dogfood 2026-11-17, b08 and F5). */}
+                    {huntStopLabel(h) ? (
+                      <span
+                        data-testid={`lead-hunt-stopped-${h.id}`}
+                        title={huntStatusTitle(h.status, 'row')}
+                        {...chipProps(outcomeMeta('could_not_run'))}
+                      >
+                        {huntStopLabel(h)}
+                      </span>
+                    ) : (
+                      /* The screen word, with the sentence that states it. The
+                         row printed the raw API word and explained nothing. */
+                      <span className="text-dim" title={huntStatusTitle(h.status, 'row')}>
+                        {statusLabel(h.status)}
+                      </span>
+                    )}
                     {/* The outcome, in the words and the colour of the one
                         label map. A threat is never green. */}
-                    {rowOutcome(h, d) && (
+                    {!huntStopLabel(h) && rowOutcome(h, d) && (
                       <span
                         data-testid={`lead-hunt-outcome-${h.id}`}
                         {...chipProps(outcomeMeta(rowOutcome(h, d)))}
@@ -908,7 +925,7 @@ export function LeadDetail() {
                       </span>
                     )}
                     {h.started_at && (
-                      <span className="text-[11.5px] text-faint" title={absTime(h.started_at)}>
+                      <span className="text-[11.5px] text-faint" title={timeTitle(h.started_at)}>
                         started {ago(h.started_at)}
                       </span>
                     )}
@@ -933,6 +950,9 @@ export function LeadDetail() {
           </Panel>
         </div>
       )}
+      {/* The other hunts that read this lead: the scheduled hunt reads the
+          open leads of its window. */}
+      <LeadOtherHunts answers={d.answers} />
 
       {/* One entity is one lead. A coordinated attack across entities is
           several leads, and no single one of them reads as a campaign. The
@@ -1000,7 +1020,7 @@ function RelatedLeadsPanel({ related }: { related?: RelatedLeadT[] }) {
                   {r.reason}
                 </span>
                 {r.formed_at && (
-                  <span className="text-[11.5px] text-faint">formed {ago(r.formed_at)}</span>
+                  <span className="text-[11.5px] text-faint">formed <RelTime iso={r.formed_at} /></span>
                 )}
               </li>
             );

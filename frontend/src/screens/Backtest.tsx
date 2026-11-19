@@ -14,7 +14,8 @@ import {
   startBacktest,
 } from '../lib/api';
 import { verdictLabel, verdictMeta } from '../lib/labels';
-import { absoluteTime, ago } from '../lib/timeRange';
+import { absTime } from '../lib/timeRange';
+import { UtcTime } from '../components/UtcTime';
 import { useAsync } from '../lib/useAsync';
 import type {
   Backtest as BacktestData,
@@ -24,6 +25,7 @@ import type {
   HumanDisposition,
   SocVerdict,
 } from '../lib/types';
+import { RelTime } from '../components/RelTime';
 
 // ---------------------------------------------------------------------------
 // Backtest — "prove it on my last N days". Point soc-ai at a historical window
@@ -483,7 +485,7 @@ export function Backtest() {
             <span className="flex-1">
               This is an earlier run.{' '}
               {viewed.data?.finished_at
-                ? `It finished at ${absoluteTime(viewed.data.finished_at)}.`
+                ? `It finished at ${absTime(viewed.data.finished_at)}.`
                 : ''}
             </span>
             <button
@@ -571,7 +573,7 @@ function PastRuns({
               key={r.backtest_id}
               className={`flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-border px-4 py-2 text-[12px] last:border-0 ${shown ? 'bg-surface-2' : ''}`}
             >
-              <span className="min-w-[150px] text-text-2">{when ? absoluteTime(when) : 'No date'}</span>
+              {when ? <UtcTime className="min-w-[150px] text-text-2" iso={when} /> : <span className="min-w-[150px] text-text-2">No date</span>}
               <span className="text-dim">
                 {r.listed ? 'Listed alerts' : r.window_days ? `${r.window_days}-day window` : ''}
               </span>
@@ -759,7 +761,7 @@ function Results({ data }: { data: BacktestData }) {
           current no matter how stale they are (dogfood 2026-07-15). */}
       {data.finished_at && (
         <div className="mb-3 text-[12px] text-faint" data-testid="backtest-ran-at">
-          Ran {ago(data.finished_at)}, at {absoluteTime(data.finished_at)}
+          Ran <RelTime iso={data.finished_at} />, at <UtcTime iso={data.finished_at} />
         </div>
       )}
       {/* Coverage before score. A rate over rows soc-ai never judged is not a

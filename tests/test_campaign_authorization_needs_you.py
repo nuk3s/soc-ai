@@ -88,6 +88,9 @@ def test_an_investigation_beyond_the_authorization_waits_on_its_own(client: Test
     items = client.get("/api/v1/needs-you/items").json()["items"]
     (item,) = [i for i in items if i["id"] == outside]
     assert item["detail"].startswith("Beyond the authorization of the campaign ")
+    # The row states `why`, and the sentence keeps the count of the actions.
+    assert item["why"].startswith("The investigation is beyond the authorization of the campaign ")
+    assert item["why"].endswith(" recommended action waits for a person.")
 
     # A negative control: the inside investigation stays quiet.
     assert inside not in _waiting(client)

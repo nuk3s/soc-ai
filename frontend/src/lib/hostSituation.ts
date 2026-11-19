@@ -1,5 +1,7 @@
 import type { EntityObservation, Lead } from './api';
 import { plural } from './plural';
+import type { TruePositiveParts } from './types';
+import { earlierPartWords } from './truePositiveParts';
 
 // ---------------------------------------------------------------------------
 // The first lines of the host page: what waits on this host, and what the
@@ -33,6 +35,12 @@ export const SCOPE_OPEN_LEADS = 'all open leads';
  *  the window of the Alerts card. */
 export const VERDICT_DAYS = 7;
 export const SCOPE_VERDICTS = `last ${VERDICT_DAYS} days`;
+/** The days and the scope words of the verdict lines for a page window. The
+ *  host page reads the observations of its 24h and 7d buttons (dogfood
+ *  2026-11-17, AB1). */
+export function verdictWindow(range: '24h' | '7d'): { days: number; scope: string } {
+  return range === '7d' ? { days: VERDICT_DAYS, scope: SCOPE_VERDICTS } : { days: 1, scope: 'last 24 hours' };
+}
 
 /** The lead statuses that still wait on soc-ai or on the analyst. */
 const OPEN = new Set(['open', 'hunting']);
@@ -135,9 +143,57 @@ export const SCOPE_INVESTIGATIONS = 'all time';
 
 /** The investigation line: the true positives of the machine, over all
  *  time, with the filtered list as its proof. No line without a true
- *  positive: the Investigations block below the hero holds the count. */
-export function investigationLines(total: number, truePositives: number, to: string): SituationLine[] {
+ *  positive: the Investigations block below the hero holds the count.
+ *
+ *  With `parts` (round "decide once", DC5) the line splits. The true
+ *  positives that wait are an alarm line that opens them. The true positives
+ *  in a decided campaign are a neutral line that opens the campaign. A
+ *  superseded true positive is in neither line. */
+export function investigationLines(
+  total: number,
+  truePositives: number,
+  to: string,
+  parts?: TruePositiveParts | null,
+): SituationLine[] {
   if (total <= 0 || truePositives <= 0) return [];
+  if (parts) {
+    const lines: SituationLine[] = [];
+    if (parts.waiting > 0) {
+      lines.push({
+        text: `${plural(parts.waiting, 'true positive investigation')} of this host ${parts.waiting === 1 ? 'waits' : 'wait'}.`,
+        to: `${to}${to.includes('?') ? '&' : '?'}verdict=true_positive&waits=true`,
+        tone: 'alarm',
+        scope: SCOPE_INVESTIGATIONS,
+      });
+    }
+    // The earlier decision of a reopened campaign covered them (W2).
+    const earlier = parts.earlier ?? 0;
+    if (earlier > 0) {
+      const cs = parts.earlierCampaigns ?? [];
+      const [one] = cs;
+      lines.push({
+        text: earlierPartWords({
+          investigations: earlier,
+          campaigns: Math.max(1, cs.length),
+          decision: cs.length === 1 && one ? one.decision : null,
+          decidedAt: cs.length === 1 && one ? one.decidedAt : null,
+        }, `${plural(earlier, 'true positive investigation')} of this host`),
+        to: cs.length === 1 && one ? `/campaigns/${one.id}` : '/campaigns',
+        tone: 'info',
+        scope: SCOPE_INVESTIGATIONS,
+      });
+    }
+    if (parts.decided > 0) {
+      const [only] = parts.campaigns;
+      lines.push({
+        text: `${plural(parts.decided, 'true positive investigation')} of this host ${parts.decided === 1 ? 'is' : 'are'} in a decided campaign.`,
+        to: parts.campaigns.length === 1 && only ? `/campaigns/${only.id}` : '/campaigns?decision=decided',
+        tone: 'info',
+        scope: SCOPE_INVESTIGATIONS,
+      });
+    }
+    return lines;
+  }
   return [
     {
       text: `${plural(truePositives, 'investigation')} of this host reached a true-positive verdict.`,
@@ -179,6 +235,7 @@ function whenPhrase(rows: readonly EntityObservation[], now: number): string {
 export function verdictLines(
   observations: readonly EntityObservation[],
   now = Date.now(),
+  scope: string = SCOPE_VERDICTS,
 ): SituationLine[] {
   const verdicts = alertVerdicts(observations);
   const lines: SituationLine[] = [];
@@ -187,7 +244,7 @@ export function verdictLines(
     lines.push({
       text: `${plural(tp.length, 'true-positive alert')}, ${whenPhrase(tp, now)}.`,
       tone: 'alarm',
-      scope: SCOPE_VERDICTS,
+      scope,
     });
   }
   const nmi = verdicts.filter((o) => o.verdict === 'needs_more_info');
@@ -195,7 +252,7 @@ export function verdictLines(
     lines.push({
       text: `${plural(nmi.length, 'alert')} ${nmi.length === 1 ? 'needs' : 'need'} more information, ${whenPhrase(nmi, now)}.`,
       tone: 'info',
-      scope: SCOPE_VERDICTS,
+      scope,
     });
   }
   return lines;

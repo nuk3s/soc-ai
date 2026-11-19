@@ -1,3 +1,4 @@
+import { Radar } from 'lucide-react';
 import { useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { CAMPAIGN_HUNTS_CAP, type CampaignChange, type CampaignHunt, type CampaignLead } from '../../lib/api';
@@ -5,6 +6,9 @@ import {
   CHANGES_LANE,
   HUNTS_HEADING,
   HUNTS_LANE,
+  HUNT_ANSWER_TITLE,
+  huntAnswerWord,
+  CHANGE_STARTS_NO_HUNT,
   HUNT_MARKS_LABEL,
   LEADS_HEADING,
   LEAD_COVERED,
@@ -31,11 +35,20 @@ import {
   type TimeCluster,
   type TimePoint,
 } from '../../lib/campaignViz';
-import { statusLabel } from '../../lib/labels';
+import { huntStopLabel, statusLabel } from '../../lib/labels';
 import { utcStamp } from '../../lib/timeRange';
 import { useElementWidth } from '../../lib/useElementWidth';
 import { LEAD_STATE_LABEL, LEAD_STATUS_LABEL, leadStatusLabel } from '../LeadsStrip';
 import { HoverTip } from './HoverTip';
+import { huntAnswerTone } from './HuntAnswerLine';
+import { UtcTime } from '../UtcTime';
+
+/** The status words of a hunt of the campaign. A hunt that stopped reads the
+ *  words of the hunt page and the lead page: "Stopped with an error after 14
+ *  steps", or "Could not run" with no step (F5). */
+function huntStatusWords(h: CampaignHunt): string {
+  return huntStopLabel(h) ?? statusLabel(h.status);
+}
 
 const ROW = 'px-[15px] py-2.5 text-[12.5px]';
 const HEADING = 'px-[15px] pt-3 text-[11.5px] font-semibold text-dim';
@@ -119,9 +132,21 @@ export function CampaignLeadsHunts({
                   <Link to={`/hunts/${h.id}`} className="font-semibold text-accent hover:underline">
                     {huntStarterLabel(h.starter)}
                   </Link>
-                  <span className="font-mono text-[11.5px] text-faint">{utcStamp(h.startedAt)}</span>
-                  <span className="text-text-2">{statusLabel(h.status)}</span>
+                  <UtcTime className="font-mono text-[11.5px] text-faint" iso={h.startedAt} seconds={false} />
+                  <span className="text-text-2">{huntStatusWords(h)}</span>
                   <span className="text-dim">{huntFindingsWords(h.findings, h.threatFindings)}</span>
+                  {/* A hunt that read the campaign states what it found. */}
+                  {h.answer && (
+                    <span
+                      data-testid={`campaign-hunt-answer-${h.id}`}
+                      title={HUNT_ANSWER_TITLE}
+                      className="inline-flex items-center gap-1 font-semibold"
+                      style={{ color: huntAnswerTone(h.answer) }}
+                    >
+                      <Radar size={12} aria-hidden />
+                      {huntAnswerWord('campaign', h.answer)}
+                    </span>
+                  )}
                 </div>
               </li>
             ))}
@@ -169,10 +194,18 @@ function HuntMarks({
     return Number.isNaN(t) ? [] : [{ id: h.id, t, stage: null, label: h.id }];
   });
   const changeOf = new Map<string, CampaignChange>();
-  const changePoints: TimePoint[] = huntChanges(changes).map((c) => {
-    changeOf.set(`change-${c.id}`, c);
-    return { id: `change-${c.id}`, t: Date.parse(c.at), stage: c.type === 'stage' ? (c.detail?.to ?? null) : null, label: c.type };
-  });
+  // The lane draws every change of the fold Changes, so it is never empty
+  // beside a list of changes (dogfood 2026-11-17, N11). A change that can
+  // start a hunt is a filled mark; any other change is a hollow mark.
+  const starts = new Set(huntChanges(changes).map((c) => c.id));
+  const changePoints: TimePoint[] = changes
+    .filter((c) => !Number.isNaN(Date.parse(c.at)))
+    .slice()
+    .sort((a, b) => Date.parse(a.at) - Date.parse(b.at) || a.id - b.id)
+    .map((c) => {
+      changeOf.set(`change-${c.id}`, c);
+      return { id: `change-${c.id}`, t: Date.parse(c.at), stage: c.type === 'stage' ? (c.detail?.to ?? null) : null, label: c.type };
+    });
   if (huntPoints.length === 0) return null;
 
   const times = [
@@ -191,7 +224,7 @@ function HuntMarks({
   const changeY = LANE / 2;
   const huntY = LANE + LANE / 2;
   const huntsOf = (c: TimeCluster) => c.points.map((p) => byId.get(p.id)).filter((h): h is CampaignHunt => !!h);
-  const huntWords = (h: CampaignHunt) => huntMarkWords(h, statusLabel(h.status));
+  const huntWords = (h: CampaignHunt) => huntMarkWords(h, huntStatusWords(h));
 
   return (
     <div className="px-[15px] pb-2 pt-3">
@@ -238,18 +271,23 @@ function HuntMarks({
             </text>
           ))}
 
-          {/* Each change that can start a hunt: a diamond, in the color of the
-              stage that a stage change reached, else in the neutral tone. */}
+          {/* Each change: a diamond. A change that can start a hunt is filled,
+              in the color of the stage that a stage change reached, else in
+              the neutral tone. A change that starts no hunt is hollow. */}
           {changeMarks.map((c) => {
             const x = (c.x0 + c.x1) / 2;
             const list = c.points.map((p) => changeOf.get(p.id)).filter((v): v is CampaignChange => !!v);
             const stage = highestStage(list.map((v) => (v.type === 'stage' ? (v.detail?.to ?? null) : null)));
-            const words = list.map((v) => `${utcStamp(v.at)}: ${changeSentence(v)}`).join(' ');
+            const startsHunt = list.some((v) => starts.has(v.id));
+            const words = list
+              .map((v) => `${utcStamp(v.at)}: ${changeSentence(v)}${starts.has(v.id) ? '' : ` ${CHANGE_STARTS_NO_HUNT}`}`)
+              .join(' ');
             return (
               <g
                 key={c.key}
                 data-testid="hunt-change-mark"
                 data-types={list.map((v) => v.type).join(' ')}
+                data-starts={startsHunt ? 'yes' : 'no'}
                 data-x={x}
               >
                 <rect
@@ -258,9 +296,9 @@ function HuntMarks({
                   width={9}
                   height={9}
                   transform={`rotate(45 ${x} ${changeY})`}
-                  fill={stage ? stageColor(stage) : NEUTRAL}
-                  stroke="rgb(var(--surface-1))"
-                  strokeWidth={2}
+                  fill={startsHunt ? (stage ? stageColor(stage) : NEUTRAL) : 'rgb(var(--surface-1))'}
+                  stroke={startsHunt ? 'rgb(var(--surface-1))' : NEUTRAL}
+                  strokeWidth={startsHunt ? 2 : 1.5}
                 />
                 <rect
                   x={x - 12}
@@ -372,6 +410,7 @@ function HuntMarks({
                 changes={hover.cluster.points
                   .map((p) => changeOf.get(p.id))
                   .filter((v): v is CampaignChange => !!v)}
+                starts={starts}
               />
             )}
           </HoverTip>
@@ -389,9 +428,10 @@ function HuntsTip({ hunts }: { hunts: CampaignHunt[] }) {
           <div className="font-mono text-[10.5px] text-faint">{utcStamp(h.startedAt)}</div>
           <div className="text-text-2">
             <span className="font-semibold text-text">{huntStarterLabel(h.starter)}</span>
-            {`. ${statusLabel(h.status)}.`}
+            {`. ${huntStatusWords(h)}.`}
           </div>
           <div className="text-dim">{huntFindingsWords(h.findings, h.threatFindings)}</div>
+          {h.answer && <div className="text-text-2">{`${huntAnswerWord('campaign', h.answer)}.`}</div>}
         </div>
       ))}
       {hunts.length > MAX_IN_TIP && (
@@ -401,13 +441,14 @@ function HuntsTip({ hunts }: { hunts: CampaignHunt[] }) {
   );
 }
 
-function ChangesTip({ changes }: { changes: CampaignChange[] }) {
+function ChangesTip({ changes, starts }: { changes: CampaignChange[]; starts: ReadonlySet<number> }) {
   return (
     <>
       {changes.slice(0, MAX_IN_TIP).map((c, i) => (
         <div key={c.id} className={i > 0 ? 'mt-1.5' : undefined}>
           <div className="font-mono text-[10.5px] text-faint">{utcStamp(c.at)}</div>
           <div className="break-words text-text-2">{changeSentence(c)}</div>
+          {!starts.has(c.id) && <div className="text-faint">{CHANGE_STARTS_NO_HUNT}</div>}
         </div>
       ))}
       {changes.length > MAX_IN_TIP && (

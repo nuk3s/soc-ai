@@ -70,7 +70,7 @@ import {
 } from '../lib/hostsList';
 import { plural } from '../lib/plural';
 import { SHOWN_ERRORS, sweepErrorList, sweepFailureSentence } from '../lib/sweepErrors';
-import { absTime, ago } from '../lib/timeRange';
+import { absTime, ago, timeTitle } from '../lib/timeRange';
 import { useListSelection } from '../lib/useListSelection';
 import { useSavedViews } from '../lib/useSavedViews';
 import type {
@@ -173,10 +173,11 @@ const CONFLICT_KIND_HELP: Record<DossierConflictKind, string> = {
   rebound: 'A different host answers on this address now.',
 };
 
+/** An absolute time in the one form of the console: UTC with the label
+ *  (round 3, T3). It gave the local time with no zone. */
 function absolute(iso: string | null): string {
   if (!iso) return 'never seen';
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+  return absTime(iso);
 }
 
 /** One lane's answer as text, for the conflict queue. The structured fields
@@ -391,11 +392,22 @@ interface Column {
   width: string;
   /** The hover of the header: what the column counts and its window. */
   title?: string;
+  /** The window that the header states after its label: "Findings · 7d". */
+  scope?: string;
 }
 
 /** The hover of the Findings header: what each count counts, and its window. */
 export const FINDINGS_HEADER_TITLE =
   'Confirmed: the true positive verdicts on this machine in the last 7 days. Open leads: the leads that name this machine and are open or hunting now.';
+
+/** The window of the confirmed count of the Findings header: "Findings ·
+ *  7d". The column counted 7 days and the header said no window (dogfood
+ *  2026-11-17, N15). An older server sends no window, and the header then
+ *  states none. */
+export function findingsWindow(rows: readonly { findings?: { days: number } | null }[]): string | undefined {
+  const days = rows.find((r) => r.findings)?.findings?.days;
+  return days ? `${days}d` : undefined;
+}
 
 const COLUMNS: Column[] = [
   { key: 'name', label: 'Host', width: 'w-[19%]' },
@@ -488,6 +500,7 @@ function SortHeader({
           )}
         >
           {col.label}
+          {col.scope && <span data-testid={`header-scope-${col.key}`}>{` · ${col.scope}`}</span>}
           {active ? (
             state.dir === 'asc' ? (
               <ChevronUp size={11} aria-hidden="true" />
@@ -741,7 +754,7 @@ function MachineTableRow({
             className="relative z-[1] min-w-0"
             title={
               row.agent.last_report
-                ? `The agent last reported ${absTime(row.agent.last_report)}.`
+                ? `The agent last reported ${timeTitle(row.agent.last_report)}.`
                 : 'The agent has no report time on record.'
             }
           >
@@ -780,7 +793,7 @@ function MachineTableRow({
         {row.events.toLocaleString()}
       </td>
       <td className="px-2.5 py-[9px] text-right align-middle font-mono text-[11.5px] text-faint">
-        <span className="relative z-[1]" title={absolute(row.first_seen)}>
+        <span className="relative z-[1]" title={row.first_seen ? timeTitle(row.first_seen) : absolute(null)}>
           {ago(row.first_seen)}
         </span>
       </td>
@@ -794,8 +807,8 @@ function MachineTableRow({
           data-testid={`machine-last-seen-${row.key}`}
           title={
             lastEvent && newestOf(lastEvent, row.last_seen) === lastEvent
-              ? `The newest grid event of this machine, ${absolute(lastEvent)}. The console read it from the grid with the page.`
-              : `The newest grid event that the last sweep saw, ${absolute(row.last_seen)}.`
+              ? `The newest grid event of this machine: ${timeTitle(lastEvent)}. The console read it from the grid with the page.`
+              : `The newest grid event that the last sweep saw: ${row.last_seen ? timeTitle(row.last_seen) : absolute(null)}.`
           }
         >
           {ago(newestOf(lastEvent, row.last_seen))}
@@ -1884,7 +1897,7 @@ export function Hosts() {
                   {COLUMNS.map((col) => (
                     <SortHeader
                       key={col.key}
-                      col={col}
+                      col={col.key === 'findings' ? { ...col, scope: findingsWindow(rows) } : col}
                       state={state}
                       onSort={onSort}
                       filter={

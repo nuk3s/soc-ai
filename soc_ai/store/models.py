@@ -1950,6 +1950,13 @@ class Campaign(Base):
     what the decision covered: ``{"last_event", "stage", "parties"}``. A
     rebuild that goes past it clears the decision. ``authorization_id`` and
     ``case_id`` are for later decisions.
+
+    ``last_alert_at`` is the time of the last alert event of a confirmed rule
+    between the machines of the campaign that a grid read saw, and
+    ``events_to`` is the end of the window that the grid reads covered
+    (migration 0076). The end rule reads both: an active campaign ends one
+    horizon after the later of ``last_event`` and ``last_alert_at``
+    (:func:`soc_ai.campaigns.service.api_status`). Each grid read writes them.
     """
 
     __tablename__ = "campaigns"
@@ -1980,6 +1987,8 @@ class Campaign(Base):
     decision_basis: Mapped[dict[str, Any] | None] = mapped_column(JSON, default=None)
     authorization_id: Mapped[int | None] = mapped_column(Integer, default=None)
     case_id: Mapped[str | None] = mapped_column(String(64), default=None)
+    last_alert_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    events_to: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
 
 
 class CampaignChange(Base):
@@ -2101,3 +2110,85 @@ class CampaignRunFacts(Base):
     basis: Mapped[str] = mapped_column(String(160))
     facts: Mapped[dict[str, Any]] = mapped_column(JSON)
     built_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class HuntAnswer(Base):
+    """What one hunt found for one campaign or one lead that it read (migration 0074).
+
+    ``subject_type`` is ``campaign`` or ``lead``. ``outcome`` is
+    ``new_activity``, ``continues`` or ``no_new_event``
+    (:mod:`soc_ai.hunting.hunt_answers`). ``finding_ordinal`` names the
+    finding behind the outcome, and is null for ``no_new_event``. The unique
+    index holds one answer for one hunt and one subject. ``hunt_id`` has no
+    foreign key, like ``campaign_members.run_id``.
+    """
+
+    __tablename__ = "hunt_answers"
+    __table_args__ = (
+        Index("ux_hunt_answers_hunt_subject", "hunt_id", "subject_type", "subject_id", unique=True),
+        Index("ix_hunt_answers_subject", "subject_type", "subject_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    hunt_id: Mapped[str] = mapped_column(String(32))
+    subject_type: Mapped[str] = mapped_column(String(16))
+    subject_id: Mapped[int] = mapped_column(Integer)
+    outcome: Mapped[str] = mapped_column(String(16))
+    finding_ordinal: Mapped[int | None] = mapped_column(Integer, default=None)
+    answered_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class RuleAlertState(Base):
+    """The acknowledge state that the grid states for one alert (migration 0075).
+
+    ``state`` is ``open``, ``acknowledged`` or ``gone``: the grid holds the
+    alert and it is open, the grid holds it acknowledged, or the grid holds no
+    such alert. ``read_at`` is the time of the read, naive UTC. The store
+    cannot tell otherwise whether an alert is still open: an acknowledge from
+    another investigation, from the inherited fan-out or from Security Onion
+    leaves no row (:mod:`soc_ai.webui.rule_decisions`).
+    """
+
+    __tablename__ = "rule_alert_states"
+
+    alert_es_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    state: Mapped[str] = mapped_column(String(16))
+    read_at: Mapped[datetime] = mapped_column(DateTime())
+
+
+class RuleDecision(Base):
+    """One decision of the analyst on the open false positives of a rule (migration 0075).
+
+    ``decision`` is ``acknowledge``: soc-ai acknowledges the open false
+    positives of the rule once. Or it is ``standing``: soc-ai does that, and
+    the hold ``high_stakes`` of the automatic acknowledge does not apply to a
+    later false positive of the rule until ``ends_at``. ``state`` is
+    ``acknowledging`` while the background work runs, then ``done`` or
+    ``failed``. ``alerts`` and ``failed`` count the acknowledges of the
+    decision, and ``investigations`` the receipts. ``acknowledged`` counts the
+    acknowledges under a standing decision after it. ``ended_at`` and
+    ``end_cause`` (``expired``, ``analyst``, ``true_positive``) state the end
+    of a standing decision. ``detail`` holds the rest of the result.
+    """
+
+    __tablename__ = "rule_decisions"
+    __table_args__ = (Index("ix_rule_decisions_rule", "rule_name", "decided_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    rule_name: Mapped[str] = mapped_column(String(512))
+    decision: Mapped[str] = mapped_column(String(16))
+    include_weak: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    note: Mapped[str] = mapped_column(Text, default="", server_default="")
+    decided_by: Mapped[str] = mapped_column(String(64))
+    decided_at: Mapped[datetime] = mapped_column(DateTime())
+    state: Mapped[str] = mapped_column(String(16))
+    alerts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    failed: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    investigations: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    acknowledged: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    ends_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    ended_at: Mapped[datetime | None] = mapped_column(DateTime(), default=None)
+    end_cause: Mapped[str | None] = mapped_column(String(32), default=None)
+    ended_by: Mapped[str | None] = mapped_column(String(64), default=None)
+    detail: Mapped[dict[str, Any] | None] = mapped_column(NULLABLE_JSON, default=None)

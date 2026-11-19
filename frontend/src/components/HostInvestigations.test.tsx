@@ -12,6 +12,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 
 import { listInvestigations } from '../lib/api';
 import type { InvestigationList, InvestigationRow } from '../lib/types';
+import { absTime, localTitle, utcStamp } from '../lib/timeRange';
 import { HostInvestigations, investigationsHref, useHostInvestigations } from './HostInvestigations';
 
 const row = (id: string, verdict: InvestigationRow['verdict'], name: string): InvestigationRow => ({
@@ -64,7 +65,7 @@ describe('HostInvestigations', () => {
     expect((await screen.findByTestId('host-investigations-count')).textContent).toBe(
       '7 investigations name this host. 6 reached a true-positive verdict.',
     );
-    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', limit: 3 });
+    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', limit: 3, tpParts: true });
     const rows = screen.getAllByTestId('host-investigation-row');
     expect(rows).toHaveLength(3);
     expect(rows[0].getAttribute('href')).toBe('/investigation/01A');
@@ -138,5 +139,86 @@ describe('HostInvestigations', () => {
     expect((await screen.findByTestId('host-investigations-error')).textContent).toContain(
       'This page could not read the investigations of this host.',
     );
+  });
+});
+
+// Round "decide once" (DC5). The host page read "51 reached a true-positive
+// verdict" in red, and each of the 51 was in a campaign that the analyst had
+// closed.
+describe('HostInvestigations: the true positives split', () => {
+  const PARTS = {
+    total: 6,
+    waiting: 1,
+    decided: 4,
+    authorized: 0,
+    superseded: 1,
+    other: 0,
+    campaigns: [{ id: 2, title: 'actor-a against web-1', state: 'closed', investigations: 4 }],
+  };
+
+  it('states the count that waits in the danger color and the decided count with a link', async () => {
+    vi.mocked(listInvestigations).mockResolvedValue({ ...LIST, truePositiveParts: PARTS });
+    mount();
+    const line = await screen.findByTestId('host-tp-split');
+    expect(line.textContent).toBe(
+      '7 investigations name this host. 6 reached a true-positive verdict. 1 waits. ' +
+        '4 are in a decided campaign: actor-a against web-1. 1 is superseded.',
+    );
+    expect(line.querySelector('[data-part="waiting"]')!.className).toContain('text-danger');
+    const decided = line.querySelector('[data-part="decided"]')!;
+    expect(decided.className).not.toMatch(/danger|warn/);
+    expect(screen.getByTestId('host-tp-decided-campaign')).toHaveAttribute('href', '/campaigns/2');
+    // The line itself reads neutral: only the count that waits is red.
+    expect(screen.getByTestId('host-investigations-count').className).not.toContain('text-danger');
+  });
+
+  it('wears no danger color when nothing waits', async () => {
+    // NEGATIVE CONTROL: the decided true positives are no alarm.
+    vi.mocked(listInvestigations).mockResolvedValue({
+      ...LIST,
+      truePositiveParts: { ...PARTS, waiting: 0, decided: 5, superseded: 1 },
+    });
+    mount();
+    const line = await screen.findByTestId('host-tp-split');
+    expect(line.textContent).toContain('0 wait.');
+    expect(line.querySelector('.text-danger')).toBeNull();
+  });
+
+  it('keeps the red line of an older server that sends no parts', async () => {
+    // NEGATIVE CONTROL: with no parts, every true positive still reads as an alarm.
+    mount();
+    const count = await screen.findByTestId('host-investigations-count');
+    await waitFor(() => expect(count.textContent).toBe('7 investigations name this host. 6 reached a true-positive verdict.'));
+    expect(count.className).toContain('text-danger');
+  });
+});
+
+// Dogfood 2026-11-17, AB2: the host page dated a row by the time soc-ai
+// investigated it, and the Investigations list dated the same row by its
+// event. A run of today on an event of 17 days ago read "today" here.
+describe('HostInvestigations: the time of the event', () => {
+  it('dates a row by its event and names both times in the hover', async () => {
+    const event = new Date(Date.now() - 17 * 86_400_000).toISOString();
+    const investigated = new Date(Date.now() - 3_600_000).toISOString();
+    vi.mocked(listInvestigations).mockResolvedValue({
+      ...LIST,
+      rows: [{ ...row('01A', 'true_positive', 'DCSync from a workstation'), ts: investigated, eventAt: event }],
+    });
+    mount();
+    const when = await screen.findByTestId('host-investigation-when');
+    expect(when.textContent).toBe(absTime(event));
+    expect(when.getAttribute('title')).toBe(
+      `Event ${utcStamp(event)}. ${localTitle(event)}. Investigated ${utcStamp(investigated)}.`,
+    );
+    // Round 3, T3: the row shows UTC with the label, and the hover states the
+    // local time with its zone.
+    expect(when.textContent!.endsWith(' UTC')).toBe(true);
+  });
+
+  it('falls back to the time of the investigation for a row with no event time', async () => {
+    // NEGATIVE CONTROL: an older server sends no event time.
+    mount();
+    const [when] = await screen.findAllByTestId('host-investigation-when');
+    expect(when.textContent).toBe(absTime(LIST.rows[0].ts ?? ''));
   });
 });

@@ -14,11 +14,13 @@ import { useState } from 'react';
 import { clearDossierOverride, snoozeDossierConflict } from '../lib/api';
 import { cn } from '../lib/cn';
 import { ageInWords, fieldLabel, isResolved, relativeAge, selfReportedFields } from '../lib/hostDossier';
-import { absTime } from '../lib/timeRange';
+import { timeTitle } from '../lib/timeRange';
+import { UtcTime } from './UtcTime';
 import type { Dossier, DossierField, MachineAgent } from '../lib/types';
 import { useDossierWrite } from '../lib/useDossierWrite';
 import { Spinner } from './States';
 import { FactRow } from './HostFacts';
+import { RelTime } from './RelTime';
 
 /** What kind-specific words an open disagreement opens with. */
 function conflictLead(kind: string | null, label: string): string {
@@ -84,7 +86,12 @@ function ConflictCard({
         <span className="text-faint">
           {' '}
           · seen {conflict.observations} time{conflict.observations === 1 ? '' : 's'}
-          {conflict.first_seen_at ? ` since ${relativeAge(conflict.first_seen_at)}` : ''}
+          {conflict.first_seen_at ? (
+            <>
+              {' since '}
+              <RelTime iso={conflict.first_seen_at} text={relativeAge(conflict.first_seen_at)} />
+            </>
+          ) : ''}
         </span>
       </div>
       {evidenceLine && (
@@ -92,7 +99,7 @@ function ConflictCard({
       )}
       {conflict.snoozed_until && (
         <div className="mt-1 text-[11.5px] text-faint">
-          Kept yours. The sweep asks again after {absTime(conflict.snoozed_until)}.
+          Kept yours. The sweep asks again after <UtcTime iso={conflict.snoozed_until} />.
         </div>
       )}
       {canDeclare && (
@@ -223,7 +230,7 @@ export function HostBriefing({ dossier, canDeclare, onApplied, focusField, agent
         <div
           data-testid="host-agent-late"
           className="flex items-start gap-2 rounded-card border border-warn/30 bg-warn/[0.05] px-3.5 py-2.5 text-[12.5px] leading-[1.5] text-text-2"
-          title={agent?.last_report ? absTime(agent.last_report) : undefined}
+          title={agent?.last_report ? timeTitle(agent.last_report) : undefined}
         >
           <Clock size={13} className="mt-0.5 flex-none text-warn" />
           <span>{lateAgentText(agent?.last_report)}</span>

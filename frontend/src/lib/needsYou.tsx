@@ -93,7 +93,8 @@ export type PartKey =
   | 'unread_shadow_hits'
   | 'untriaged_groups'
   | 'needs_more_info'
-  | 'pending_actions';
+  | 'pending_actions'
+  | 'rules_waiting';
 
 /** The parts of the count that wait on a decision, each decision once, in the
  *  order of the lines. An unread shadow hit is review work: one press of
@@ -107,6 +108,7 @@ export const DECISION_PART_KEYS: ReadonlyArray<PartKey> = [
   'investigations_waiting',
   'leads_needing_decision',
   'untriaged_groups',
+  'rules_waiting',
 ];
 
 /** The parts an older server summed. It sends no `investigations_waiting`. */
@@ -180,8 +182,19 @@ export function needsYouPart(data: NeedsYouCount | null, ...keys: PartKey[]): nu
 /** The page that lists every decision that waits, one item each. */
 export const NEEDS_YOU_PAGE = '/needs-you';
 
-/** Where each part of the count is read and decided. The tile lines and the
- *  sidebar badges link here, so the number on the link is the list it opens. */
+/** The types of the Needs you list that a link can filter on. */
+export type NeedsYouFilter = 'campaign' | 'investigation' | 'lead' | 'alerts' | 'rule';
+
+/** The Needs you page with a type filter. Each line of the Dashboard tile and
+ *  of the bell opens it, so a line opens the one list and no other
+ *  (dogfood 2026-11-17, NY4). */
+export function needsYouTypeLink(type: NeedsYouFilter): string {
+  return `${NEEDS_YOU_PAGE}?type=${type}`;
+}
+
+/** Where each part of the count is read and decided. The sidebar badges link
+ *  here, so the number on a badge is the list it opens. The lines of the tile
+ *  and of the bell open the Needs you page (needsYouTypeLink). */
 export function needsYouLinks(data: NeedsYouCount | null) {
   const alertWindow = data?.alert_window ?? '7d';
   const verdictWindow = data?.verdict_window ?? '30d';
@@ -202,6 +215,15 @@ export function needsYouLinks(data: NeedsYouCount | null) {
   };
 }
 
+/** The filter of the Needs you page that holds each decision part. */
+const PART_FILTER: Partial<Record<PartKey, NeedsYouFilter>> = {
+  campaigns: 'campaign',
+  investigations_waiting: 'investigation',
+  leads_needing_decision: 'lead',
+  untriaged_groups: 'alerts',
+  rules_waiting: 'rule',
+};
+
 /** One part of the count as the bell panel and the Notifications screen say it. */
 export interface NeedsYouLine {
   key: PartKey;
@@ -213,7 +235,8 @@ export interface NeedsYouLine {
   scope: string;
   /** What to say when the server could not read the part. */
   unknown: string;
-  /** The list that holds the part. */
+  /** The list that holds the part: the Needs you page with the type filter
+   *  of the part. The review line opens the shadow hits. */
   to: string;
 }
 
@@ -309,6 +332,21 @@ function allNeedsYouLines(data: NeedsYouCount | null): NeedsYouLine[] {
       unknown: 'Could not count the leads.',
       to: links.leads,
     },
+    // The rules with open false positives, after the leads and before the
+    // alert groups: the order of the list. An older server sends no part,
+    // and the line then does not show.
+    ...(data.rules_waiting === undefined
+      ? []
+      : [
+          {
+            key: 'rules_waiting' as const,
+            count: data.rules_waiting,
+            text: '',
+            scope: ANY_AGE,
+            unknown: 'Could not count the rules with open false positives.',
+            to: needsYouTypeLink('rule'),
+          },
+        ]),
     {
       key: 'unread_shadow_hits',
       count: data.unread_shadow_hits,
@@ -328,7 +366,16 @@ function allNeedsYouLines(data: NeedsYouCount | null): NeedsYouLine[] {
   ];
   return lines
     .filter((line) => line.count === null || line.count > 0)
-    .map((line) => ({ ...line, text: line.count === null ? '' : lineText(line.key, line.count, data.alert_floor) }));
+    .map((line) => {
+      // A decision part opens the one list. The shadow hits are review work
+      // and no item of it: their line keeps the Hunts page.
+      const filter = PART_FILTER[line.key];
+      return {
+        ...line,
+        to: filter ? needsYouTypeLink(filter) : line.to,
+        text: line.count === null ? '' : lineText(line.key, line.count, data.alert_floor),
+      };
+    });
 }
 
 function lineText(key: PartKey, n: number, alertFloor: boolean): string {
@@ -347,5 +394,14 @@ function lineText(key: PartKey, n: number, alertFloor: boolean): string {
       return `${n} ${plural(n, 'verdict needs', 'verdicts need')} more info`;
     case 'pending_actions':
       return `${n} recommended ${plural(n, 'action waits', 'actions wait')} for you`;
+    case 'rules_waiting':
+      return `${n} ${plural(n, 'rule waits', 'rules wait')} on your decision`;
   }
+}
+
+/** The rules with open false positives: the chip of the Needs you page. An
+ *  older server sends no part, and the chip then shows no count. */
+export function rulesWaiting(data: NeedsYouCount | null): number | null {
+  if (!data || data.rules_waiting === undefined) return null;
+  return data.rules_waiting;
 }

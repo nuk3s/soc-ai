@@ -5,7 +5,7 @@ import { Link, useInRouterContext } from 'react-router-dom';
 import { ApiError, getApiKeys, getPreflightDetail, refreshPreflight } from '../lib/api';
 import { type DoctorFix, doctorFix, rowsByGrade } from '../lib/doctorFix';
 import type { PreflightDetail, PreflightRow } from '../lib/types';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle, utcTimesInText } from '../lib/timeRange';
 import { ChangePasswordModal } from '../shell/ChangePasswordModal';
 import { HelpText } from './HelpText';
 import { LoadingInline } from './States';
@@ -308,7 +308,7 @@ export function DoctorList({
       <div className="flex flex-wrap items-center gap-2 px-4 py-2.5">
         <span className="text-[12.5px] font-semibold text-text-2">Doctor</span>
         {detail && (
-          <span className="text-[11.5px] text-dim" title={absTime(detail.checked_at)}>
+          <span className="text-[11.5px] text-dim" title={timeTitle(detail.checked_at)}>
             {rows.length ? `${doctorCounts(rows)} · ` : ''}checked {ago(detail.checked_at)}
           </span>
         )}
@@ -358,7 +358,7 @@ export function DoctorList({
                 </span>
                 <div className="min-w-0 flex-1">
                   <span className="font-semibold text-text-2">{r.name}</span>
-                  <span className="text-dim">: {r.detail}</span>
+                  <span className="text-dim">: {utcTimesInText(r.detail)}</span>
                   {r.hint && (
                     // A remedy names a command in backticks. HelpText renders
                     // it as code (dogfood round 2, V2-3).

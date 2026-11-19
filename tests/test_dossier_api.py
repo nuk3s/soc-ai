@@ -1211,6 +1211,7 @@ def _grid_responder() -> Any:
                 2,
                 {
                     "recent": {
+                        "doc_count": 1,
                         "src": {"buckets": [{"key": _ACTIVITY_IP, "doc_count": 2}]},
                         "dst": {"buckets": [{"key": "192.168.20.226", "doc_count": 2}]},
                     }
@@ -1242,6 +1243,8 @@ def test_activity_returns_peers_volume_users_and_alert_count(
     # No auth documents for this address at all — "needs host logs", not "nobody".
     assert data["users"] is None
     assert data["alerts_7d"] == 2
+    # The count of the chosen range: the filter bucket of the 24h window.
+    assert data["alerts"] == 1
     assert data["latest_investigation"] is None
     # The truncation flags ride the wire so the page's "the N busiest…"
     # footnotes state a cut that happened instead of re-inferring one from a

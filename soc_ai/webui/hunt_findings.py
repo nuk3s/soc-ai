@@ -56,6 +56,7 @@ import asyncio
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from time import monotonic
 from typing import Any
 
@@ -795,6 +796,13 @@ async def _complete(state: Any, hunt_id: str) -> FindingVerdicts | None:
                 _LOGGER.info("lead %s after hunt %s: %s", hunt.lead_id, hunt_id, moved)
     except Exception:
         _LOGGER.exception("hunt %s did not complete its investigation phase", hunt_id)
+    # The hunt states what it found for each campaign and each lead that it
+    # read. Its own try block: the phase is over whatever happens here.
+    from soc_ai.hunting import hunt_answers  # noqa: PLC0415 - the hunting package reads this
+
+    await hunt_answers.after_end(
+        state.db_sessionmaker, hunt_id, now=datetime.now(UTC).replace(tzinfo=None)
+    )
     return verdicts
 
 

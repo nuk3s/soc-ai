@@ -12,6 +12,7 @@ import type {
   CampaignChange,
   CampaignDecision,
   CampaignDecisionType,
+  CampaignState,
   CampaignStatus,
 } from './api';
 
@@ -33,6 +34,31 @@ export function decisionState(c: {
   if (!isActiveCampaign(c.status) || c.decision === undefined) return 'unknown';
   if (c.decision === null) return 'waits';
   return typeof c.decision === 'string' ? c.decision : c.decision.type;
+}
+
+/** The one state of a campaign (DC1): the `state` the server sends, else the
+ *  decision in force, else the status. Every page reads this, so no page
+ *  shows "Open" for a campaign that an analyst closed. */
+export function campaignState(c: {
+  status: CampaignStatus;
+  decision?: CampaignDecision | CampaignDecisionType | null;
+  state?: CampaignState | '' | null;
+}): CampaignState {
+  if (c.state) return c.state;
+  const d = decisionState(c);
+  return d === 'closed' || d === 'authorized' || d === 'case' ? d : c.status;
+}
+
+/** True when the payload states that the campaign waits on a decision: it
+ *  is active and no decision is in force. A server of an earlier release
+ *  sends no decision, and the console then claims no wait. */
+export function stateWaits(c: {
+  status: CampaignStatus;
+  decision?: CampaignDecision | CampaignDecisionType | null;
+  state?: CampaignState | '' | null;
+}): boolean {
+  const s = campaignState(c);
+  return (s === 'open' || s === 'ended') && c.decision === null;
 }
 
 /** The newest acknowledgement that followed the decision that stands. An

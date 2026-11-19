@@ -142,7 +142,7 @@ const mount = async (pipelineErrors: InvestigationRow[] = []) => {
 
 /** The whole true-positives tile (the Panel), located from its label. */
 const tpTile = async () =>
-  (await screen.findByText('True positives · 24h')).closest('.rounded-panel')!;
+  (await screen.findByText('True positives that wait · 24h')).closest('.rounded-panel')!;
 
 describe('Dashboard true-positives tile — every number answers one question', () => {
   it('states the total of the Confirmed threats answer, over the window', async () => {
@@ -177,14 +177,14 @@ describe('Dashboard true-positives tile — every number answers one question', 
     const tile = await tpTile();
     await waitFor(() => expect(tile.textContent).toContain('Open them'));
     const link = screen.getByRole('link', { name: 'Open them' });
-    expect(link.getAttribute('href')).toBe('/investigations?range=24h&verdict=true_positive');
+    expect(link.getAttribute('href')).toBe('/investigations?range=24h&verdict=true_positive&waits=true');
   });
 
   it('reads the new window when the range changes', async () => {
     await mount();
     await tpTile();
     fireEvent.click(screen.getByText('7d'));
-    expect(await screen.findByText('True positives · 7d')).toBeTruthy();
+    expect(await screen.findByText('True positives that wait · 7d')).toBeTruthy();
     expect(await screen.findByText('Confirmed threats · last 7 days')).toBeTruthy();
     await waitFor(() => {
       const sinces = getThreats.mock.calls.map((c) => Date.now() - Date.parse(c[0].since));
@@ -209,7 +209,7 @@ describe('Dashboard true-positives tile — every number answers one question', 
     getThreats.mockReset().mockRejectedValue(new Error('503'));
     fireEvent.click(screen.getByText('7d'));
     await screen.findByTestId('confirmed-threats-error');
-    const tile = (await screen.findByText('True positives · 7d')).closest('.rounded-panel')!;
+    const tile = (await screen.findByText('True positives that wait · 7d')).closest('.rounded-panel')!;
     expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('?');
     expect(tile.textContent).toContain('Could not read the confirmed threats.');
     // NEGATIVE CONTROL: a failure is not a zero and not the empty line.
@@ -222,13 +222,102 @@ describe('Dashboard true-positives tile — every number answers one question', 
     // It counts investigation runs over thirty days, which is neither the unit
     // nor the window in the tile's heading, so it says so. The clause waits for
     // its own read.
-    await waitFor(() => expect(tile.textContent).toMatch(/investigations, last 30 days/i));
-    expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
+    await waitFor(() => expect(tile.textContent).toMatch(/failed investigations · last 30 days/i));
+    expect(await screen.findByRole('button', { name: '2 failed investigations' })).toBeTruthy();
   });
 
   it('says nothing about a 30-day window when there is nothing to say', async () => {
     await mount();
     const tile = await tpTile();
     expect(tile.textContent).not.toMatch(/30 days/);
+  });
+});
+
+// Round "decide once" (DC3). Production at 7 days read "12 on 0 hosts", and the
+// link opened 14 rows. Each of the 12 was in a closed campaign.
+describe('Dashboard true-positives tile counts what waits', () => {
+  it('states the waiting count and its machines, never the decided ones', async () => {
+    await mount();
+    getThreats.mockReset().mockResolvedValue({
+      ...threatsOf(15),
+      waiting: 3,
+      waitingHosts: 2,
+      decided: { campaigns: 1, investigations: 12 },
+    });
+    fireEvent.click(screen.getByText('7d'));
+    const tile = (await screen.findByText('True positives that wait · 7d')).closest('.rounded-panel')!;
+    await waitFor(() => expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('3'));
+    expect(within(tile as HTMLElement).getByTestId('tp-hosts').textContent).toBe('on 2 hosts in this window');
+    // The panel header states the same count.
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('3 true positives wait');
+    expect(screen.getByTestId('threat-decided').textContent).toBe(
+      'Decided: 1 campaign with 12 true positive investigations in this window.',
+    );
+  });
+
+  it('states the split when a campaign with no decision holds some of them (OW2)', async () => {
+    await mount();
+    getThreats.mockReset().mockResolvedValue({
+      ...threatsOf(6),
+      waiting: 6,
+      waitingHosts: 3,
+      waitingInCampaigns: 2,
+      waitingCampaigns: 1,
+    });
+    fireEvent.click(screen.getByText('7d'));
+    const tile = (await screen.findByText('True positives that wait · 7d')).closest('.rounded-panel')!;
+    await waitFor(() => expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('6'));
+    expect((await within(tile as HTMLElement).findByTestId('tp-split')).textContent).toBe(
+      '6 true positives wait: 4 on their own, 2 in 1 campaign.',
+    );
+  });
+
+  // Round 3 part 2 (W2): the close of a reopened campaign covered 28 of them.
+  it('states the true positives that the close of a reopened campaign covered, and the panel states the same', async () => {
+    await mount();
+    getThreats.mockReset().mockResolvedValue({
+      ...threatsOf(8),
+      waiting: 8,
+      waitingHosts: 2,
+      waitingInCampaigns: 2,
+      waitingCampaigns: 1,
+      earlier: { campaigns: 1, investigations: 28, decision: 'closed', decidedAt: '2026-11-15T01:01:12Z' },
+    });
+    fireEvent.click(screen.getByText('30d'));
+    const tile = (await screen.findByText('True positives that wait · 30d')).closest('.rounded-panel')!;
+    await waitFor(() => expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('8'));
+    const words = '28 are in a campaign that opened again. The close of 2026-11-15 covered them.';
+    expect((await within(tile as HTMLElement).findByTestId('tp-earlier')).textContent).toBe(words);
+    expect(screen.getByTestId('threat-earlier').textContent).toBe(words);
+  });
+
+  it('control: the tile states no split when no campaign holds one', async () => {
+    await mount();
+    getThreats.mockReset().mockResolvedValue({ ...threatsOf(3), waiting: 3, waitingHosts: 2, waitingInCampaigns: 0 });
+    fireEvent.click(screen.getByText('7d'));
+    const tile = (await screen.findByText('True positives that wait · 7d')).closest('.rounded-panel')!;
+    await waitFor(() => expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('3'));
+    expect(within(tile as HTMLElement).queryByTestId('tp-split')).toBeNull();
+    expect(within(tile as HTMLElement).queryByTestId('tp-earlier')).toBeNull();
+  });
+
+  it('states no machine count under a count of 0', async () => {
+    // NEGATIVE CONTROL: twelve decided true positives are no threat that waits.
+    await mount();
+    getThreats.mockReset().mockResolvedValue({
+      ...threatsOf(12),
+      rows: [],
+      authorized: [],
+      campaigns: [],
+      waiting: 0,
+      waitingHosts: 0,
+      decided: { campaigns: 1, investigations: 12 },
+    });
+    fireEvent.click(screen.getByText('7d'));
+    const tile = (await screen.findByText('True positives that wait · 7d')).closest('.rounded-panel')!;
+    await waitFor(() => expect(within(tile as HTMLElement).getByTestId('tp-total').textContent).toBe('0'));
+    expect(within(tile as HTMLElement).getByTestId('tp-hosts').textContent).toBe('None waits in this window.');
+    expect(tile.textContent).not.toMatch(/on 0 hosts/);
+    expect(screen.getByTestId('confirmed-threats-empty').textContent).toBe('No confirmed threat waits for a decision.');
   });
 });

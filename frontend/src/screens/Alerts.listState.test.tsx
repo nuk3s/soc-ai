@@ -156,9 +156,10 @@ describe('a failing poll names the age of the rows (RL12)', () => {
     vi.mocked(getAlerts).mockRejectedValue(new ApiError('The grid did not answer.', 503));
     await poll();
 
-    // The date and the zone of the read (dogfood 2026-10-19, R2-D17).
+    // The date and the zone of the read (dogfood 2026-10-19, R2-D17), in UTC
+    // with the label (round 3, T3).
     const line = await screen.findByText(
-      /^Showing the last good read from \w{3} \d{2}, \d\d:\d\d \S+\. The grid did not answer\.$/,
+      /^Showing the last good read from \d{4}-\d{2}-\d{2} \d\d:\d\d UTC\. The grid did not answer\.$/,
     );
     expect(line).toBeTruthy();
     expect(screen.getByText('ET SCAN Test Detection')).toBeTruthy();
@@ -186,6 +187,24 @@ describe('an invalid filter is the analyst to fix, not an outage (P7, RL8)', () 
 
     const sent = vi.mocked(getAlerts).mock.calls.length;
     await poll();
+    await poll();
+    expect(vi.mocked(getAlerts).mock.calls.length).toBe(sent);
+  });
+
+  it('shows the reason of a filter that the grid rejected and stops polling', async () => {
+    const rejected =
+      'The field destination.ip is an IP field. An IP field takes an address or a CIDR range in quotes. ' +
+      'Elasticsearch states: query_shard_exception: Can only use prefix queries on keyword, text and ' +
+      'wildcard fields - not on [destination.ip] which is of type [ip]. The result is unknown.';
+    vi.mocked(getAlerts).mockRejectedValue(new ApiError(rejected, 400, 'query_rejected'));
+    mount('/alerts?q=destination.ip:192.0.2.*');
+
+    expect(await screen.findByText('The grid rejected the filter')).toBeTruthy();
+    expect(screen.getByText(rejected)).toBeTruthy();
+    expect(screen.queryByText('Could not load this view')).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Retry' })).toBeNull();
+
+    const sent = vi.mocked(getAlerts).mock.calls.length;
     await poll();
     expect(vi.mocked(getAlerts).mock.calls.length).toBe(sent);
   });

@@ -28,7 +28,7 @@ from soc_ai.store.models import Campaign
 
 from tests.test_hunt_campaign_block import seed_campaign
 
-LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision"}
+LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision", "state"}
 
 
 @pytest.fixture

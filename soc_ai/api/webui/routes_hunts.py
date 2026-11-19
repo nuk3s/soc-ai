@@ -64,6 +64,7 @@ from soc_ai.store.models import (
     Investigation,
     Lead,
 )
+from soc_ai.store.observation_event_times import investigation_event_times
 from soc_ai.tools.query_events import _MAX_TIME_RANGE_MINUTES
 from soc_ai.webui import (
     anchor_check,
@@ -132,6 +133,9 @@ class HuntRowOut(BaseModel):
     # catalog run reads "<analytic title>, last 24 h" and a lead hunt reads
     # "Lead 6 hunt: domainadmin on SR-DC01". The objective stays the record.
     title: str = ""
+    # The steps of a hunt that stopped (STOPPED_STATUSES). Null for any other
+    # hunt. The row reads "Stopped with an error after 14 steps".
+    steps: int | None = None
     affectedHosts: int = 0
     confidence: float | None = None
     startedBy: str = ""
@@ -190,6 +194,11 @@ _HUNT_TL_GROUP = {
 # tally of capped findings / stripped citations) — an audit record, not a hunt
 # trace step, so it is skipped from the timeline (the validator's effect shows on
 # the findings themselves via validatorNote).
+# The statuses of a hunt that stopped before it finished. The list, the
+# page, the lead page and the campaign fold count the steps of such a hunt:
+# "Stopped with an error after 14 steps" (dogfood 2026-11-17, F5).
+STOPPED_STATUSES = frozenset({"error", "cancelled", "interrupted"})
+
 _HUNT_TL_SKIP = {
     "tool_result",
     "model_response",
@@ -479,10 +488,7 @@ async def _finding_runs(db: Any, hunt: Hunt, *, state: Any = None) -> dict[int, 
     true_positives = [
         inv.id
         for _link, inv in chosen.values()
-        if inv is not None
-        and inv.status == "complete"
-        and inv.verdict == "true_positive"
-        and inv.is_fallback is not True
+        if inv is not None and action_rules.run_requests(inv)
     ]
     pending: dict[str, int] = {}
     if true_positives:
@@ -688,6 +694,9 @@ class HuntOut(BaseModel):
     outcome_label: str = ""
     outcome_headline: str = ""
     title: str = ""
+    # The steps of a hunt that stopped, as HuntRowOut.steps. Null for any
+    # other hunt.
+    steps: int | None = None
     # The lead that started this hunt, when one did.
     leadId: int | None = None
     # W10. What a running hunt does now, in words: "the model reads the
@@ -1192,9 +1201,15 @@ async def list_hunts(
         )
         verdicts = await hunt_svc.finding_verdicts(db, [h.id for h in rows])
         campaigns = await campaign_svc.links_by_id(db, [h.campaign_id for h in rows])
-    return [
+        stopped = [h.id for h in rows if h.status in STOPPED_STATUSES]
+        steps = await _step_counts(db, stopped)
+    out = [
         _hunt_row(h, chat_counts.get(h.id, 0), names, verdicts.get(h.id), campaigns) for h in rows
     ]
+    for row in out:
+        if row.id in stopped:
+            row.steps = steps.get(row.id, 0)
+    return out
 
 
 @router.get("/hunts/stats", response_model=list[HuntStatOut])
@@ -1641,6 +1656,11 @@ async def get_hunt(request: Request, hunt_id: str) -> HuntOut:
         outcome_label=_outcome.outcome_label(outcome, counts),
         outcome_headline=headline,
         title=objective_headline(hunt.objective, names),
+        steps=(
+            sum(1 for e in events if e.kind not in _HUNT_TL_SKIP)
+            if hunt.status in STOPPED_STATUSES
+            else None
+        ),
         leadId=hunt.lead_id,
         currentStep=current_activity(events) if hunt.status == "running" else None,
         typicalRun=typical,
@@ -3695,6 +3715,52 @@ class LeadPromotedFindingOut(BaseModel):
     shared_with: list[int] = []
 
 
+class LeadCampaignOut(BaseModel):
+    """The campaign that a lead is part of, as the top of the lead page states it.
+
+    ``decision`` is ``closed``, ``authorized``, ``case`` or null, with the time
+    and the hand of the decision. ``closed_with_campaign`` is true for a lead
+    that soc-ai closed with the close or the authorization of its campaign.
+    ``closed_at`` is the time of that close, null for any other lead.
+    """
+
+    id: int
+    title: str
+    decision: str | None = None
+    decided_at: str | None = None
+    decided_by: str | None = None
+    closed_with_campaign: bool = False
+    closed_at: str | None = None
+    # W4: the decision that closed the lead (``closed`` or ``authorized``),
+    # its analyst, and the newest reopen of the campaign after the close.
+    closed_by_decision: str | None = None
+    closed_by: str | None = None
+    reopened_at: str | None = None
+
+
+class LeadAuthorizedOut(BaseModel):
+    """The observations of a lead whose investigation matched one authorization."""
+
+    label: str
+    observations: int
+
+
+class LeadAnswerOut(BaseModel):
+    """What one other hunt found for this lead when it read it (migration 0074).
+
+    ``outcome`` is ``new_activity``: a threat finding names a machine of the
+    lead, or ``no_new_event``. ``finding_title`` names the finding behind
+    ``new_activity``. ``hunt_at`` is the time that the hunt started.
+    """
+
+    hunt_id: str
+    hunt_at: str | None = None
+    starter: str
+    outcome: str
+    finding_ordinal: int | None = None
+    finding_title: str | None = None
+
+
 class LeadDetailOut(LeadOut):
     """One lead with its timeline, its live weight and its decisions."""
 
@@ -3726,6 +3792,12 @@ class LeadDetailOut(LeadOut):
     # with the verdict its investigation reached.
     promoted_findings: list[LeadPromotedFindingOut] = []
     observations: list[LeadObservationDetailOut]  # type: ignore[assignment]
+    # LH4: the campaign that the lead is part of, with its decision, and the
+    # observations whose investigation matched an authorization.
+    campaign_context: LeadCampaignOut | None = None
+    authorized: list[LeadAuthorizedOut] = []
+    # LH3: what the other hunts that read this lead found, newest first.
+    answers: list[LeadAnswerOut] = []
 
 
 class LeadDismissIn(BaseModel):
@@ -3987,7 +4059,9 @@ async def list_leads(
     by_lead: dict[int, list[EntityObservation]] = {}
     for o in obs_rows:
         by_lead.setdefault(int(o.lead_id or 0), []).append(o)
-    tallies = {lead.id: _hunt_tally(_hunts_of(lead, hunts_by_id.values())) for lead in leads}
+    tallies = {
+        lead.id: _hunt_tally(_hunts_of(lead, hunts_by_id.values()), verdicts) for lead in leads
+    }
 
     def _state(lead: Any) -> tuple[str | None, str | None]:
         h = hunts_by_id.get(lead.hunt_id or "")
@@ -4002,7 +4076,9 @@ async def list_leads(
             closed_by_hunt_verdicts=leads_store.closed_on_verdicts(lead),
             hunt_status=_state(lead)[0],
             hunt_outcome_label=_state(lead)[1],
-            hunt_outcome=_lead_hunt_outcome(hunts_by_id.get(lead.hunt_id or "")),
+            hunt_outcome=_lead_hunt_outcome(
+                hunts_by_id.get(lead.hunt_id or ""), verdicts.get(lead.hunt_id or "")
+            ),
             hunt_answer=_lead_hunt_answer(hunts_by_id.get(lead.hunt_id or "")),
             hunt_not_checked=_lead_hunt_gaps(hunts_by_id.get(lead.hunt_id or "")),
             hold_reason=leads_store.hold_reason_of(lead),
@@ -4095,8 +4171,10 @@ def _lead_hunt_state(
     return status, _outcome.outcome_label(outcome, _phase_counts(hunt, verdicts)) or None
 
 
-def _lead_hunt_outcome(hunt: Hunt | None) -> str | None:
-    """The outcome code of the hunt attached to a lead, by the rule of :func:`_lead_hunt_state`."""
+def _lead_hunt_outcome(
+    hunt: Hunt | None, verdicts: _outcome.FindingVerdicts | None = None
+) -> str | None:
+    """The outcome code of the hunt attached to a lead: :func:`_lead_outcome_code`."""
     from soc_ai.store.leads import HUNT_FAILED_STATUSES  # noqa: PLC0415 - lazy
 
     if hunt is None:
@@ -4104,8 +4182,21 @@ def _lead_hunt_outcome(hunt: Hunt | None) -> str | None:
     status = _HUNT_STATUS.get(hunt.status, "error")
     if status in HUNT_FAILED_STATUSES:
         return "failed"
+    return _lead_outcome_code(hunt, verdicts) or None
+
+
+def _lead_outcome_code(hunt: Hunt, verdicts: _outcome.FindingVerdicts | None) -> str:
+    """The one outcome code of a hunt on a lead: the pill, the row and the record read it.
+
+    The four lead-store codes (clean, threats, gap, failed). A hunt that
+    investigated its findings gives the verdict outcome in their place. The
+    host page card read "found a threat" from the store code while the pill
+    read "No threat confirmed" from the verdicts (dogfood 2026-11-17, b05).
+    """
+    status = _HUNT_STATUS.get(hunt.status, "error")
     _threats, outcome = _hunt_outcome(status, (_hunt_report(hunt).get("findings") or []))
-    return outcome or None
+    _threats, public, _headline = _outcome_of(hunt, verdicts)
+    return public if public in _VERDICT_OUTCOMES else outcome
 
 
 def _lead_hunt_answer(hunt: Hunt | None) -> str:
@@ -4137,15 +4228,20 @@ def _hunts_of(lead: Any, hunts: Any) -> list[Hunt]:
     return sorted(mine, key=lambda h: (h.created_at or datetime.min, h.id), reverse=True)
 
 
-def _hunt_finds_a_threat(hunt: Hunt) -> bool:
-    status = _HUNT_STATUS.get(hunt.status, "error")
-    _threats, outcome = _hunt_outcome(status, (_hunt_report(hunt).get("findings") or []))
-    return outcome == "threats"
+def _hunt_finds_a_threat(hunt: Hunt, verdicts: _outcome.FindingVerdicts | None = None) -> bool:
+    """A threat by the one code: a threat finding, or a confirmed threat after the verdicts.
+
+    A hunt whose investigations refuted every threat finding found none.
+    """
+    return _lead_outcome_code(hunt, verdicts) in ("threats", "threats_confirmed")
 
 
-def _hunt_tally(hunts: Sequence[Hunt]) -> tuple[int, int]:
+def _hunt_tally(
+    hunts: Sequence[Hunt], verdicts: Mapping[str, _outcome.FindingVerdicts] | None = None
+) -> tuple[int, int]:
     """How many hunts a lead has on record, and how many of them found a threat."""
-    return len(hunts), sum(1 for h in hunts if _hunt_finds_a_threat(h))
+    found = verdicts or {}
+    return len(hunts), sum(1 for h in hunts if _hunt_finds_a_threat(h, found.get(h.id)))
 
 
 def _gap_sentences(hunt: Hunt, limit: int = 3) -> list[str]:
@@ -4178,10 +4274,9 @@ def _lead_hunt_out(
     # The row keeps the four lead-store codes (clean, threats, gap, failed).
     # A hunt that investigated its findings sends the verdict outcome in their
     # place, and its label carries the counts, the words the hunt page prints.
-    threats, outcome = _hunt_outcome(status, (report.get("findings") or []))
+    threats, _code = _hunt_outcome(status, (report.get("findings") or []))
     _threats, public, _headline = _outcome_of(hunt, verdicts)
-    if public in _VERDICT_OUTCOMES:
-        outcome = public
+    outcome = _lead_outcome_code(hunt, verdicts)
     answer, not_checked = _hunt_answer(hunt)
     return LeadHuntOut(
         id=hunt.id,
@@ -4356,7 +4451,7 @@ async def _lead_detail_from_db(
     # A lead of a campaign waits on its campaign, and its page names it.
     campaign_id = (await leads_store.campaign_leads(db, [int(lead.id)])).get(int(lead.id))
     links = await campaign_svc.links_by_id(db, [campaign_id])
-    return _lead_detail(
+    out = _lead_detail(
         lead,
         rows,
         datetime.now(UTC),
@@ -4368,12 +4463,52 @@ async def _lead_detail_from_db(
         auto_hunt=auto_hunt,
         hold_reason=await derived_hold_reason(db, lead),
         lead_hunts=[_lead_hunt_out(h, steps.get(h.id, 0), verdicts.get(h.id)) for h in on_lead],
-        hunt_tally=_hunt_tally(on_lead),
+        hunt_tally=_hunt_tally(on_lead, verdicts),
         hunt_verdicts=verdicts.get(hunt.id) if hunt is not None else None,
         promoted_findings=await _promoted_findings(db, on_lead),
         retired=retired,
         campaign=link_out(links.get(int(campaign_id))) if campaign_id is not None else None,
+        event_times=await investigation_event_times(db, rows),
     )
+    await _lead_context(db, lead, out)
+    return out
+
+
+async def _lead_context(db: Any, lead: Any, out: LeadDetailOut) -> None:
+    """LH3 and LH4: the campaign of the lead, its authorized observations and the answers."""
+    from soc_ai.campaigns import lead_tags  # noqa: PLC0415 - lazy, like the store reads
+    from soc_ai.hunting import hunt_answers  # noqa: PLC0415
+
+    found = await lead_tags.lead_campaign(db, lead)
+    if found is not None:
+        out.campaign_context = LeadCampaignOut(
+            id=found.id,
+            title=found.title,
+            decision=found.decision,
+            decided_at=_iso(found.decided_at),
+            decided_by=found.decided_by,
+            closed_with_campaign=found.closed_with_campaign,
+            closed_at=_iso(found.closed_at),
+            closed_by_decision=found.closed_by_decision,
+            closed_by=found.closed_by,
+            reopened_at=_iso(found.reopened_at),
+        )
+    out.authorized = [
+        LeadAuthorizedOut(label=part.label, observations=part.observations)
+        for part in await lead_tags.authorized_parts(db, int(lead.id))
+    ]
+    views = await hunt_answers.answers_of(db, hunt_answers.SUBJECT_LEAD, [int(lead.id)])
+    out.answers = [
+        LeadAnswerOut(
+            hunt_id=v.hunt_id,
+            hunt_at=_iso(v.hunt_at),
+            starter=v.starter,
+            outcome=v.outcome,
+            finding_ordinal=v.finding_ordinal,
+            finding_title=scrub_secrets(v.finding_title) if v.finding_title else None,
+        )
+        for v in views
+    ]
 
 
 def _lead_detail(
@@ -4394,6 +4529,7 @@ def _lead_detail(
     retired: dict[str, datetime] | None = None,
     hunt_verdicts: _outcome.FindingVerdicts | None = None,
     campaign: CampaignLinkOut | None = None,
+    event_times: Mapping[int, datetime] | None = None,
 ) -> LeadDetailOut:
     """One lead, its observations and what each one is worth now.
 
@@ -4444,7 +4580,10 @@ def _lead_detail(
                 occurrences=int(o.occurrences or 1),
                 born_at=_iso(o.born_at),
                 first_seen_at=_iso(o.first_seen_at),
-                observed_at=_iso(o.observed_at),
+                # An alert or a finding observation holds no document time.
+                # Its investigation holds the time of the event (AB2). The
+                # weight above keeps the stored time.
+                observed_at=_iso(o.observed_at or (event_times or {}).get(int(o.id))),
                 source=observation_source(o.source),
                 shadow=bool(o.shadow),
                 weight_now=round(w, 3),
@@ -4498,7 +4637,7 @@ def _lead_detail(
         id=lead.id,
         hunt_status=hunt_status,
         hunt_outcome_label=hunt_outcome_label,
-        hunt_outcome=_lead_hunt_outcome(hunt),
+        hunt_outcome=_lead_hunt_outcome(hunt, hunt_verdicts),
         hunt_answer=_lead_hunt_answer(hunt),
         hunt_not_checked=_lead_hunt_gaps(hunt),
         repeats_after_close=repeats_after_close(lead, rows)[0],

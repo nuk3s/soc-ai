@@ -1185,6 +1185,8 @@ async def test_host_page_folds_the_mock_answers(settings_kratos):
     assert sum(point.events for point in activity.volume) == 288
     assert activity.conn_datasets == ["zeek.conn"]
     assert activity.alerts_7d == 1
+    # The alert of 2 hours ago is in the 24h window the page asked for.
+    assert activity.alerts == 1
     assert activity.users is not None
     assert [u.name for u in activity.users] == ["svc-backup", "it-admin-07"]
     assert activity.newest_event is not None

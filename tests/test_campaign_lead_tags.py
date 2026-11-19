@@ -416,3 +416,150 @@ async def test_a_hunt_of_a_merged_campaign_moves_to_the_campaign_that_took_it(
     async with maker() as db:
         hunt = await db.get(Hunt, "01HUNTMERGED")
     assert hunt is not None and hunt.campaign_id == campaign_id
+
+
+# ── LH1: the observation of a promoted hunt finding (2026-11-17) ───────────
+
+
+async def add_finding_observation(
+    maker: async_sessionmaker[AsyncSession],
+    lead_id: int,
+    *,
+    hunt_id: str,
+    ordinal: int,
+    entity: str = ACTOR,
+) -> None:
+    """The observation that a promotion of a hunt finding writes, attached to the lead."""
+    from soc_ai.hunting.leads import content_fingerprint
+
+    now = utcnow()
+    async with maker() as db:
+        db.add(
+            EntityObservation(
+                entity_kind="host",
+                entity_key=entity,
+                kind="hunt_finding",
+                spec_id="hunt",
+                fingerprint=content_fingerprint(hunt_id, ordinal),
+                birth_weight=1.0,
+                born_at=now,
+                first_seen_at=now,
+                occurrences=1,
+                source="hunt",
+                summary="A hunt finding.",
+                evidence_json={"hunt_id": hunt_id, "ordinal": ordinal, "citations": []},
+                lead_id=lead_id,
+            )
+        )
+        await db.commit()
+
+
+async def seed_finding_campaign(
+    maker: async_sessionmaker[AsyncSession], *, verdict: str = "true_positive"
+) -> tuple[int, list[int], str]:
+    """The campaign of :func:`seed_campaign`, and one finding investigation on its pair."""
+    _run, campaign_id, leads = await seed_campaign(maker)
+    async with maker() as db:
+        finding_run = await seed_run(
+            db,
+            "alert-finding",
+            src=ACTOR,
+            dst=TARGET,
+            verdict=verdict,
+            finding=("01HUNTFINDING", 0),
+        )
+    async with maker() as db:
+        await campaign_svc.rebuild(db)
+    return campaign_id, leads, finding_run
+
+
+async def test_the_observation_of_a_held_finding_keeps_the_lead_in_its_campaign(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """Prod lead 73: 9 alert observations and 4 finding observations of campaign 2."""
+    campaign_id, leads, finding_run = await seed_finding_campaign(maker)
+    async with maker() as db:
+        member = await db.scalar(
+            select(CampaignMember.campaign_id).where(CampaignMember.run_id == finding_run)
+        )
+    assert member == campaign_id
+    await add_finding_observation(maker, leads[0], hunt_id="01HUNTFINDING", ordinal=0)
+    await step(maker)
+    assert (await tags(maker))[leads[0]] == campaign_id
+    # The SQL of the readers and the step agree.
+    assert await held(maker, leads) == dict.fromkeys(leads, campaign_id)
+
+
+async def test_a_finding_with_no_investigation_keeps_the_lead_out(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The negative control: the finding has no finding investigation."""
+    campaign_id, leads, _finding_run = await seed_finding_campaign(maker)
+    await add_finding_observation(maker, leads[0], hunt_id="01HUNTFINDING", ordinal=3)
+    assert await held(maker, leads) == {leads[1]: campaign_id}
+    await step(maker)
+    assert (await tags(maker))[leads[0]] is None
+
+
+async def test_a_finding_investigation_outside_the_campaign_keeps_the_lead_out(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The negative control: the finding investigation is no true positive member."""
+    campaign_id, leads, finding_run = await seed_finding_campaign(maker, verdict="false_positive")
+    async with maker() as db:
+        member = await db.scalar(
+            select(CampaignMember.id).where(
+                CampaignMember.run_id == finding_run, CampaignMember.verdict_differs.is_(False)
+            )
+        )
+    assert member is None
+    await add_finding_observation(maker, leads[0], hunt_id="01HUNTFINDING", ordinal=0)
+    assert await held(maker, leads) == {leads[1]: campaign_id}
+    await step(maker)
+    assert (await tags(maker))[leads[0]] is None
+
+
+async def test_a_finding_investigation_beyond_an_authorization_keeps_the_lead_out(
+    maker: async_sessionmaker[AsyncSession],
+) -> None:
+    """The negative control: the campaign holds no investigation beyond its authorization."""
+    campaign_id, leads, _finding_run = await seed_finding_campaign(maker)
+    await add_finding_observation(maker, leads[0], hunt_id="01HUNTFINDING", ordinal=0)
+    await step(maker)
+    assert (await tags(maker))[leads[0]] == campaign_id
+    async with maker() as db:
+        row = await db.get(Campaign, campaign_id)
+        assert row is not None
+        row.decision = "authorized"
+        row.authorization_id = 999
+        await db.commit()
+    await step(maker)
+    assert (await tags(maker))[leads[0]] is None
+
+
+async def test_the_promotion_writes_the_evidence_that_the_rule_reads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The key of the rule comes from the evidence that the promotion writes."""
+    from soc_ai.hunting import sources
+
+    captured: dict[str, Any] = {}
+
+    async def fake_record(_db: Any, **kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    async def fake_form(_db: Any, **_kwargs: Any) -> Any:
+        return sources.LeadOutcome()
+
+    monkeypatch.setattr(sources, "record_observation", fake_record)
+    monkeypatch.setattr(sources, "form_leads", fake_form)
+    await sources.observe_hunt_finding(
+        None,  # type: ignore[arg-type]
+        hunt_id="01HUNTX",
+        ordinal=2,
+        finding={"hosts": [ACTOR], "title": "A finding."},
+        now=utcnow(),
+    )
+    assert captured["spec_id"] == leads_store._HUNT_SPEC_ID
+    evidence = captured["evidence"]
+    assert lead_tags.finding_key(evidence["hunt_id"], evidence["ordinal"]) == "01HUNTX#2"

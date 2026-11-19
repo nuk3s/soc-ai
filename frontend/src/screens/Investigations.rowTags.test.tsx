@@ -190,7 +190,7 @@ describe('the campaign tag', () => {
     const chip = await screen.findByTestId('inv-campaign-A');
     expect(chip).toHaveAttribute('href', '/campaigns/7');
     expect(within(screen.getByTestId('inv-tags-A')).getByRole('link')).toBe(chip);
-    expect(chip).toHaveAccessibleName('Campaign: actor-a against web-1. Stage reached: Action on the target, 4 of 5.');
+    expect(chip).toHaveAccessibleName('Campaign 7 · Open: actor-a against web-1. Stage reached: Action on the target, 4 of 5.');
     expect(screen.getByTestId('inv-campaign-B').getAttribute('title')).toContain(
       'Same session as this campaign. The verdict differs.',
     );
@@ -198,5 +198,28 @@ describe('the campaign tag', () => {
     // NEGATIVE CONTROL.
     expect(screen.queryByTestId('inv-campaign-C')).toBeNull();
     expect(screen.queryByTestId('inv-campaign-D')).toBeNull();
+  });
+
+  // Round "decide once" (DC4). A true positive row of a closed campaign read
+  // as open work on every list.
+  it('states the decision of a decided campaign on the row, keeps the verdict and claims no wait', async () => {
+    listInvestigations.mockResolvedValue(
+      list([
+        row({ id: 'A', alertId: 'ev-a', verdict: 'true_positive', campaign: { ...LINK, decision: 'closed', state: 'closed' } }),
+        row({ id: 'B', alertId: 'ev-b', verdict: 'true_positive', campaign: { ...LINK, decision: null, state: 'open' } }),
+      ]),
+    );
+    mount();
+    const chip = await screen.findByTestId('inv-campaign-A');
+    expect(chip.textContent).toBe('Campaign 7 · Closed');
+    // The row of A: the nearest box around the chip that holds the verdict.
+    let decided: HTMLElement = chip;
+    while (decided.parentElement && !decided.textContent?.includes('True positive')) decided = decided.parentElement;
+    expect(decided.textContent).toContain('True positive');
+    expect(decided.textContent).not.toContain('Campaign 7 · Open');
+    expect(decided.textContent).not.toMatch(/\bwaits?\b|Waits on you/);
+    // NEGATIVE CONTROL: a campaign with no decision states Open as work.
+    expect(screen.getByTestId('inv-campaign-B').textContent).toBe('Campaign 7 · Open');
+    expect(screen.getByTestId('inv-campaign-B-state').className).toContain('text-warn');
   });
 });

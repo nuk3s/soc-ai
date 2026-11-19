@@ -45,6 +45,10 @@ _LOOP_LINE = (
     "campaigns: the refresh loop could not rebuild the campaigns. The next request or "
     "the next timer tries again."
 )
+_COUNTS_LINE = (
+    "campaigns: the refresh loop could not read the grid for the alert counts. The pages "
+    "show the stored counts with the time of their read. The next wake tries again."
+)
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,44 @@ def _listen() -> Iterator[asyncio.Event]:
             _LISTENER = None
 
 
+async def _refresh_counts(app: Any, service: Any) -> None:
+    """Read the grid for the campaigns whose stored alert count is behind (SD5).
+
+    A rebuild that adds an investigation changes the pairs of a campaign,
+    and every surface reads the stored count. The demo has no grid, and an
+    app with no grid client or settings reads nothing. The step has a time
+    budget, so a grid that does not answer holds the next rebuild back by at
+    most :data:`soc_ai.campaigns.service.EVENTS_REFRESH_BUDGET_S`.
+
+    The step first opens each closed campaign again whose activity goes on
+    (G4, :func:`soc_ai.campaigns.service.reopen_on_activity`). Its reads and
+    the reads of the counts share the one limit of reads of a wake. The end
+    check of each ended campaign (E2, :func:`soc_ai.campaigns.service.check_end`)
+    comes last, inside the same limit.
+    """
+    state = getattr(app, "state", None)
+    elastic = getattr(state, "elastic", None)
+    settings = getattr(state, "settings", None)
+    if elastic is None or settings is None or getattr(settings, "soc_ai_demo", False):
+        return
+    try:
+        async with asyncio.timeout(service.EVENTS_REFRESH_BUDGET_S):
+            async with app.state.db_sessionmaker() as db:
+                at = _naive_now()
+                asked = await service.reopen_on_activity(db, elastic, settings, now=at)
+                await service.refresh_behind(
+                    db,
+                    elastic,
+                    settings,
+                    now=at,
+                    limit=max(0, service.EVENTS_REFRESH_MAX - asked),
+                )
+    except TimeoutError:
+        _LOGGER.warning(_COUNTS_LINE)
+    except Exception:
+        _LOGGER.warning(_COUNTS_LINE, exc_info=True)
+
+
 async def refresh_loop(app: Any, *, idle_s: float = IDLE_S, join_s: float = JOIN_S) -> None:
     """Rebuild the campaigns after each request, and at least once every ``idle_s``.
 
@@ -126,6 +168,7 @@ async def refresh_loop(app: Any, *, idle_s: float = IDLE_S, join_s: float = JOIN
                     await case_comments.after_rebuild(db, state=app.state)
             except Exception:
                 _LOGGER.warning(_LOOP_LINE, exc_info=True)
+            await _refresh_counts(app, service)
 
 
 __all__ = ["IDLE_S", "JOIN_S", "is_listening", "refresh_loop", "request_refresh"]

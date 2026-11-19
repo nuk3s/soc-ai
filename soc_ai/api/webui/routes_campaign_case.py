@@ -52,6 +52,7 @@ from soc_ai.campaigns import case as campaign_case
 from soc_ai.campaigns import decisions
 from soc_ai.campaigns import service as campaign_svc
 from soc_ai.campaigns.facts import chunked
+from soc_ai.campaigns.ladder import held_by
 from soc_ai.campaigns.types import KIND_ALERT, KIND_FINDING, TRUE_POSITIVE
 from soc_ai.config import Settings
 from soc_ai.so_client.elastic import ElasticClient
@@ -380,11 +381,13 @@ async def _case_text(
         return None
     reached = [step for step in view.ladder if step.reached]
     heads = await _headlines(db, [s.proof_run_id for s in reached if s.proof_run_id])
+    earlier = held_by({step.stage: step.first_at for step in reached})
     stages = [
         campaign_case.StageLine(
             stage=step.stage,
-            at=step.first_at,
+            at=earlier[step.stage].at if step.stage in earlier else step.first_at,
             what=heads.get(step.proof_run_id or "") or step.proof_label,
+            by=step.stage in earlier,
         )
         for step in reached
     ]

@@ -24,7 +24,7 @@ import {
 import { plural } from '../lib/plural';
 import { useDemo } from '../lib/demo';
 import { SEVERITY, tint } from '../lib/tokens';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import type { Severity } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import type { RunState } from '../lib/analyticRuns';
@@ -39,6 +39,7 @@ import { AnalyticDrawer, StatusDot } from './AnalyticDrawer';
 import { StatusTag } from './Badges';
 import { Panel, PanelHeader } from './Panel';
 import { EmptyState, Freshness, LoadingInline, LoadingState, StaleNotice } from './States';
+import { RelTime } from './RelTime';
 
 // ---------------------------------------------------------------------------
 // The analytic catalog — every declarative analytic and what its sweep trail
@@ -284,7 +285,7 @@ function FailedRunMarker({
       title={reason || FAILED_REASON_DEFAULT}
     >
       <AlertTriangle size={9} strokeWidth={2.5} />
-      {label} {ago(at)}
+      {label} <RelTime iso={at} />
     </span>
   );
 }
@@ -406,7 +407,7 @@ function SweepsFacts({ data }: { data: HuntCatalog }) {
           says the command in the hint has never been run, and running it is
           what makes this span move. */}
       {(data.last_sweep_at !== null || !on) && (
-        <span className="text-dim" title={data.last_sweep_at ? absTime(data.last_sweep_at) : undefined}>
+        <span className="text-dim" title={data.last_sweep_at ? timeTitle(data.last_sweep_at) : undefined}>
           · last sweep {ago(data.last_sweep_at)}
         </span>
       )}
@@ -594,7 +595,7 @@ function ProfileSpecRow({
                 the cap, not the estate. */}
             {c.capped && ` · capped at ${c.recent_cap ?? 500}`}
           </span>
-          <span className="flex-none text-[12px] text-dim" title={c.last_run_at ? absTime(c.last_run_at) : undefined}>
+          <span className="flex-none text-[12px] text-dim" title={c.last_run_at ? timeTitle(c.last_run_at) : undefined}>
             last run {ago(c.last_run_at)}
           </span>
           {spec.status === 'shadow' && !heldBySystem(spec) && (
@@ -666,12 +667,12 @@ function SpecRow({
               it reads as a quiet analytic. The failed-run chip says it. */}
           {!spec.last_error && (
             <>
-              <span className="flex-none text-[12px] text-dim" title={absTime(spec.last_swept_at)}>
+              <span className="flex-none text-[12px] text-dim" title={timeTitle(spec.last_swept_at)}>
                 last swept {ago(spec.last_swept_at)}
               </span>
               <span
                 className="flex-none text-[12px] text-dim"
-                title={spec.last_fired_at ? absTime(spec.last_fired_at) : undefined}
+                title={spec.last_fired_at ? timeTitle(spec.last_fired_at) : undefined}
               >
                 last fired {ago(spec.last_fired_at)}
               </span>

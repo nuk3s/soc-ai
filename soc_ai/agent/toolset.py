@@ -57,6 +57,8 @@ from soc_ai.hunting.catalog_tiers import effective_catalog
 from soc_ai.hunting.execute import run_spec
 from soc_ai.oracle.identifiers import effective_internal_identifiers
 from soc_ai.oracle.sanitize import OracleUnknownLabelError
+from soc_ai.so_client import rejected_query
+from soc_ai.so_client.elastic import GridQueryRejectedError
 from soc_ai.store import host_dossier as dossier_store
 from soc_ai.tools.analytics import beacon_profile, dcerpc_histogram, dns_entropy_scan, first_seen
 from soc_ai.tools.crawl_page import crawl_page
@@ -232,6 +234,14 @@ OFF_GRID_TOOLS = frozenset(
 # the product.
 GRID_UNAVAILABLE_REASON = "grid_unavailable"
 
+# The ``reason`` stamped on a tool error when the grid answered and rejected
+# the query (:class:`~soc_ai.so_client.elastic.GridQueryRejectedError`): the
+# query was wrong for the type of a field on the shards that map it. The grid
+# is up, so this is no grid failure, and the hunt runner counts it as a
+# rejection (:func:`soc_ai.api.hunt_runner._grid_tool_outcomes`). The same
+# word as the 400 of the routes that run an analyst's query.
+QUERY_REJECTED_REASON = "query_rejected"
+
 # What the MODEL is told when the grid fails. Deliberately not the exception
 # text: a raw "Connection error caused by ConnectionRefusedError(111)" is a
 # string a weak model paraphrases into "no results", and an all-clear written
@@ -262,7 +272,13 @@ def _is_grid_unavailable(exc: BaseException) -> bool:
     else is the grid. The exceptions to that split are 408 (request timeout)
     and 429 (search queue full / circuit breaker tripped) — 4xx codes that
     describe a struggling grid, not a malformed query.
+
+    ``GridQueryRejectedError`` is a partial read too, but the grid answered and
+    said why: the query is the model's to correct (production 2026-11-19, 19
+    ``grid_unavailable`` results in one hunt on a grid that was up).
     """
+    if isinstance(exc, GridQueryRejectedError):
+        return False
     if isinstance(exc, ApiError):
         status = getattr(getattr(exc, "meta", None), "status", None)
         if status is None:
@@ -414,7 +430,24 @@ def _tool_error(exc: BaseException) -> dict[str, Any]:
     hunt runner counts deterministically — see
     :func:`soc_ai.api.hunt_runner._grid_tool_outcomes` — so a hunt that could
     not read the grid cannot land as a clean sweep whatever the model writes.
+
+    A query the grid REJECTED (:class:`GridQueryRejectedError`) is the third
+    shape. It is stamped ``reason: "query_rejected"`` and keeps the reason
+    text of Elasticsearch, with a hint for each reason the production grid
+    returned: the grid is up, and the model can correct only a query whose
+    error it sees. The message still states that the result is unknown.
     """
+    if isinstance(exc, GridQueryRejectedError):
+        rejected: dict[str, Any] = {
+            "error": True,
+            "type": type(exc).__name__,
+            "reason": QUERY_REJECTED_REASON,
+            "message": rejected_query.model_message(exc),
+        }
+        if hint := rejected_query.rejection_hint(exc.reason):
+            rejected["hint"] = hint
+        # The reason text can name an index: the synth spelling stays out.
+        return strip_synth_markers(rejected)
     if _is_grid_unavailable(exc):
         return {
             "error": True,
@@ -703,7 +736,7 @@ def _host_dossier_payload(entry: ResolvedDossier, *, asked_as: str) -> dict[str,
         return {
             "ip": asked_as,
             "found": False,
-            "reason": "no dossier — the network sweep has no record of this address",
+            "reason": "no dossier. The network sweep has no record of this address.",
             "note": _DOSSIER_ABSENT_NOTE,
         }
     payload: dict[str, Any] = {
@@ -732,7 +765,7 @@ def _host_dossier_payload(entry: ResolvedDossier, *, asked_as: str) -> dict[str,
 _DUPLICATE_HINT = (
     "Same args were already called this investigation. Result hasn't changed; "
     "calling again wastes the budget. Pivot to a different field, time window, "
-    "or tool — or proceed to emitting the transcript."
+    "or tool. You can also go on and emit the transcript."
 )
 
 
@@ -881,7 +914,7 @@ _OQL_ALERT_WINDOW_NOTE = (
     "window width. `window_mode` decides WHICH QUESTION you are asking:\n"
     "- `around` (default): centred, half before the alert and half after "
     "(60 = ±30 min, 1440 = ±12h). Use it for 'what happened around this "
-    "alert' — the setup before it and what followed after.\n"
+    "alert': the setup before it and what followed after.\n"
     "- `before`: the whole width sits BEHIND the alert (1440 = the 24 hours "
     "up to it). Use it for EVERY how-often / how-many / is-this-normal "
     "question. Asking one of those with `around` answers it over half the "
@@ -921,8 +954,8 @@ _OQL_WIDE_WINDOW_NOTE = (
     "`window_mode` changes nothing."
 )
 _ZEEK_WIDE_WINDOW_NOTE = (
-    "The default window is wide ({minutes} minutes), counted back from now — "
-    "there is no alert to center on. `time_range_minutes` is the total width; "
+    "The default window is wide ({minutes} minutes), counted back from now. "
+    "There is no alert to center on. `time_range_minutes` is the total width; "
     "narrow it when you only need the immediate surroundings of one flow."
 )
 
@@ -1563,7 +1596,7 @@ def register_read_tools(  # noqa: PLR0915 - tool registrations are inherently lo
         if maker is None:
             return {
                 "available": False,
-                "reason": "host dossier unavailable — this run has no database",
+                "reason": "The host dossier is not available. This run has no database.",
             }
         try:
             async with maker() as db:

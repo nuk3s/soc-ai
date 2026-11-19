@@ -178,7 +178,7 @@ describe('Investigations list: run class chip', () => {
 describe('SeverityTag', () => {
   it('names whose severity it shows', () => {
     const { rerender } = render(<SeverityTag sev="high" />);
-    expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/^Rule severity: High\./);
+    expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/^Alert severity: High\./);
     rerender(<SeverityTag sev="high" source="finding" />);
     expect(screen.getByTestId('severity-tag').getAttribute('title')).toMatch(/^Finding severity: High\./);
     rerender(<SeverityTag sev="unknown" />);

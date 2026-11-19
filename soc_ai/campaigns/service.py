@@ -13,7 +13,8 @@ The rebuild writes the changes of each campaign (``formed``, ``stage``,
 ``party``), and it opens a decided campaign again when it goes past the
 basis of the decision (:mod:`soc_ai.campaigns.decisions`). It gives the
 engine the investigations that an analyst excluded or included
-(``campaign_run_overrides``). After the commit, each campaign record in
+(``campaign_run_overrides``), and the later alerts that the stored grid read
+of each active campaign holds (:func:`with_activity`). After the commit, each campaign record in
 force marks the inside investigations of its campaign, and an authorized
 campaign gets one ``beyond`` change for each new outside investigation
 (:func:`soc_ai.campaigns.authorization.after_rebuild`).
@@ -51,13 +52,14 @@ from typing import TYPE_CHECKING, Any
 from sqlalchemy import and_, delete, func, not_, or_, select
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from soc_ai.campaigns import authorization, decisions, facts, lead_tags, words
+from soc_ai.campaigns import authorization, decisions, facts, lead_tags, since_decision, words
 from soc_ai.campaigns import case as campaign_case
 from soc_ai.campaigns import events as campaign_events
 from soc_ai.campaigns.engine import build_campaigns
 from soc_ai.campaigns.events import CampaignEvents, PairEvents, RuleEvents
 from soc_ai.campaigns.facts import chunked
 from soc_ai.campaigns.refresh import request_refresh
+from soc_ai.campaigns.since_decision import SinceDecision
 from soc_ai.campaigns.types import (
     LINK_INCLUDED,
     ROLE_ACTOR,
@@ -127,8 +129,17 @@ _EVENTS_LINE = (
     "campaigns: soc-ai could not refresh the events of campaign %s. The page shows the "
     "stored events."
 )
+_END_CHECK_LINE = (
+    "campaigns: soc-ai could not check the end of campaign %s. The campaign keeps its state. "
+    "The next wake tries again."
+)
 # An open campaign reads the grid again when its stored events are older.
 EVENTS_MAX_AGE = timedelta(minutes=15)
+# The most grid reads of one wake of the refresh loop (:func:`refresh_behind`),
+# and the time that the step may take. A grid that does not answer then
+# holds the next rebuild back by at most this time.
+EVENTS_REFRESH_MAX = 5
+EVENTS_REFRESH_BUDGET_S = 60.0
 
 
 # ── Rebuild ────────────────────────────────────────────────────────────────
@@ -511,13 +522,19 @@ def _rows_of(campaign_id: int, draft: CampaignDraft) -> list[CampaignMember | Ca
 
 
 def _earlier(index: int, drafts: Sequence[CampaignDraft], ids: Sequence[int]) -> int | None:
-    """The newest other campaign on a pair of the draft that ended before the draft starts."""
+    """The newest other campaign on a pair of the draft that ended before the draft starts.
+
+    The end of the other campaign is the end of its activity
+    (:attr:`CampaignDraft.active_until`, round 4, E3): its last event, or a
+    later alert of a confirmed rule of one of its investigations. A campaign
+    whose alerts go on past the start of the draft did not end before it.
+    """
     draft = drafts[index]
     best: int | None = None
     for j, other in enumerate(drafts):
-        if j == index or not (other.pairs & draft.pairs) or other.last_event >= draft.first_event:
+        if j == index or not (other.pairs & draft.pairs) or other.active_until >= draft.first_event:
             continue
-        if best is None or (other.last_event, ids[j]) > (drafts[best].last_event, ids[best]):
+        if best is None or (other.active_until, ids[j]) > (drafts[best].active_until, ids[best]):
             best = j
     return ids[best] if best is not None else None
 
@@ -632,7 +649,8 @@ def _changes(
 
     A campaign with a decision opens again when the draft goes past the basis
     of the decision (:func:`decisions.reopen_cause`): the decision is cleared
-    and one ``reopened`` change states the cause. A merged campaign passes no
+    and one ``reopened`` change states the cause and the decision that it
+    ended (:func:`decisions.reopen`). A merged campaign passes no
     decision on: the campaign that takes its members keeps its own.
     """
     out: list[CampaignChange] = []
@@ -670,8 +688,7 @@ def _changes(
             decision=row.decision,
         )
         if cause is not None:
-            decisions.clear_decision(row)
-            out.append(decisions.change(cid, decisions.CHANGE_REOPENED, {"cause": cause}, now))
+            out.append(decisions.reopen(row, cause, now))
     return out
 
 
@@ -720,6 +737,69 @@ def _naive_now(now: datetime | None) -> datetime:
     return naive_utc(now) or utcnow()
 
 
+async def _pair_lasts(db: AsyncSession) -> dict[str, Mapping[frozenset[str], datetime]]:
+    """The last alert event of each pair of the stored grid read of each active campaign.
+
+    Keyed by the run id of each investigation of the campaign whose verdict
+    does not differ (E3). ``PairEvents.last_at`` counts the confirmed rules
+    only, so an alert of a rule that soc-ai did not confirm gives no time.
+    Two reads.
+    """
+    rows = (
+        await db.execute(
+            select(Campaign.id, Campaign.events).where(Campaign.status == STATUS_ACTIVE)
+        )
+    ).all()
+    lasts: dict[int, dict[frozenset[str], datetime]] = {}
+    for cid, value in rows:
+        if not isinstance(value, dict):
+            continue
+        held = CampaignEvents.from_json(value)
+        if held.source != campaign_events.SOURCE_GRID:
+            continue
+        pairs = {
+            frozenset((p.source, p.target)): p.last_at
+            for p in held.pairs
+            if p.alerts and p.last_at is not None and p.source != p.target
+        }
+        if pairs:
+            lasts[int(cid)] = pairs
+    out: dict[str, Mapping[frozenset[str], datetime]] = {}
+    for ids in chunked(sorted(lasts)):
+        members = await db.execute(
+            select(CampaignMember.run_id, CampaignMember.campaign_id).where(
+                CampaignMember.campaign_id.in_(ids), CampaignMember.verdict_differs.is_(False)
+            )
+        )
+        for run_id, cid in members.all():
+            out[str(run_id)] = lasts[int(cid)]
+    return out
+
+
+def with_activity(
+    run: RunFacts, lasts: Mapping[str, Mapping[frozenset[str], datetime]]
+) -> RunFacts:
+    """The facts of a run with the end of its activity, for the engine (E3).
+
+    A true positive investigation of an active campaign ends its activity at
+    the last alert event of a confirmed rule between its two machines that
+    the stored grid read of the campaign holds, when that is later than its
+    event time. Any other run keeps its facts as they are.
+    """
+    if (
+        not run.is_true_positive
+        or run.event_time is None
+        or run.source is None
+        or run.target is None
+        or run.source == run.target
+    ):
+        return run
+    last = lasts.get(run.run_id, {}).get(frozenset((run.source, run.target)))
+    if last is None or last <= run.event_time:
+        return run
+    return dataclasses.replace(run, active_until=last)
+
+
 async def rebuild(
     db: AsyncSession,
     *,
@@ -753,6 +833,9 @@ async def rebuild(
     basis = await _basis(db, session_ids)
     groups = {inv.id: key for inv in (*runs, *others) if (key := _group_key(inv)) is not None}
     scanned = {inv.id for inv in runs} | {inv.id for inv in others}
+    # The later alerts of the investigations of each active campaign (E3).
+    # The engine reads them as facts, and the stored facts do not hold them.
+    lasts = await _pair_lasts(db)
     # End the read snapshot. In WAL mode a read transaction that turns into a
     # write fails when another writer committed in between. The runs leave
     # the session first, so the rollback does not expire what the facts
@@ -761,7 +844,7 @@ async def rebuild(
     await db.rollback()
     drafts = await asyncio.to_thread(
         build_campaigns,
-        [*attack_facts.values(), *other_facts.values()],
+        [with_activity(f, lasts) for f in (*attack_facts.values(), *other_facts.values())],
         excluded=excluded,
         included=included,
     )
@@ -858,6 +941,8 @@ def reset_fresh_cache() -> None:
     _LOCKS.clear()
     _READ_FAILED.clear()
     _EVENT_LOCKS.clear()
+    _ACTIVITY_CHECKED.clear()
+    _NO_END_PAIRS.clear()
 
 
 def _lock() -> asyncio.Lock:
@@ -989,6 +1074,10 @@ class CampaignRow:
     # campaign holds a decision or is not active.
     decision: str | None = None
     waits_since: datetime | None = None
+    # The time of the stored grid read, and True when the content of the
+    # campaign changed after it: the count can be behind (:func:`alerts_behind`).
+    alerts_at: datetime | None = None
+    alerts_behind: bool = False
     # The authorization that the campaign names: its expiry and its state,
     # and the count of the true positive investigations beyond it.
     authorization_expires_at: datetime | None = None
@@ -998,6 +1087,22 @@ class CampaignRow:
     # and the time of the press that opened it. None for any other campaign.
     case_id: str | None = None
     case_opened_at: datetime | None = None
+    # What is new since the decision that a reopen ended, or None
+    # (:mod:`soc_ai.campaigns.since_decision`).
+    since_decision: SinceDecision | None = None
+    # The last alert event of a confirmed rule that a grid read saw, or None
+    # (``Campaign.last_alert_at``). The status reads the same time.
+    last_alert_at: datetime | None = None
+
+    @property
+    def state(self) -> str:
+        """The one state of the campaign (:func:`api_state`)."""
+        return api_state(self.status, self.decision)
+
+    @property
+    def last_activity(self) -> datetime:
+        """The later of the last investigation event and the last alert event."""
+        return last_activity(self.last_event, self.last_alert_at)
 
 
 @dataclass(frozen=True)
@@ -1008,7 +1113,11 @@ class CampaignRef:
 
 @dataclass(frozen=True)
 class AuthorizationView:
-    """An authorization that member runs matched, with the count of those runs."""
+    """An authorization that member runs matched, with the count of those runs.
+
+    ``member_runs`` counts the members whose verdict does not differ: the
+    investigations that the campaign holds.
+    """
 
     id: int
     label: str
@@ -1173,19 +1282,83 @@ class CampaignView:
     authorization: CampaignAuthorizationView | None = None
     beyond: tuple[BeyondView, ...] = ()
     excluded: tuple[ExcludedView, ...] = ()
+    # What is new since the decision that a reopen ended, or None.
+    since_decision: SinceDecision | None = None
+    # The last alert event of a confirmed rule that a grid read saw, or None
+    # (``Campaign.last_alert_at``). The status reads the same time.
+    last_alert_at: datetime | None = None
+
+    @property
+    def last_activity(self) -> datetime:
+        """The later of the last investigation event and the last alert event."""
+        return last_activity(self.last_event, self.last_alert_at)
+
+
+def last_activity(last_event: datetime, last_alert_at: datetime | None) -> datetime:
+    """The last activity of a campaign: the later of its last investigation event and its
+    last alert event.
+
+    A later alert of a confirmed rule between the machines of a campaign takes
+    its verdict from an earlier investigation and gets no investigation of its
+    own (:mod:`soc_ai.campaigns.events`). Each surface that states the span or
+    the last activity of a campaign states this time.
+    """
+    if last_alert_at is None:
+        return last_event
+    return max(last_event, last_alert_at)
 
 
 def api_status(row: Campaign, now: datetime) -> str:
     """``merged`` and ``withdrawn`` from the store. An active campaign is
-    ``ended`` when its last event is more than one horizon old, else ``open``."""
-    return _status_of(row.status, row.last_event, now)
+    ``ended`` when its last activity is more than one horizon old, else ``open``.
+
+    The owner, 2026-11-19: "A later alert of a confirmed rule keeps a campaign
+    open." The last activity is the later of the last investigation event and
+    the last alert event of a confirmed rule that a grid read saw
+    (``Campaign.last_alert_at``, :func:`last_activity`). An acknowledged alert
+    counts. An alert of a rule that soc-ai did not confirm never counts: the
+    grid read counts only the confirmed rules. :func:`open_sql` is the same
+    rule in SQL.
+    """
+    return _status_of(row.status, row.last_event, row.last_alert_at, now)
 
 
-def _status_of(status: str, last_event: datetime, now: datetime) -> str:
+def _horizon() -> timedelta:
+    return timedelta(hours=decay_horizon_hours())
+
+
+def _status_of(
+    status: str, last_event: datetime, last_alert_at: datetime | None, now: datetime
+) -> str:
     if status != STATUS_ACTIVE:
         return status
-    horizon = timedelta(hours=decay_horizon_hours())
-    return STATUS_ENDED if now - last_event > horizon else STATUS_OPEN
+    ended = now - last_activity(last_event, last_alert_at) > _horizon()
+    return STATUS_ENDED if ended else STATUS_OPEN
+
+
+def open_sql(now: datetime) -> Any:
+    """The SQL of a campaign whose last activity is inside one horizon (:func:`api_status`).
+
+    The status of an active campaign is ``open`` exactly when this holds.
+    Two plain comparisons, so SQLite and PostgreSQL read it the same way.
+    """
+    since = now - _horizon()
+    return or_(Campaign.last_event >= since, Campaign.last_alert_at >= since)
+
+
+def api_state(status: str, decision: str | None) -> str:
+    """The one state of a campaign that each page shows.
+
+    ``status`` is the API status (:func:`api_status`). An active campaign
+    (``open`` or ``ended``) with a decision in force
+    (:func:`decisions.in_force`) states the decision: ``closed``,
+    ``authorized`` or ``case``. Else the state is the status. The rule that
+    takes a campaign out of Needs you gives the state, so no page shows
+    "Open" for a campaign that an analyst closed.
+    """
+    if status in (STATUS_OPEN, STATUS_ENDED) and decisions.in_force(decision):
+        return str(decision)
+    return status
 
 
 @dataclass(frozen=True)
@@ -1208,6 +1381,13 @@ class CampaignLink:
     # authorization does not cover: its mark does not hold. The campaign does
     # not hold it, so it keeps normal handling.
     beyond: bool = False
+    # When the analyst made the decision (naive UTC), or None.
+    decided_at: datetime | None = None
+
+    @property
+    def state(self) -> str:
+        """The one state of the campaign (:func:`api_state`)."""
+        return api_state(self.status, self.decision)
 
 
 def _waits(row: Campaign, reopened: Mapping[int, datetime]) -> datetime | None:
@@ -1301,6 +1481,8 @@ async def links_of(
                 Campaign.stage,
                 Campaign.last_event,
                 Campaign.decision,
+                Campaign.decided_at,
+                Campaign.last_alert_at,
             )
             .join(Campaign, Campaign.id == CampaignMember.campaign_id)
             .where(CampaignMember.run_id.in_(ids), Campaign.status == STATUS_ACTIVE)
@@ -1310,15 +1492,27 @@ async def links_of(
         # does not hold.
         decided = [str(r[0]) for r in found if r[7] == decisions.DECISION_AUTHORIZED]
         quiet = await _marked(db, decided)
-        for run_id, differs, cid, title, status, stage, last_event, decision in found:
+        for (
+            run_id,
+            differs,
+            cid,
+            title,
+            status,
+            stage,
+            last_event,
+            decision,
+            decided_at,
+            last_alert_at,
+        ) in found:
             out[str(run_id)] = CampaignLink(
                 id=int(cid),
                 title=str(title),
-                status=_status_of(str(status), last_event, at),
+                status=_status_of(str(status), last_event, last_alert_at, at),
                 stage=stage,
                 differs=bool(differs),
                 decision=decision,
                 beyond=decision == decisions.DECISION_AUTHORIZED and str(run_id) not in quiet,
+                decided_at=decided_at if decisions.in_force(decision) else None,
             )
     return out
 
@@ -1344,7 +1538,7 @@ async def links_by_id(
                 out[wanted] = CampaignLink(
                     id=int(row.id),
                     title=str(row.title),
-                    status=_status_of(str(row.status), row.last_event, at),
+                    status=api_status(row, at),
                     stage=row.stage,
                     differs=False,
                     decision=row.decision,
@@ -1388,6 +1582,22 @@ class HostCampaign:
     last_event: datetime
     alerts: int | None
     decision: str | None = None
+    # The time of the stored grid read, and whether the count can be behind.
+    alerts_at: datetime | None = None
+    alerts_behind: bool = False
+    # The last alert event of a confirmed rule that a grid read saw, or None
+    # (``Campaign.last_alert_at``). The status reads the same time.
+    last_alert_at: datetime | None = None
+
+    @property
+    def state(self) -> str:
+        """The one state of the campaign (:func:`api_state`)."""
+        return api_state(self.status, self.decision)
+
+    @property
+    def last_activity(self) -> datetime:
+        """The later of the last investigation event and the last alert event."""
+        return last_activity(self.last_event, self.last_alert_at)
 
 
 async def campaigns_of_machine(
@@ -1446,16 +1656,31 @@ async def campaigns_of_machine(
                 Campaign.last_event,
                 Campaign.events,
                 Campaign.decision,
+                Campaign.events_at,
+                Campaign.built_at,
+                Campaign.last_alert_at,
             ).where(Campaign.id.in_(ids))
         )
-        for cid, title, status, stage, first, last, events, decision in rows.all():
+        for (
+            cid,
+            title,
+            status,
+            stage,
+            first,
+            last,
+            events,
+            decision,
+            read,
+            built,
+            last_alert,
+        ) in rows.all():
             held_roles = roles[int(cid)]
             flags = named.get(int(cid), [])
             out.append(
                 HostCampaign(
                     id=int(cid),
                     title=str(title),
-                    status=_status_of(str(status), last, at),
+                    status=_status_of(str(status), last, last_alert, at),
                     stage=stage,
                     differs=bool(flags) and all(flags),
                     role=ROLE_BOTH
@@ -1465,6 +1690,9 @@ async def campaigns_of_machine(
                     last_event=last,
                     alerts=_grid_alerts(events),
                     decision=decision,
+                    alerts_at=read if _grid_alerts(events) is not None else None,
+                    alerts_behind=alerts_behind(events, read, built),
+                    last_alert_at=last_alert,
                 )
             )
     out.sort(key=lambda c: (c.last_event, c.id), reverse=True)
@@ -1522,6 +1750,10 @@ async def list_campaigns(
         rows = list((await db.scalars(query)).all())
     parties = await _parties_of(db, [row.id for row in rows])
     reopened = await decisions.last_reopened(db, [row.id for row in rows])
+    # Only a campaign that opened again can state what is new since a decision.
+    since = await since_decision.since_decisions(
+        db, [row for row in rows if row.id in reopened and row.status == STATUS_ACTIVE]
+    )
     records = await _records_of(db, rows, at)
     with_case = [row for row in rows if row.decision == decisions.DECISION_CASE]
     opened = await campaign_case.opened_at(db, with_case)
@@ -1547,11 +1779,15 @@ async def list_campaigns(
                 alerts=_grid_alerts(row.events),
                 decision=row.decision,
                 waits_since=_waits(row, reopened),
+                alerts_at=row.events_at if _grid_alerts(row.events) is not None else None,
+                alerts_behind=alerts_behind(row.events, row.events_at, row.built_at),
                 authorization_expires_at=record[0] if record is not None else None,
                 authorization_state=record[1] if record is not None else None,
                 beyond=record[2] if record is not None else 0,
                 case_id=row.case_id if has_case else None,
                 case_opened_at=(opened.get(row.id) or row.decided_at) if has_case else None,
+                since_decision=since.get(row.id),
+                last_alert_at=row.last_alert_at,
             )
         )
     return out
@@ -1593,6 +1829,19 @@ def _grid_alerts(value: Any) -> int | None:
     if not isinstance(value, Mapping) or value.get("source") != campaign_events.SOURCE_GRID:
         return None
     return _int(value.get("alerts"))
+
+
+def alerts_behind(events: Any, read_at: datetime | None, built_at: datetime | None) -> bool:
+    """True when a stored grid count is older than the content of its campaign (SD5).
+
+    A rebuild that changed the campaign, for example with a new
+    investigation, sets ``built_at``. The refresh loop then reads the grid
+    (:func:`refresh_behind`). Until the grid answers, the stored count stays,
+    and each surface that shows it states the time of the read.
+    """
+    if _grid_alerts(events) is None or read_at is None or built_at is None:
+        return False
+    return read_at < built_at
 
 
 def _text(value: Any) -> str | None:
@@ -1988,6 +2237,7 @@ async def get_campaign(
         first_event=row.first_event,
         last_event=row.last_event,
         built_at=row.built_at,
+        last_alert_at=row.last_alert_at if row.status == STATUS_ACTIVE else None,
         decision=decisions.decision_of(row),
         waits_since=_waits(row, await decisions.last_reopened(db, [row.id])),
         changes=tuple(await decisions.changes_of(db, row.id)),
@@ -2036,9 +2286,23 @@ async def get_campaign(
         }
     )
     detail = row.detail if isinstance(row.detail, dict) else {}
+    events = await _view_events(db, row, held, view.status, at)
+    # The later alert events of the stored read stand when the read counted
+    # after the time that the campaign has now (G6). The page states them
+    # beside the answer of a hunt, with no new grid read.
+    if events.later is not None and events.later.after != await _later_after(db, row):
+        events = dataclasses.replace(events, later=None)
     return dataclasses.replace(
         view,
-        authorizations=await _authorizations(db, invs.values(), at),
+        # The bottom line states the period to the last activity.
+        bottom_line=words.with_last_activity(
+            row.bottom_line, row.first_event, row.last_event, row.last_alert_at
+        ),
+        # The line "covers N of the M investigations" counts the investigations
+        # that the campaign holds, as the fold "Investigations" does (G5).
+        authorizations=await _authorizations(
+            db, [invs[m.run_id] for m in members if not m.verdict_differs and m.run_id in invs], at
+        ),
         ladder=_ladder(detail),
         parties=tuple(
             PartyView(
@@ -2063,10 +2327,11 @@ async def get_campaign(
         false_positive_from_targets=await _false_positives_from(db, targets, addresses),
         detection=_detection(detail),
         edges=_edges(detail),
-        events=await _view_events(db, row, held, view.status),
+        events=events,
         authorization=held_authorization,
         beyond=beyond,
         excluded=await _excluded_of(db, row.id),
+        since_decision=await since_decision.since_decision(db, row),
     )
 
 
@@ -2104,7 +2369,14 @@ async def _held(db: AsyncSession, campaign_id: int) -> _Held:
 
 @dataclass(frozen=True)
 class _EventsPlan:
-    """The pairs of a campaign, the basis of a grid read of them, and the window."""
+    """The pairs of a campaign, the basis of a grid read of them, and the window.
+
+    ``until`` is the end of the read of a campaign that is not ended: the
+    read goes to now (:func:`campaign_events.read_window`). None for a
+    campaign that ended: its read ends after its last event. ``after`` is
+    the time after which the read counts the later alert events
+    (:func:`_later_after`), or None for a read that does not count them.
+    """
 
     members: tuple[Member, ...]
     addresses: Mapping[str, tuple[str, ...]]
@@ -2112,9 +2384,11 @@ class _EventsPlan:
     basis: str
     start: datetime
     end: datetime
+    until: datetime | None = None
+    after: datetime | None = None
 
 
-def _plan_of(row: Campaign, held: _Held) -> _EventsPlan:
+def _plan_of(row: Campaign, held: _Held, now: datetime) -> _EventsPlan:
     members = tuple(
         Member(
             run=held.runs[m.run_id],
@@ -2133,8 +2407,11 @@ def _plan_of(row: Campaign, held: _Held) -> _EventsPlan:
         for p in held.parties
     }
     pairs = campaign_events.campaign_pairs(members, addresses)
-    basis = campaign_events.events_basis(pairs, row.first_event, row.last_event)
-    return _EventsPlan(members, addresses, pairs, basis, row.first_event, row.last_event)
+    until = now if api_status(row, now) == STATUS_OPEN else None
+    basis = campaign_events.events_basis(
+        pairs, row.first_event, row.last_event, to_now=until is not None
+    )
+    return _EventsPlan(members, addresses, pairs, basis, row.first_event, row.last_event, until)
 
 
 def _grid_events(row: Campaign) -> CampaignEvents | None:
@@ -2145,23 +2422,47 @@ def _grid_events(row: Campaign) -> CampaignEvents | None:
     return held if held.source == campaign_events.SOURCE_GRID else None
 
 
-def _wants_read(row: Campaign, basis: str, now: datetime) -> bool:
+def _wants_read(row: Campaign, basis: str, now: datetime, after: datetime | None = None) -> bool:
     """True when a grid read of the campaign is due.
 
     A row with no stored grid events reads. An ended campaign with stored
-    grid events never reads again: the grid forgets old records. Else a new
-    basis reads, and the stored events of an open campaign read again after
-    :data:`EVENTS_MAX_AGE`.
+    grid events never reads its events again: the grid forgets old records.
+    Its end check reads the horizon after its last activity once more
+    (:func:`check_end`). Else a new basis reads, and the stored events of an
+    open campaign read again after :data:`EVENTS_MAX_AGE`. A stored count of
+    the later alert events after another time than ``after`` reads again
+    too: a decision or a reopen moved the time.
     """
     if row.status != STATUS_ACTIVE:
         return False
-    if _grid_events(row) is None or row.events_at is None:
+    held = _grid_events(row)
+    if held is None or row.events_at is None:
         return True
     if api_status(row, now) == STATUS_ENDED:
         return False
     if row.events_basis != basis:
         return True
+    if after is not None and (held.later is None or held.later.after != after):
+        return True
     return now - row.events_at > EVENTS_MAX_AGE
+
+
+async def _later_after(db: AsyncSession, row: Campaign) -> datetime:
+    """After what time an alert event of the campaign is later (G2).
+
+    The newest investigation event of the campaign, or the boundary of a
+    decision when that is later: the last event of the basis of a decision
+    in force, else the boundary of the decision that a reopen ended
+    (:func:`since_decision.boundaries`). An alert that a decision covered is
+    no later alert.
+    """
+    boundary: datetime | None = None
+    if decisions.in_force(row.decision):
+        basis = row.decision_basis
+        boundary = naive_utc(basis.get("last_event")) if isinstance(basis, Mapping) else None
+    else:
+        boundary = (await since_decision.boundaries(db, [row])).get(row.id)
+    return since_decision.later_after(row.last_event, boundary)
 
 
 # The basis of the last failed grid read of each campaign, keyed by the store
@@ -2189,8 +2490,11 @@ async def _due(db: AsyncSession, campaign_id: int, now: datetime) -> _EventsPlan
     row = await db.get(Campaign, campaign_id, populate_existing=True)
     if row is None or row.status != STATUS_ACTIVE:
         return None
-    plan = _plan_of(row, await _held(db, campaign_id))
-    if not plan.pairs or not _wants_read(row, plan.basis, now):
+    plan = _plan_of(row, await _held(db, campaign_id), now)
+    if not plan.pairs:
+        return None
+    plan = dataclasses.replace(plan, after=await _later_after(db, row))
+    if not _wants_read(row, plan.basis, now, plan.after):
         return None
     return plan
 
@@ -2208,8 +2512,9 @@ async def refresh_events(
     :func:`_wants_read` decides. One lock for each campaign id holds a second
     request back, and that request then finds the read done. The grid read
     holds no transaction of the store. A success writes the three event
-    columns in one short transaction. A failure leaves the stored events as
-    they are. The call never raises.
+    columns and the two columns of the end rule (``last_alert_at``,
+    ``events_to``) in one short transaction. A failure leaves the stored
+    events as they are. The call never raises.
     """
     at = _naive_now(now)
     key = (_store_key(db), campaign_id)
@@ -2227,7 +2532,13 @@ async def refresh_events(
             # the write below starts a fresh transaction.
             await db.rollback()
             got = await campaign_events.read_events(
-                elastic, settings, pairs=plan.pairs, start=plan.start, end=plan.end
+                elastic,
+                settings,
+                pairs=plan.pairs,
+                start=plan.start,
+                end=plan.end,
+                until=plan.until,
+                after=plan.after,
             )
             if got is None:
                 _READ_FAILED[key] = plan.basis
@@ -2239,6 +2550,9 @@ async def refresh_events(
             row.events = jsonable(dataclasses.replace(got, read_at=at))
             row.events_at = at
             row.events_basis = plan.basis
+            # The two facts of the end rule (:func:`api_status`).
+            row.last_alert_at = got.last_alert_at
+            row.events_to = got.read_to
             await db.commit()
             _READ_FAILED.pop(key, None)
     except Exception:
@@ -2247,27 +2561,500 @@ async def refresh_events(
             await db.rollback()
 
 
+async def refresh_behind(
+    db: AsyncSession,
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+    limit: int = EVENTS_REFRESH_MAX,
+) -> int:
+    """Read the grid for each active campaign whose stored events are behind its content.
+
+    Production, 2026-11-18: a rebuild added six investigations to campaign 2.
+    Only a GET of the campaign page read the grid, so the Dashboard row and
+    the Needs you row read the older count (1,104) and the page read the new
+    one (1,118). The refresh loop calls this step after each rebuild. A
+    campaign with no grid read, or with a read older than its content, is a
+    candidate. :func:`refresh_events` decides each read and never raises. At
+    most ``limit`` reads, the newest content first. A failed read keeps the
+    stored count, and the next wake tries again. Returns the reads it asked for.
+
+    A campaign that is not ended reads the grid to now, and later alerts of
+    its rules can come with no new investigation. Each such campaign with a
+    read older than :data:`EVENTS_MAX_AGE` is a candidate too, after the
+    campaigns that are behind, the oldest read first. The same ``limit``
+    holds for both.
+
+    Last come the end checks (E2, :func:`check_end`): each ended campaign
+    whose grid reads did not cover the horizon after its last activity, the
+    oldest end first. A campaign that ended by the rule of an earlier
+    release is such a campaign, so no one-time step exists. The same
+    ``limit`` holds.
+    """
+    at = _naive_now(now)
+    behind = (
+        await db.scalars(
+            select(Campaign.id)
+            .where(
+                Campaign.status == STATUS_ACTIVE,
+                or_(Campaign.events_at.is_(None), Campaign.events_at < Campaign.built_at),
+            )
+            .order_by(Campaign.built_at.desc(), Campaign.id.desc())
+        )
+    ).all()
+    stale = (
+        await db.scalars(
+            select(Campaign.id)
+            .where(
+                Campaign.status == STATUS_ACTIVE,
+                open_sql(at),
+                Campaign.events_at.is_not(None),
+                Campaign.events_at < at - EVENTS_MAX_AGE,
+            )
+            .order_by(Campaign.events_at, Campaign.id)
+        )
+    ).all()
+    ids = list(dict.fromkeys([*behind, *stale]))
+    asked = 0
+    for campaign_id in ids:
+        if asked >= limit:
+            break
+        if await _due(db, int(campaign_id), at) is None:
+            continue
+        await db.rollback()
+        await refresh_events(db, int(campaign_id), elastic, settings, now=at)
+        asked += 1
+    # The end check of each ended campaign, the oldest end first (E2).
+    for campaign_id in await _ending(db, at):
+        if asked >= limit:
+            break
+        if await _end_due(db, campaign_id, at) is None:
+            continue
+        await db.rollback()
+        await check_end(db, campaign_id, elastic, settings, now=at)
+        asked += 1
+    return asked
+
+
+# ── The end check (E2) ─────────────────────────────────────────────────────
+
+# The built time of each ended campaign with no pair of a confirmed rule to
+# read, keyed by the store URL and the campaign id. A rebuild that changes the
+# campaign gives a new check. The end check then reads no row of it again.
+_NO_END_PAIRS: dict[tuple[str, int], datetime] = {}
+
+
+def ended_sql(now: datetime) -> Any:
+    """The SQL of a campaign whose last activity is more than one horizon old.
+
+    The negation of :func:`open_sql`, with the NULL of a campaign that no grid
+    read gave an alert time: ``NOT`` of a comparison with NULL selects nothing.
+    """
+    since = now - _horizon()
+    return and_(
+        Campaign.last_event < since,
+        or_(Campaign.last_alert_at.is_(None), Campaign.last_alert_at < since),
+    )
+
+
+@dataclass(frozen=True)
+class _EndCheck:
+    """The end check of one ended campaign: the pairs of its confirmed rules and the window.
+
+    ``after`` is the last activity of the campaign, and ``until`` is
+    ``min(now, after + horizon)``.
+    """
+
+    campaign_id: int
+    pairs: tuple[campaign_events.PairSpec, ...]
+    after: datetime
+    until: datetime
+
+
+def _end_window(
+    status: str,
+    last_event: datetime,
+    last_alert_at: datetime | None,
+    events_to: datetime | None,
+    read: bool,
+    now: datetime,
+) -> tuple[datetime, datetime] | None:
+    """The window of the end check of a campaign, or None when no check is due.
+
+    A check is due for an active campaign that ended by :func:`api_status`,
+    that holds a grid read, and whose grid reads end before
+    ``min(now, last activity + horizon)``. A campaign with no grid read waits
+    for its first read (:func:`refresh_behind`). A read of an earlier release
+    states no end of its window, so its check is due.
+    """
+    if status != STATUS_ACTIVE or not read:
+        return None
+    if _status_of(status, last_event, last_alert_at, now) != STATUS_ENDED:
+        return None
+    after = last_activity(last_event, last_alert_at)
+    until = min(now, after + _horizon())
+    if events_to is not None and events_to >= until:
+        return None
+    return after, until
+
+
+async def _ending(db: AsyncSession, now: datetime) -> list[int]:
+    """The ended campaigns whose end check is due, the oldest end first. One read."""
+    rows = (
+        await db.execute(
+            select(
+                Campaign.id,
+                Campaign.status,
+                Campaign.last_event,
+                Campaign.last_alert_at,
+                Campaign.events_to,
+            ).where(
+                Campaign.status == STATUS_ACTIVE,
+                ended_sql(now),
+                Campaign.events_at.is_not(None),
+            )
+        )
+    ).all()
+    due: list[tuple[datetime, int]] = []
+    for cid, status, last_event, last_alert, events_to in rows:
+        window = _end_window(str(status), last_event, last_alert, events_to, True, now)
+        if window is not None:
+            due.append((window[0], int(cid)))
+    return [cid for _after, cid in sorted(due)]
+
+
+async def _end_due(db: AsyncSession, campaign_id: int, now: datetime) -> _EndCheck | None:
+    """The end check of one campaign when it is due, or None.
+
+    Reads the row as the store holds it now.
+    """
+    row = await db.get(Campaign, campaign_id, populate_existing=True)
+    if row is None:
+        return None
+    window = _end_window(
+        row.status,
+        row.last_event,
+        row.last_alert_at,
+        row.events_to,
+        row.events_at is not None and _grid_events(row) is not None,
+        now,
+    )
+    if window is None:
+        return None
+    key = (_store_key(db), campaign_id)
+    if _NO_END_PAIRS.get(key) == row.built_at:
+        return None
+    pairs = tuple(
+        p
+        for p in _plan_of(row, await _held(db, campaign_id), now).pairs
+        if p.confirmed and p.source_addresses and p.target_addresses
+    )
+    if not pairs:
+        _NO_END_PAIRS[key] = row.built_at
+        return None
+    return _EndCheck(campaign_id, pairs, *window)
+
+
+async def check_end(
+    db: AsyncSession,
+    campaign_id: int,
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+) -> None:
+    """Read the horizon after the last activity of an ended campaign once more (E2).
+
+    A campaign must not end on a grid read that did not cover the horizon
+    after its last activity. A read of an open campaign each
+    :data:`EVENTS_MAX_AGE` can end before that horizon, and a read of an
+    earlier release ended 30 minutes after the last investigation event. One
+    grid read (:func:`campaign_events.read_end`) reads the alert events of the
+    confirmed rules after the last activity, until ``min(now, last activity +
+    horizon)``. A found alert moves ``last_alert_at``, and :func:`api_status`
+    decides again: the campaign is open when the new last activity is inside
+    one horizon of now, else the next wake checks the next horizon. With no
+    alert the read covers the horizon, ``events_to`` moves to its end, and no
+    later wake reads the campaign again.
+
+    The check writes only ``last_alert_at`` and ``events_to``, in one short
+    transaction. A grid that does not answer changes nothing, and the next
+    wake tries again. One lock for each campaign id holds a grid read of the
+    same campaign back. The call never raises.
+    """
+    at = _naive_now(now)
+    try:
+        if await _end_due(db, campaign_id, at) is None:
+            return
+        await db.rollback()
+        async with _events_lock(campaign_id):
+            check = await _end_due(db, campaign_id, at)
+            if check is None:
+                return
+            # The grid read holds no read snapshot of the store.
+            await db.rollback()
+            found = await campaign_events.read_end(
+                elastic, settings, pairs=check.pairs, after=check.after, until=check.until
+            )
+            if found is None:
+                return
+            row = await db.get(Campaign, campaign_id, populate_existing=True)
+            if (
+                row is None
+                or row.status != STATUS_ACTIVE
+                or last_activity(row.last_event, row.last_alert_at) != check.after
+            ):
+                # The campaign changed during the read. The next wake checks again.
+                await db.rollback()
+                return
+            if found.last_at is not None and found.last_at > check.after:
+                row.last_alert_at = found.last_at
+            row.events_to = check.until
+            await db.commit()
+    except Exception:
+        _LOGGER.warning(_END_CHECK_LINE, campaign_id, exc_info=True)
+        with contextlib.suppress(Exception):
+            await db.rollback()
+
+
+# The stored grid read of each closed campaign that the last activity check
+# read after, keyed by the store URL and the campaign id (G4). A new grid
+# read of the campaign gives a new check.
+_ACTIVITY_CHECKED: dict[tuple[str, int], datetime] = {}
+
+
+@dataclass(frozen=True)
+class _Check:
+    """What the activity check of one closed campaign needs, read before the grid read."""
+
+    campaign_id: int
+    events_at: datetime
+    basis: dict[str, Any]
+    covered: datetime
+    pairs: tuple[campaign_events.PairSpec, ...]
+
+
+def _covered_later(row: Campaign) -> tuple[datetime, frozenset[str]] | None:
+    """The time that the close covers and the machines of its basis, when the stored grid
+    read holds a later alert of the campaign. Else None.
+
+    The stored read counts the alert events of the confirmed rules after
+    the time that the close covers (:func:`_later_after`). With none, no
+    grid read is due. A read that counted after another time is older than
+    the decision, and the next read gives the count.
+    """
+    stored = _grid_events(row)
+    basis = row.decision_basis
+    if stored is None or row.events_at is None or not isinstance(basis, Mapping):
+        return None
+    covered = naive_utc(basis.get("last_event"))
+    parties = basis.get("parties")
+    if covered is None or not isinstance(parties, list):
+        return None
+    later = stored.later
+    if later is None or not later.known or later.alerts <= 0:
+        return None
+    if later.after != since_decision.later_after(row.last_event, covered):
+        return None
+    return covered, frozenset(str(key) for key in parties)
+
+
+async def _reopen_for_activity(
+    db: AsyncSession,
+    check: _Check,
+    found: campaign_events.Activity,
+    now: datetime,
+) -> bool:
+    """Open a closed campaign again with the cause ``activity``. One short transaction.
+
+    The rebuild lock holds a rebuild back, and the row is read as the store
+    holds it now. A campaign that is no longer closed, or whose close
+    changed, keeps its state.
+    """
+    async with _lock():
+        row = await db.get(Campaign, check.campaign_id, populate_existing=True)
+        if (
+            row is None
+            or row.status != STATUS_ACTIVE
+            or row.decision != decisions.DECISION_CLOSED
+            or row.decision_basis != check.basis
+        ):
+            await db.rollback()
+            return False
+        db.add(
+            decisions.reopen(
+                row,
+                decisions.CAUSE_ACTIVITY,
+                now,
+                alerts=found.alerts,
+                rules=found.rules,
+                firstAlertAt=found.first_at.isoformat() if found.first_at else None,
+                lastAlertAt=found.last_at.isoformat() if found.last_at else None,
+            )
+        )
+        await db.commit()
+    return True
+
+
+async def reopen_on_activity(
+    db: AsyncSession,
+    elastic: ElasticClient,
+    settings: Settings,
+    *,
+    now: datetime | None = None,
+    limit: int = EVENTS_REFRESH_MAX,
+) -> int:
+    """Open each closed campaign again whose activity goes on with no new investigation (G4).
+
+    A later alert of a confirmed rule between the machines of a campaign
+    takes its verdict from an earlier investigation, so no rebuild sees it.
+    The refresh loop calls this step. A closed campaign that is not ended is
+    a candidate when its stored grid read holds alert events of its
+    confirmed rules after the time that the close covers. One grid read
+    (:func:`campaign_events.read_activity`) then reads the alert events of
+    those rules after that time, between the machines of the basis, that
+    Security Onion has not acknowledged. With one or more, the campaign
+    opens again with the cause ``activity``, as a rebuild does.
+
+    An authorized decision and a case decision never open again here. A
+    grid that does not answer opens nothing, and the next grid read of the
+    campaign gives a new check. At most ``limit`` reads. Returns the reads
+    it asked for.
+    """
+    at = _naive_now(now)
+    rows = (
+        await db.scalars(
+            select(Campaign)
+            .where(
+                Campaign.status == STATUS_ACTIVE,
+                Campaign.decision == decisions.DECISION_CLOSED,
+                open_sql(at),
+                Campaign.events_at.is_not(None),
+            )
+            .order_by(Campaign.events_at.desc(), Campaign.id)
+        )
+    ).all()
+    store = _store_key(db)
+    checks: list[_Check] = []
+    for row in rows:
+        if row.events_at is None or _ACTIVITY_CHECKED.get((store, row.id)) == row.events_at:
+            continue
+        held = _covered_later(row)
+        if held is None:
+            continue
+        covered, machines = held
+        # The pairs whose two machines the basis holds.
+        pairs = tuple(
+            p
+            for p in _plan_of(row, await _held(db, row.id), at).pairs
+            if p.source in machines and p.target in machines
+        )
+        basis = dict(row.decision_basis) if isinstance(row.decision_basis, Mapping) else {}
+        checks.append(_Check(row.id, row.events_at, basis, covered, pairs))
+    # The grid reads hold no transaction of the store.
+    await db.rollback()
+    asked = 0
+    for check in checks:
+        if asked >= limit:
+            break
+        if check.pairs:
+            asked += 1
+        found = await campaign_events.read_activity(
+            elastic, settings, pairs=check.pairs, after=check.covered, until=at
+        )
+        # A failed read waits for the next grid read of the campaign.
+        _ACTIVITY_CHECKED[(store, check.campaign_id)] = check.events_at
+        if found is not None and found.alerts > 0:
+            await _reopen_for_activity(db, check, found, at)
+    return asked
+
+
+def _page_read_to(
+    row: Campaign, plan: _EventsPlan, key: tuple[str, int], now: datetime
+) -> datetime | None:
+    """The end of the grid read that the page of an open campaign states, or None.
+
+    None for a campaign that ended, and for a page that states the events
+    that the investigations hold or a read of an earlier release: the close
+    then keeps the rule of today, the last event plus the pad.
+    """
+    status = api_status(row, now)
+    if status != STATUS_OPEN:
+        return None
+    current = _current_events(row, plan, key, status)
+    if current.source != campaign_events.SOURCE_GRID or current.read_to is None:
+        return None
+    return current.read_to if current.read_to > row.last_event else None
+
+
+def _covered_to(row: Campaign) -> datetime | None:
+    """The time that the close of a campaign covers, when it is after the last event.
+
+    A close of an open campaign records the end of the grid read that the
+    page stated as the last event of its basis (:func:`close_basis`). A close
+    of an earlier release, or of a campaign that ended, recorded the last
+    event: None, the rule of today.
+    """
+    if row.decision != decisions.DECISION_CLOSED or not isinstance(row.decision_basis, Mapping):
+        return None
+    covered = naive_utc(row.decision_basis.get("last_event"))
+    return covered if covered is not None and covered > row.last_event else None
+
+
+async def close_basis(
+    db: AsyncSession, row: Campaign, *, now: datetime | None = None
+) -> dict[str, Any]:
+    """The basis of a close of a campaign: what the page states (G3).
+
+    The last event of the basis is the end of the grid read that the page
+    states, when that is after the last investigation event: the close
+    covers the later alert events that the page shows. Else it is the last
+    investigation event, as before.
+    """
+    at = _naive_now(now)
+    basis = await decisions.basis_for(db, row)
+    plan = _plan_of(row, await _held(db, row.id), at)
+    until = _page_read_to(row, plan, (_store_key(db), row.id), at)
+    if until is not None:
+        basis["last_event"] = until.isoformat()
+    return basis
+
+
 async def close_scope(
     db: AsyncSession,
     campaign_id: int,
     elastic: ElasticClient,
     settings: Settings,
+    *,
+    now: datetime | None = None,
 ) -> campaign_events.CloseScope | None:
     """The alert events that a close of one campaign acknowledges, or None for an unknown id.
 
     The pairs and the confirmed rules of the campaign, in its period
     (:func:`campaign_events.read_close_scope`). A campaign that is not active
     acknowledges nothing. The grid read holds no transaction of the store.
+
+    The scope ends where the page ends (G3). For a closed campaign that is
+    the time of its basis (:func:`close_basis`), so the acknowledge after the
+    close and the route "Acknowledge" take no alert after the decision. For
+    a campaign with no decision it is the end of the grid read that the page
+    states. A campaign that ended keeps the rule of today.
     """
+    at = _naive_now(now)
     row = await db.get(Campaign, campaign_id, populate_existing=True)
     if row is None:
         return None
     if row.status != STATUS_ACTIVE:
         return campaign_events.CloseScope(alerts=0, rules=0)
-    plan = _plan_of(row, await _held(db, campaign_id))
+    plan = _plan_of(row, await _held(db, campaign_id), at)
+    if row.decision == decisions.DECISION_CLOSED:
+        until = _covered_to(row)
+    else:
+        until = _page_read_to(row, plan, (_store_key(db), row.id), at)
     await db.rollback()
     return await campaign_events.read_close_scope(
-        elastic, settings, pairs=plan.pairs, start=plan.start, end=plan.end
+        elastic, settings, pairs=plan.pairs, start=plan.start, end=plan.end, until=until
     )
 
 
@@ -2359,8 +3146,10 @@ async def _judge(
     return dataclasses.replace(events, pairs=tuple(pairs))
 
 
-async def _view_events(db: AsyncSession, row: Campaign, held: _Held, status: str) -> CampaignEvents:
-    plan = _plan_of(row, held)
+async def _view_events(
+    db: AsyncSession, row: Campaign, held: _Held, status: str, now: datetime
+) -> CampaignEvents:
+    plan = _plan_of(row, held, now)
     current = _current_events(row, plan, (_store_key(db), row.id), status)
     return await _judge(db, current, plan.addresses)
 
@@ -2382,21 +3171,31 @@ __all__ = [
     "RebuildResult",
     "RelatedRun",
     "SessionView",
+    "alerts_behind",
+    "api_state",
     "api_status",
     "campaigns_of_machine",
+    "check_end",
+    "close_basis",
     "close_scope",
+    "ended_sql",
     "ensure_fresh",
     "get_campaign",
     "held",
     "held_sql",
+    "last_activity",
     "links_by_id",
     "links_of",
     "list_campaigns",
+    "open_sql",
     "plan_ids",
     "rebuild",
+    "refresh_behind",
     "refresh_events",
+    "reopen_on_activity",
     "request_refresh",
     "reset_fresh_cache",
     "waiting_campaigns",
     "waiting_count",
+    "with_activity",
 ]

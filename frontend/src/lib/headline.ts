@@ -1,3 +1,4 @@
+import { isKnownTool, toolNoun } from './toolLabels';
 // ---------------------------------------------------------------------------
 // The verdict headline in plain words.
 //
@@ -43,21 +44,44 @@ export function isFieldPath(token: string): boolean {
   return t.includes('_') || /\.\d+(\.|$)/.test(t) || FIELD_ROOTS.has(root);
 }
 
-/** The words for the tools a headline names. */
-const TOOL_WORDS: Record<string, string> = {
-  t_rule_prevalence: 'the rule history',
-  t_host_dossier: 'the host record',
-  t_prevalence: 'the prevalence check',
-  t_enrich_ip: 'the address look-up',
-  t_search_events: 'the event search',
-  t_origin_chain: 'the origin chain',
-  t_suggest_rule_tuning: 'the rule tuning check',
-  t_query_zeek_logs: 'the Zeek logs',
-  t_query_events_oql: 'the event search',
-};
-
+/** The words for a tool a headline names: "the event search". They come from
+ *  the one label map of the tools (lib/toolLabels, AB5). A tool the map does
+ *  not hold reads as "the <name> check". */
 export function toolWords(id: string): string {
-  return TOOL_WORDS[id] ?? `the ${id.replace(/^t_/, '').replace(/_/g, ' ')} check`;
+  return isKnownTool(id) ? `the ${toolNoun(id)}` : `the ${id.replace(/^t_/, '').replace(/_/g, ' ')} check`;
+}
+
+// A tool id in prose, with the citation form around it: "t_beacon_profile",
+// "tool t_web_search:result.results" or "t_prevalence:result.is_novel". The
+// word "tool" and the result path are mechanics, and the words of the tool
+// replace all of it (dogfood 2026-11-17, F20 and N9).
+const TOOL_REF = /(?:\btool\s+)?\b(t_[a-z][a-z0-9_]*)(?::[A-Za-z0-9_.=\[\]]+)?/g;
+
+/** One part of a text: plain text, or the words of a tool with the text that
+ *  the model wrote for it. */
+export interface ToolSegment {
+  text: string;
+  /** The text that the model wrote, for the tooltip. Absent on plain text. */
+  tool?: string;
+}
+
+/** A text split at each tool id it names. The console renders the words of
+ *  the tool, and the tooltip keeps what the model wrote. A tool id at the
+ *  start of a sentence reads with a capital: "The beacon profile flagged". */
+export function toolSegments(text: string): ToolSegment[] {
+  const out: ToolSegment[] = [];
+  let last = 0;
+  for (const m of text.matchAll(TOOL_REF)) {
+    const at = m.index ?? 0;
+    if (at > last) out.push({ text: text.slice(last, at) });
+    const before = text.slice(0, at);
+    const words = toolWords(m[1]);
+    const start = /(^|[.!?]\s+)$/.test(before);
+    out.push({ text: start ? words.charAt(0).toUpperCase() + words.slice(1) : words, tool: m[0] });
+    last = at + m[0].length;
+  }
+  if (last < text.length) out.push({ text: text.slice(last) });
+  return out;
 }
 
 /** The stored verdict keys, as the console words them. */
@@ -71,10 +95,19 @@ const VERDICT_WORDS: Record<string, string> = {
  *  read "a prior true_positive stands on this same session", and a finding
  *  read "Evidence: t_rule_prevalence ..." (review 2026-11-12, console
  *  finding 15). */
-export function plainText(text: string): string {
-  return text
-    .replace(/\bt_[a-z][a-z0-9_]*\b/g, (id) => toolWords(id))
-    .replace(/\b(true_positive|false_positive|needs_more_info)\b/g, (key) => VERDICT_WORDS[key]);
+export function plainText(text: string, opts: { tools?: boolean } = {}): string {
+  const tools = opts.tools ?? true;
+  const worded = tools ? toolSegments(text).map((seg) => seg.text).join('') : text;
+  return (
+    worded
+      .replace(/\b(true_positive|false_positive|needs_more_info)\b/g, (key) => VERDICT_WORDS[key])
+      // The machine words of a run that the model copied into its text: the
+      // tag of an older Oracle answer, "the local <verdict> verdict" and the
+      // status code of the host-name check (dogfood 2026-11-17, N9).
+      .replace(/^\s*\[oracle adjudicated\]\s*/i, '')
+      .replace(/\blocal (true positive|false positive|needs more info) verdict\b/gi, 'soc-ai $1 verdict')
+      .replace(/\bskipped_field_absent\b/g, 'no host name on the alert')
+  );
 }
 
 // The first sentence of a text: up to the first full stop, question mark or
@@ -126,8 +159,23 @@ export function splitHeadline(
   const source = head && head !== sum ? head : sum;
   const { first, rest } = firstOf(source);
   if (!sum) return { headline: first, body: source === head ? rest : '' };
-  const body = sum.startsWith(first) ? sum.slice(first.length).trim() : sum;
-  return { headline: first, body };
+  return { headline: first, body: bodyAfter(sum, first) };
+}
+
+/** The summary without a leading copy of the headline.
+ *
+ *  A stored headline with no full stop left the stop of the summary behind,
+ *  and the body read ". At 2026-10-31T20:15:42Z blue ran" (dogfood
+ *  2026-11-17, AB5). The copy counts only when a sentence end or a space
+ *  follows it: a headline that stops inside the first sentence of the
+ *  summary leaves the whole summary as the body. */
+function bodyAfter(sum: string, first: string): string {
+  if (!first || !sum.startsWith(first)) return sum;
+  const after = sum.slice(first.length);
+  if (after === '') return '';
+  const stop = after.match(/^[.!?]+(?=\s|$)/);
+  if (stop) return after.slice(stop[0].length).trim();
+  return /^\s/.test(after) ? after.trim() : sum;
 }
 
 /** The headline with its field paths and tool ids out. `paths` holds the

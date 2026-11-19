@@ -8,7 +8,7 @@ import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AlertGroup, GridGap } from '../lib/types';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 
 vi.mock('../lib/api', async (importOriginal) => {
   const orig = await importOriginal<typeof import('../lib/api')>();
@@ -56,7 +56,7 @@ const GAP: GridGap = {
 };
 
 const GAP_TEXT =
-  `The grid was unreadable from ${absoluteTime('2026-10-15T13:36:00Z')} to ${absoluteTime('2026-10-19T10:15:00Z')} (93 h). Counts in this window are incomplete.`;
+  `The grid was unreadable from ${utcStamp('2026-10-15T13:36:00Z')} to ${utcStamp('2026-10-19T10:15:00Z')} (93 h). Counts in this window are incomplete.`;
 
 const mkGroup = (o: Partial<AlertGroup> = {}): AlertGroup => ({
   id: 'es-1',

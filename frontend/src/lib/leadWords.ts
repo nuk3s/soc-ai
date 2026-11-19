@@ -7,7 +7,7 @@
 // ---------------------------------------------------------------------------
 
 import { ACTION_CAMPAIGN_NOTE } from './campaignWords';
-import { huntOutcome } from './labels';
+import { huntOutcome, stoppedHuntWords } from './labels';
 import { CLOSE_RULE_CLAUSE, isSystemActor } from './leadDecisions';
 import { ago, utcStamp, utcWindow } from './timeRange';
 import { VERDICT } from './tokens';
@@ -287,12 +287,41 @@ export function leadSeenSentence(
   return `soc-ai saw ${andList(parts)} on ${subject}${spanWords(lead.observations)}.${also}`;
 }
 
-/** What the newest hunt on a lead concluded, in one sentence. A hunt that
+/** What a hunt on a lead concluded, in the words that follow "The newest hunt"
+ *  and "Hunt result:". The lead page and the lead card on the host page read
+ *  this one map, so a card never reads "found a threat" beside a pill that
+ *  reads "No threat confirmed" (dogfood 2026-11-17, b05). The server sends
+ *  one outcome code for a lead: the verdicts decide once the hunt
+ *  investigated its findings. */
+export const LEAD_OUTCOME_WORDS: Readonly<Record<string, string>> = {
+  threat_found: 'found a threat',
+  threats_confirmed: 'confirmed a threat',
+  no_threat: 'found no threat',
+  no_threat_confirmed: 'confirmed no threat',
+  no_answer: 'gave no answer',
+};
+
+/** The words of a hunt that stopped after it ran steps. One function in
+ *  lib/labels.ts gives them to every surface. */
+export { stoppedHuntWords };
+
+/** The sentence of a newest hunt that did not finish: it stopped after its
+ *  steps, or it could not run. */
+function stoppedHuntSentence(h: { status: string; steps?: number }): string {
+  const n = h.steps ?? 0;
+  const steps = `${n} ${n === 1 ? 'step' : 'steps'}`;
+  if (n > 0 && h.status === 'error') return `The newest lead hunt stopped with an error after ${steps}.`;
+  if (n > 0 && h.status === 'cancelled') return `A cancel stopped the newest lead hunt after ${steps}.`;
+  if (n > 0 && h.status === 'interrupted') return `A restart stopped the newest lead hunt after ${steps}.`;
+  return 'The newest lead hunt could not run.';
+}
+
+/** What the newest lead hunt on a lead concluded, in one sentence. A hunt that
  *  runs, and a hunt that could not run, claim no result. `hunts` is newest
  *  first. A server that sends no list leaves the hunt the lead record names. */
 export function leadHuntSentence(
   lead: {
-    hunts?: readonly { status: string; outcome: string; started_at: string | null }[];
+    hunts?: readonly { status: string; outcome: string; started_at: string | null; steps?: number }[];
     hunt_id?: string | null;
     hunt_status?: string | null;
     hunt_outcome?: string | null;
@@ -309,29 +338,22 @@ export function leadHuntSentence(
   if (!newest) return 'No hunt ran on this lead.';
   const key = huntOutcome(newest);
   if (key === 'running') return 'A hunt runs on this lead now.';
-  if (key === 'investigating') return 'The newest hunt investigates its findings now.';
+  if (key === 'investigating') return 'The newest lead hunt investigates its findings now.';
   const threat = key === 'threat_found' || key === 'threats_confirmed';
   const earlier = !threat && (lead.hunt_threat_count ?? 0) > 0 ? ' An earlier hunt found a threat.' : '';
-  if (key === 'could_not_run') return `The newest hunt could not run.${earlier}`;
-  const ran = newest.started_at ? `The newest hunt ran ${agoWords(newest.started_at, now)}` : null;
+  if (key === 'could_not_run') return `${stoppedHuntSentence(newest)}${earlier}`;
+  const ran = newest.started_at ? `The newest lead hunt ran ${agoWords(newest.started_at, now)}` : null;
   if (key === 'no_threat_gap') {
     return ran
       ? `${ran}. It found no threat and reported a visibility gap.${earlier}`
-      : `The newest hunt found no threat and reported a visibility gap.${earlier}`;
+      : `The newest lead hunt found no threat and reported a visibility gap.${earlier}`;
   }
   if (key === null) {
     return ran
       ? `${ran}. Its result is not on record.${earlier}`
-      : `The result of the newest hunt is not on record.${earlier}`;
+      : `The result of the newest lead hunt is not on record.${earlier}`;
   }
-  const found: Record<string, string> = {
-    threat_found: 'found a threat',
-    threats_confirmed: 'confirmed a threat',
-    no_threat: 'found no threat',
-    no_threat_confirmed: 'confirmed no threat',
-    no_answer: 'gave no answer',
-  };
-  return `${ran ? `${ran} and` : 'The newest hunt'} ${found[key]}.${earlier}`;
+  return `${ran ? `${ran} and` : 'The newest lead hunt'} ${LEAD_OUTCOME_WORDS[key]}.${earlier}`;
 }
 
 /** The line of a lead that a campaign holds: "Part of the campaign {title}.
@@ -362,11 +384,19 @@ export function leadWaitSentence(facts: {
   verdictToDecide?: boolean;
   /** soc-ai closed the lead: after a clean hunt, or on the verdicts of a hunt. */
   closedBySocAi?: boolean;
+  /** The campaign that closed the lead opened again after the close (W4). */
+  campaignReopened?: boolean;
 }): string {
   const open = facts.state === 'new' || facts.state === 'in_progress' || facts.state === 'hunted';
   if (open && facts.campaignTitle) return campaignLeadSentence(facts.campaignTitle);
   const byCampaign = CAMPAIGN_CLOSE_WORDS[facts.dismissedReason ?? ''];
-  if (facts.state === 'dismissed' && byCampaign) return `soc-ai closed the lead: ${byCampaign}. It waits on nothing.`;
+  if (facts.state === 'dismissed' && byCampaign) {
+    // W4: the words follow the state of the campaign at read time.
+    if (facts.campaignReopened) {
+      return `soc-ai closed the lead: ${byCampaign}. The campaign opened again and waits on a decision. The lead stays closed.`;
+    }
+    return `soc-ai closed the lead: ${byCampaign}. It waits on nothing.`;
+  }
   switch (facts.state) {
     case 'new':
       return facts.queued
@@ -486,7 +516,7 @@ export function staleHuntSentence(
  *  timeline, and a banner about an earlier threat. The record states the
  *  count and the newest answer together. `hunts` is newest first. */
 export function huntRecordSentence(
-  hunts: readonly { status: string; outcome: string }[],
+  hunts: readonly { status: string; outcome: string; steps?: number }[],
 ): string | null {
   if (hunts.length < 2) return null;
   // The outcome keys of lib/labels.ts. The lead store sends its own four codes
@@ -499,19 +529,19 @@ export function huntRecordSentence(
   const newest = keys[0];
   let tail: string;
   if (newest === 'running') {
-    tail = 'The newest hunt is running.';
+    tail = 'The newest lead hunt is running.';
   } else if (newest === 'investigating') {
-    tail = 'The newest hunt investigates its findings.';
+    tail = 'The newest lead hunt investigates its findings.';
   } else if (hunts[0].status !== 'complete' || newest === 'could_not_run') {
-    tail = 'The newest hunt could not run.';
+    tail = stoppedHuntSentence(hunts[0]);
   } else if (newest === 'threats_confirmed') {
-    tail = 'The newest hunt confirmed a threat.';
+    tail = 'The newest lead hunt confirmed a threat.';
   } else if (newest === 'no_threat_confirmed') {
-    tail = 'The newest hunt confirmed no threat.';
+    tail = 'The newest lead hunt confirmed no threat.';
   } else if (newest === 'threat_found') {
-    tail = 'The newest hunt found a threat.';
+    tail = 'The newest lead hunt found a threat.';
   } else {
-    tail = 'The newest hunt found none.';
+    tail = 'The newest lead hunt found none.';
   }
   return `${head} ${tail}`;
 }
@@ -565,12 +595,12 @@ export function leadHuntResult(lead: {
       return { key: 'running', words: 'the hunt investigates its findings' };
     case 'threat_found':
     case 'threats_confirmed':
-      return { key: 'threat', words: 'found a threat' };
+      return { key: 'threat', words: LEAD_OUTCOME_WORDS[outcome] };
     case 'could_not_run':
       return worst('failed', 'hunt failed');
     case 'no_threat':
     case 'no_threat_confirmed':
-      return worst('no_threat', 'found no threat');
+      return worst('no_threat', LEAD_OUTCOME_WORDS[outcome]);
     case 'no_threat_gap':
       return worst('no_threat_gap', 'found no threat, with a visibility gap');
     case 'no_answer':
@@ -609,7 +639,8 @@ export interface LeadHuntFacts {
 export function leadHuntLabel(h: LeadHuntFacts): string {
   const steps = `${h.steps} ${h.steps === 1 ? 'step' : 'steps'}`;
   if (h.status === 'running' || h.status === 'queued') return `Lead hunt · ${steps} · running`;
-  const parts = ['Lead hunt', steps, runTime(h.elapsed_sec)];
+  // A hunt that stopped after its steps states them in its outcome words.
+  const parts = stoppedHuntWords(h) ? ['Lead hunt', runTime(h.elapsed_sec)] : ['Lead hunt', steps, runTime(h.elapsed_sec)];
   if (h.status === 'complete') {
     parts.push(`${h.threat_findings} threat ${h.threat_findings === 1 ? 'finding' : 'findings'}`);
   }

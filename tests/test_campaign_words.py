@@ -128,6 +128,10 @@ def test_the_backend_texts_of_a_stage_use_the_words() -> None:
         alerts = None
         waits_since = None
         first_event = datetime(2026, 1, 10, 1)
+        last_event = datetime(2026, 1, 10, 2)
+        targets = ()
+        actors = ()
+        targets_more = 0
 
     for stage, words in _STAGE_WORDS.items():
         bell = campaign_change_title("stage", "actor-a against web-1", {"from": None, "to": stage})

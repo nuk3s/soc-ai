@@ -192,15 +192,16 @@ describe('Dashboard Needs-you alert line', () => {
     expect(screen.queryAllByText(/auto-investigate idle/i)).toHaveLength(0);
   });
 
-  it('points at the screen where the group can actually be triaged', async () => {
+  // NY4 (dogfood 2026-11-17). The line opens the one list on the alert
+  // groups. Its item there opens the Alerts list over the window of the count
+  // (test_campaign_needs_you.py, the item of the alert groups).
+  it('opens the Needs you page on the alert groups', async () => {
     await mount();
     fireEvent.click(await screen.findByText('1 alert group has no verdict'));
     // Parsed, not substring-matched: query-param ORDER carries no meaning.
     const dest = new URL(here()!, 'http://x');
-    expect(dest.pathname).toBe('/alerts');
-    expect(dest.searchParams.get('verdict')).toBe('untriaged');
-    // The window of the count, so the list shows the number the line states.
-    expect(dest.searchParams.get('range')).toBe('7d');
+    expect(dest.pathname).toBe('/needs-you');
+    expect(dest.searchParams.get('type')).toBe('alerts');
   });
 });
 

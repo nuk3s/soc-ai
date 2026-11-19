@@ -4,7 +4,7 @@
 import { render, screen } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { absoluteTime } from '../lib/timeRange';
+import { timeTitle } from '../lib/timeRange';
 import { Freshness } from './States';
 
 afterEach(() => {
@@ -16,7 +16,7 @@ describe('Freshness', () => {
     const at = Date.now() - 30_000;
     render(<Freshness at={at} />);
     const marker = screen.getByText(/^updated /);
-    expect(marker.getAttribute('title')).toBe(`Last updated ${absoluteTime(at)}`);
+    expect(marker.getAttribute('title')).toBe(`Last updated ${timeTitle(at)}`);
     expect(marker.getAttribute('title')).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
   });
 

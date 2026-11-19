@@ -279,7 +279,7 @@ WHITELIST: tuple[SettingSpec, ...] = (
         help=(
             "This setting applies only if the redaction above is on. On, soc-ai "
             "blocks a payload that still holds an internal identifier. soc-ai then "
-            "does not call the model. The run records a pipeline error with the "
+            "does not call the model. The investigation fails and records the "
             "count of leaked identifiers. Off, soc-ai sends the payload even if an "
             "internal identifier remains."
         ),
@@ -553,6 +553,21 @@ WHITELIST: tuple[SettingSpec, ...] = (
         ),
         min_value=0.0,
         max_value=1.0,
+    ),
+    SettingSpec(
+        key="rule_decision_days",
+        attr="rule_decision_days",
+        type="int",
+        label="Term of a standing rule decision (days)",
+        section="Triage automation",
+        hot=True,
+        help=(
+            "A standing rule decision lets soc-ai acknowledge each later false positive "
+            "of the rule for this number of days. Every other guard of the automatic "
+            "acknowledge stays. The default is 30."
+        ),
+        min_value=1,
+        max_value=365,
     ),
     SettingSpec(
         key="auto_triage_min_severity",

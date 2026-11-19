@@ -43,9 +43,14 @@ import { sparklinePoints } from './QualityCard';
  *   the count can honestly exceed the click-through's rows — the count is
  *   right and the list is the narrower read, not the other way round.
  */
-export function alertsHref(ip: string): string {
+export function alertsHref(ip: string, range: HostActivityRange = '7d'): string {
   const clause = `(source.ip:${ip} OR destination.ip:${ip})`;
-  return `/alerts?range=7d&hide_acked=false&q=${encodeURIComponent(clause)}`;
+  return `/alerts?range=${range}&hide_acked=false&q=${encodeURIComponent(clause)}`;
+}
+
+/** The words of a window for a sentence: "24 hours", "7 days". */
+export function windowWords(range: HostActivityRange): string {
+  return range === '7d' ? '7 days' : '24 hours';
 }
 
 /** How many ports fit under the count before the rest becomes a number. Three
@@ -244,7 +249,7 @@ export interface HostKpisProps {
    *  can never describe the live half differently. */
   state: ActivityState;
   range: HostActivityRange;
-  /** The alert verdicts the observations of the last 7 days hold for this
+  /** The alert verdicts the observations of the page window hold for this
    *  host. The grid count and the verdicts are two systems: the tile read "0,
    *  nothing fired" over six verdicts (dogfood 2026-10-06, S3). */
   alertVerdicts?: number;
@@ -264,9 +269,8 @@ export function HostKpis({
   alertVerdicts = 0,
   gaps,
 }: HostKpisProps) {
-  // The two cards that do not follow the 24h and 7d buttons name their own
-  // window. The Services card read no window and the Alerts card read 7d
-  // beside two cards that read 24h (dogfood 2026-10-06).
+  // The three counts follow the 24h and 7d buttons. The Services card is a
+  // fact of the machine and names its source (dogfood 2026-11-17, AB1).
   const profileDays = servicesWindowDays && servicesWindowDays > 0 ? servicesWindowDays : 30;
   // One sentence for the state the live numbers are in, reused by all three so
   // they cannot drift apart. `stale` keeps its numbers: an error WITH data behind
@@ -291,6 +295,10 @@ export function HostKpis({
     peerCount == null || activity == null ? null : peerSub(peerCount, activity.peers_truncated);
   const rest = services ? services.length - PORTS_SHOWN : 0;
   const windowEnd = activity?.window_end ? Date.parse(activity.window_end) : Number.NaN;
+  // The Alerts card counts the page window. An older server sends the
+  // 7-day count alone.
+  const alertRange: HostActivityRange = activity?.alerts == null ? '7d' : range;
+  const alertCount = activity == null ? null : (activity.alerts ?? activity.alerts_7d);
   const rate = connectionRate(activity?.volume ?? [], range, {
     end: Number.isFinite(windowEnd) ? windowEnd : Date.now(),
     gaps: gaps ?? [],
@@ -298,46 +306,6 @@ export function HostKpis({
 
   return (
     <div className="mb-3 grid grid-cols-2 gap-3 lg:grid-cols-4">
-      <Kpi
-        testId="kpi-services"
-        label={servicesSource === 'profile' ? `Services · ${profileDays}d` : 'Services · last sweep'}
-        title={
-          servicesSource === 'profile'
-            ? `The ports this host serves, from the profile of up to ${profileDays} days. The 24h and 7d buttons do not change this card.`
-            : 'The ports this host serves, from the last sweep. The 24h and 7d buttons do not change this card.'
-        }
-        value={services == null ? UNKNOWN : services.length.toLocaleString()}
-        sub={
-          services == null ? (
-            'the sweep holds no service data for this host'
-          ) : services.length === 0 ? (
-            'this host serves no ports'
-          ) : servicesStale ? (
-            <span
-              data-testid="kpi-services-stale"
-              title="The sweep found these ports. The evidence is old or weak, so the page does not assert them. A new sweep confirms them."
-            >
-              {services.slice(0, PORTS_SHOWN).join(', ')}
-              {rest > 0 ? ` +${rest} more` : ''}
-              <span className="text-warn">
-                {' · '}
-                {servicesStale === 'low confidence' ? servicesStale : `stale ${servicesStale}`}
-              </span>
-            </span>
-          ) : (
-            // WHICH ports, not "ports": tcp/8006 answers "is this the Proxmox
-            // box?" from the strip, which is the question the count alone
-            // sends a reader down the page to answer.
-            <span title="The ports this host answers on, ranked by connection count.">
-              {services.slice(0, PORTS_SHOWN).join(', ')}
-              {rest > 0 ? ` +${rest} more` : ''}
-              {servicesSource === 'profile' ? ' · from the profile' : ''}
-            </span>
-          )
-        }
-        icon={<Network size={16} />}
-        tone={services == null ? UNKNOWN_TONE : 'text-accent'}
-      />
       <Kpi
         testId="kpi-users"
         label={`Users · ${range}`}
@@ -386,30 +354,28 @@ export function HostKpis({
       />
       <Kpi
         testId="kpi-alerts"
-        label="Alerts raised · 7d"
-        // Fixed at 7 days whatever the activity window is — an alert count is
-        // the one number a shorter window would make less useful, not more.
-        // The card says so, because the three cards beside it follow the
-        // window buttons (dogfood 2026-10-06, W items).
-        title="Alerts the grid raised on this host in the last 7 days. This card always counts 7 days. The 24h and 7d buttons do not change it."
-        value={activity == null ? UNKNOWN : activity.alerts_7d.toLocaleString()}
+        label={`Alerts raised · ${alertRange}`}
+        // The card follows the 24h and 7d buttons like the cards beside it
+        // (dogfood 2026-11-17, AB1). An older server sends the 7-day count
+        // alone, and the card then names 7 days.
+        title={`Alerts the grid raised on this host in the last ${windowWords(alertRange)}.`}
+        value={alertCount == null ? UNKNOWN : alertCount.toLocaleString()}
         sub={
           <>
             <div>
-              {liveSub ??
-                (activity && activity.alerts_7d > 0 ? 'detections naming this host' : 'nothing fired')}
+              {liveSub ?? (alertCount != null && alertCount > 0 ? 'detections naming this host' : 'nothing fired')}
             </div>
             {alertVerdicts > 0 && (
               <div
                 data-testid="kpi-alert-verdicts"
                 className="font-semibold text-text-2"
-                title="Triage verdicts on alerts that name this host, from the observations of the last 7 days. The panel below lists them."
+                title={`Triage verdicts on alerts that name this host, from the observations of the last ${windowWords(range)}. The panel below lists them.`}
               >
                 {alertVerdicts.toLocaleString()} alert verdict{alertVerdicts === 1 ? '' : 's'} on this
                 host
               </div>
             )}
-            {range !== '7d' && (
+            {alertRange !== range && (
               <div data-testid="kpi-alerts-fixed" className="text-faint">
                 This card counts the last 7 days.
               </div>
@@ -418,23 +384,67 @@ export function HostKpis({
                 dash invites a click on a figure that does not exist. */}
             {activity != null && (
               <Link
-                to={alertsHref(ip)}
-                title="This link opens the alerts console for this host over the same 7 days. It includes acknowledged detections. Detections from the agent on this machine carry no address the filter can match."
+                to={alertsHref(ip, alertRange)}
+                title={`This link opens the alerts console for this host over the same ${windowWords(alertRange)}. It includes acknowledged detections. Detections from the agent on this machine carry no address the filter can match.`}
                 className="mt-0.5 inline-block underline decoration-dim/50 underline-offset-2 hover:text-text hover:decoration-dim"
               >
-                alerts for this host · 7d
+                alerts for this host · {alertRange}
               </Link>
             )}
           </>
         }
         icon={<ShieldAlert size={16} />}
         tone={
-          activity == null
+          alertCount == null
             ? UNKNOWN_TONE
-            : activity.alerts_7d > 0
+            : alertCount > 0
               ? 'text-danger'
               : 'text-mono-green'
         }
+      />
+      <Kpi
+        testId="kpi-services"
+        // A fact of the machine, with no page window: the label names its
+        // source, and the dashed card sits after the window counts. The card
+        // read "Services · 30d" beside a 24h toggle (dogfood 2026-11-17, AB1).
+        label={servicesSource === 'profile' ? 'Services · profile' : 'Services · last sweep'}
+        fact
+        title={
+          servicesSource === 'profile'
+            ? `The ports this host serves, from the profile of up to ${profileDays} days. This is a fact of the machine. The 24h and 7d buttons do not change it.`
+            : 'The ports this host serves, from the last sweep. This is a fact of the machine. The 24h and 7d buttons do not change it.'
+        }
+        value={services == null ? UNKNOWN : services.length.toLocaleString()}
+        sub={
+          services == null ? (
+            'the sweep holds no service data for this host'
+          ) : services.length === 0 ? (
+            'this host serves no ports'
+          ) : servicesStale ? (
+            <span
+              data-testid="kpi-services-stale"
+              title="The sweep found these ports. The evidence is old or weak, so the page does not assert them. A new sweep confirms them."
+            >
+              {services.slice(0, PORTS_SHOWN).join(', ')}
+              {rest > 0 ? ` +${rest} more` : ''}
+              <span className="text-warn">
+                {' · '}
+                {servicesStale === 'low confidence' ? servicesStale : `stale ${servicesStale}`}
+              </span>
+            </span>
+          ) : (
+            // WHICH ports, not "ports": tcp/8006 answers "is this the Proxmox
+            // box?" from the strip, which is the question the count alone
+            // sends a reader down the page to answer.
+            <span title="The ports this host answers on, ranked by connection count.">
+              {services.slice(0, PORTS_SHOWN).join(', ')}
+              {rest > 0 ? ` +${rest} more` : ''}
+              {servicesSource === 'profile' ? ' · from the profile' : ''}
+            </span>
+          )
+        }
+        icon={<Network size={16} />}
+        tone={services == null ? UNKNOWN_TONE : 'text-accent'}
       />
     </div>
   );

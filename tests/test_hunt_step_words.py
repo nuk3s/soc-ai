@@ -239,3 +239,52 @@ def test_a_partial_read_reads_as_plain_sentences() -> None:
         "The grid answered from 45 of 289 shards. The answer is incomplete. An empty answer "
         "means that the result is unknown."
     )
+
+
+# --- Round 3, T2: the tool text itself is in ASD-STE100 and has no dash. The
+# hunt step mapper still reads the error that the validator gives now.
+
+
+def test_the_live_wildcard_error_has_no_dash_and_still_maps() -> None:
+    from soc_ai.so_client.oql import OqlValidationError, parse_oql, validate_oql
+
+    with pytest.raises(OqlValidationError) as caught:
+        validate_oql(parse_oql("process.command_line:*mimikatz"))
+    message = str(caught.value)
+    assert "—" not in message and "–" not in message
+    assert translate_tool_error(message) == (
+        "The query starts a pattern with a wildcard. The grid refuses that form. "
+        "Write the pattern as foo*, or use field:~value."
+    )
+
+
+def test_a_tool_string_of_a_hunt_step_gives_no_dash() -> None:
+    """The literals of the tool layer reach a hunt step, a tool summary or the
+    prompt of the model. A dash in one of them came back in a step."""
+    import ast
+    from pathlib import Path
+
+    from tests.test_prose_style import _docstring_ids
+
+    root = Path(__file__).resolve().parents[1] / "soc_ai"
+    files = [
+        *sorted((root / "tools").glob("*.py")),
+        root / "agent" / "toolset.py",
+        root / "so_client" / "oql.py",
+        root / "so_client" / "inventory.py",
+    ]
+    hits = []
+    for path in files:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docstrings = _docstring_ids(tree)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in docstrings
+                and ("\u2014" in node.value or "\u2013" in node.value)
+                # A log line names a %s. An operator reads it in a log.
+                and "%" not in node.value
+            ):
+                hits.append(f"{path.name}:{node.lineno}")
+    assert hits == []

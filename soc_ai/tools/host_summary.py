@@ -526,8 +526,9 @@ def _collect_top_peers(ip: str, aggregations: dict[str, Any]) -> list[dict[str, 
     read_only=True,
     description=(
         "Identify an internal host by IP from Security Onion data: hostname,"
-        " device/OS (parsed from HTTP User-Agent — fixes iPhone-vs-Mac),"
-        " server/workstation role, first/last seen, top peers/ports/DNS."
+        " device/OS, server/workstation role, first/last seen, top peers/ports/DNS."
+        " The device/OS comes from the HTTP User-Agent, which tells an iPhone from"
+        " a Mac."
     ),
 )
 async def host_summary(
@@ -994,8 +995,9 @@ def _merge_os_evidence(
         if hint_family is not None and ua_family is not None and hint_family != ua_family:
             hint_block["basis"] = "user-agent"
             hint_block["conflict"] = (
-                f"user-agent says {ua_guess} ({ua_family}); "
-                f"telemetry domains say {hint_family} — investigate (NAT/multi-device?)"
+                f"The user-agent says {ua_guess} ({ua_family}). "
+                f"The telemetry domains say {hint_family}. Investigate NAT or more "
+                "than one device on this address."
             )
         else:
             # Agree (or the hint is a mixed/None verdict) → corroboration.

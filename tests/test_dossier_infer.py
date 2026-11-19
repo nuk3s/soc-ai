@@ -1491,7 +1491,7 @@ def test_a_self_reported_hostname_outranks_a_banner_hostname() -> None:
     # The loser is kept: a host with two names is worth seeing, not worth
     # silently resolving.
     assert fact.evidence == [
-        "pve-a (self-reported, filebeat 9.3.7, last 2019-03-15T22:15:00+00:00)",
+        "pve-a (self-reported, filebeat 9.3.7, last 2019-03-15 22:15 UTC)",
         "pve01 (from dhcp)",
     ]
     # The agent's clock, not the builder's and not the DHCP record's.
@@ -1564,7 +1564,7 @@ def test_os_family_and_detail_come_from_the_agents_own_os_struct() -> None:
     assert detail.source == "hostlog"
     assert detail.evidence == [
         "Debian GNU/Linux 13 (trixie), kernel 7.0.12-1-pve "
-        "(self-reported, filebeat 9.3.7, last 2019-03-15T22:15:00+00:00)"
+        "(self-reported, filebeat 9.3.7, last 2019-03-15 22:15 UTC)"
     ]
 
 

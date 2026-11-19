@@ -84,6 +84,7 @@ SEEDED_TABLES: tuple[str, ...] = (
     "runbook",
     "internal_identifier",
     "rule_prior_decisions",
+    "rule_decisions",
 )
 
 # A full ISO-8601 datetime, the only string shape the rebase moves. A date

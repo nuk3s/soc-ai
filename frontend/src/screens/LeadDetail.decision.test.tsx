@@ -160,7 +160,7 @@ describe('the state line', () => {
     await screen.findByTestId('lead-machine-name');
     expect(await stateLine()).toBe(
       'soc-ai saw 1 collapsed rate, 1 new outbound port and 3 rate spikes on adguard2 at ' +
-        '192.0.2.33 in 28 days. The newest hunt ran 39 days ago and found no threat. ' +
+        '192.0.2.33 in 28 days. The newest lead hunt ran 39 days ago and found no threat. ' +
         'The lead waits on your decision: dismiss it or hunt again.',
     );
   });

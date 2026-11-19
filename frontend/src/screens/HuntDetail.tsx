@@ -67,6 +67,7 @@ import { useTabTitle } from '../lib/useTabTitle';
 import { type FlowFinding, type FlowHunt, findingInvestigation, huntFlow } from '../lib/flowSteps';
 import { useDemo } from '../lib/demo';
 import { entityPath } from '../lib/entityPath';
+import { huntHosts } from '../lib/huntGraph';
 import { HUNT_STATUS } from '../lib/statusMeta';
 import {
   type HuntOutcomeKey,
@@ -74,6 +75,7 @@ import {
   confidenceText,
   confidenceWord,
   huntOutcome,
+  huntStopLabel,
   outcomeLabel,
   outcomeMeta,
   threatCountSentence,
@@ -102,6 +104,9 @@ import {
 import { useAsync } from '../lib/useAsync';
 import { lazyWithReload } from '../lib/lazyWithReload';
 import { useChatScope } from '../lib/chatScope';
+import { stepTimeUtc, utcTimesInText } from '../lib/timeRange';
+import { plainText } from '../lib/headline';
+import { ToolText } from '../components/ToolText';
 import type {
   FindingInvestigationStatus,
   HuntDetailData,
@@ -296,10 +301,14 @@ export function pageOutcome(
 function huntDisposition(
   outcome: HuntOutcomeKey,
   serverLabel?: string | null,
+  stopped?: { status?: string | null; steps?: number | null } | null,
 ): { label: string; color: string } {
   const meta = outcomeMeta(outcome);
+  // A hunt that stopped reads the words of the list, the lead page and the
+  // campaign fold: "Stopped with an error after 14 steps" (F5).
+  const stop = stopped ? huntStopLabel(stopped) : null;
   // The server label carries the count sentence, "3 confirmed · 1 not judged · of 4 threat findings".
-  return { label: serverLabel || outcomeLabel(outcome), color: meta.color };
+  return { label: stop ?? (serverLabel || outcomeLabel(outcome)), color: meta.color };
 }
 
 /** The outcomes whose bottom line counts the threat findings. */
@@ -323,6 +332,7 @@ export function bottomLineCount(
     | 'findingsConfirmed'
     | 'findingsFalsePositive'
     | 'threatFindingCount'
+    | 'steps'
   >,
 ): string {
   const outcome = pageOutcome(data);
@@ -337,7 +347,7 @@ export function bottomLineCount(
       threatFindings: total,
     });
   }
-  return huntDisposition(outcome, data.outcome_label).label;
+  return huntDisposition(outcome, data.outcome_label, data).label;
 }
 
 /** The first sentence of the narrative, as plain text. The narrative of a
@@ -1211,7 +1221,7 @@ function FindingCard({
         </>
       ) : (
         <div className="text-[12.5px] leading-[1.6] text-text-2" style={{ textWrap: 'pretty' }}>
-          {f.detail}
+          <ToolText text={utcTimesInText(plainText(f.detail, { tools: false }))} />
         </div>
       )}
       {f.validatorNote && (
@@ -1248,19 +1258,9 @@ function FindingCard({
           {f.citations.map((c) => {
             // A model can cite a tool call, "t_origin_chain(10.99.0.40)". It
             // is no document, so it reads in words and opens nothing (K4).
-            const words = citationWords(c);
-            return words ? (
-              <span
-                key={c}
-                data-testid="citation-words"
-                title={`The finding cites a tool result: ${c}`}
-                className="rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px font-sans text-[11px] text-dim"
-              >
-                {words}
-              </span>
-            ) : (
-              <DocumentChip key={c} id={c} />
-            );
+            // The chip shows it in words and keeps the tool name in its
+            // tooltip (DocumentChip, AB5).
+            return <DocumentChip key={c} id={c} />;
           })}
           {/* Three ids beside a narrative saying four documents matched, with
               nothing accounting for the fourth. execute.py caps top_hits at
@@ -1285,44 +1285,9 @@ function FindingCard({
   );
 }
 
-// The nouns of the tools a model cites by name. A tool this map does not hold
-// reads as its own words.
-const CITED_TOOL: Record<string, string> = {
-  origin_chain: 'Origin chain',
-  decode_payload: 'Decoded payload',
-  host_dossier: 'Host dossier',
-  host_summary: 'Host summary',
-  query_events_oql: 'Event search',
-  query_zeek_logs: 'Zeek logs',
-  get_event_raw: 'Document',
-  get_alert_context: 'Alert context',
-  get_rule_content: 'Rule text',
-  prevalence: 'Prevalence',
-  rule_prevalence: 'Rule prevalence',
-  first_seen: 'First sighting',
-  beacon_profile: 'Beacon profile',
-  dns_entropy_scan: 'DNS entropy scan',
-  run_analytic: 'Analytic run',
-  enrich_ip: 'Reputation',
-  enrich_domain: 'Domain reputation',
-  enrich_hash: 'File-hash reputation',
-};
-const TOOL_CITATION = /^t_([a-z0-9_]+)\s*\((.*)\)\s*$/i;
-
-/** A tool citation in words: "t_origin_chain(10.99.0.40)" reads "Origin chain
- *  of 10.99.0.40". null for a document id, which opens in the drawer. */
-export function citationWords(citation: string): string | null {
-  const m = citation.trim().match(TOOL_CITATION);
-  if (!m) return null;
-  const name = m[1].toLowerCase();
-  const noun =
-    CITED_TOOL[name] ?? name.replace(/_/g, ' ').replace(/^./, (ch) => ch.toUpperCase());
-  const args = m[2]
-    .split(',')
-    .map((a) => a.replace(/^\s*[a-z_]+\s*=\s*/i, '').replace(/^["']|["']$/g, '').trim())
-    .filter(Boolean);
-  return args.length ? `${noun} of ${args.join(', ')}` : noun;
-}
+// A tool citation in words: the one label map of lib/toolLabels (AB5). The
+// page re-exports it for its tests and callers.
+export { citationWords } from '../lib/toolLabels';
 
 /** The help line over the finding cards. Each sentence names a control the
  *  page shows: the detection sentence only while detection authoring is on. */
@@ -1547,7 +1512,7 @@ function TimelineRow({ step, last }: { step: TimelineStep; last: boolean }) {
             {step.group}
           </span>
           <div className="flex-1" />
-          <span className="font-mono text-[11px] text-faint">{step.time}</span>
+          <span className="font-mono text-[11px] text-faint">{stepTimeUtc(step.time)}</span>
         </div>
         <div className="mt-[3px] text-[13.5px] font-medium" style={{ textWrap: 'pretty' }}>
           {step.title}
@@ -1693,7 +1658,7 @@ export function HuntDetail() {
     startHuntConsole(data.objective)
       .then((r) => navigate(`/hunts/${r.hunt_id}`))
       .catch((e: unknown) => {
-        setRehuntError(e instanceof Error ? e.message : 'The re-hunt did not start. Try again.');
+        setRehuntError(e instanceof Error ? e.message : 'The new hunt did not start. Try again.');
         setRehunting(false);
       });
   };
@@ -1722,7 +1687,7 @@ export function HuntDetail() {
   // and support the read-only follow-up chat.
   const terminal = complete || failed;
   const outcome: HuntOutcomeKey | null = data ? pageOutcome(data) : null;
-  const disp = outcome ? huntDisposition(outcome, data?.outcome_label) : null;
+  const disp = outcome ? huntDisposition(outcome, data?.outcome_label, data) : null;
   // The hero wears the outcome's colour once the hunt ended. A run that could
   // not reach the grid wore the green of "Complete".
   const statusColor =
@@ -1743,6 +1708,18 @@ export function HuntDetail() {
   // The findings the charts may count. A failed query is no finding of the
   // hunt: the breakdown counted one as "medium 1" on a run that never ran.
   const charted = data ? data.findings.filter((f) => !isRunFailure(f)) : [];
+  // The one host list of the page: the host panel and the map read it.
+  const hostList = data ? huntHosts(charted, data.affectedHosts) : [];
+  // A host is affected only beside a threat: a threat finding names it, or
+  // the report of a hunt that found a threat marks it (C5).
+  const threatHunt =
+    !!data &&
+    (charted.some((f) => (f.category ?? 'threat') === 'threat') ||
+      ['threat_found', 'threats_confirmed'].includes(pageOutcome(data)));
+  const affected = new Set([
+    ...hostList.filter((h) => h.threats > 0).map((h) => h.host),
+    ...(threatHunt && data ? data.affectedHosts : []),
+  ]);
   // Declarative-spec run: no model touched this hunt at any point.
   const catalog = data?.startedBy === CATALOG_ACTOR;
   // The Ask soc-ai panel's hunt scope. The hunt chat answers from the report,
@@ -2041,7 +2018,7 @@ export function HuntDetail() {
                   data-tour="hunt-rehunt"
                   onClick={doRehunt}
                   disabled={rehunting}
-                  title="Re-run this objective as a fresh hunt"
+                  title="Hunt again: start a new hunt with this objective."
                   className={
                     failed
                       ? 'flex items-center gap-1.5 rounded-control border border-accent bg-[rgba(75,139,245,.14)] px-[11px] py-1.5 text-[12px] font-semibold text-[#cfe0ff] hover:bg-[rgba(75,139,245,.22)] disabled:opacity-60'
@@ -2049,7 +2026,7 @@ export function HuntDetail() {
                   }
                 >
                   {rehunting ? <Spinner size={13} /> : <RotateCw size={13} />}
-                  {rehunting ? 'Starting' : 'Re-hunt'}
+                  {rehunting ? 'Starting' : 'Hunt again'}
                 </button>
               )}
               {rehuntError && (
@@ -2173,6 +2150,23 @@ export function HuntDetail() {
           <div className="mt-[18px] grid grid-cols-1 items-start gap-[18px] lg:grid-cols-[minmax(0,1fr)_360px]">
             {/* main column: narrative, findings, timeline */}
             <div className="flex min-w-0 flex-col gap-[18px]">
+              {/* The pictures lead: the map and the charts come before the
+                  narrative and the findings (dogfood 2026-11-17, AB3). They
+                  show only once the hunt has concluded WITH findings: a
+                  running or empty hunt has nothing to plot, and a chart must
+                  never render from nothing. */}
+              {complete && charted.length > 0 && (
+                <CollapsibleSection title="Visual summary">
+                  <Suspense fallback={<VisualsSkeleton />}>
+                    <HuntVisuals
+                      findings={charted}
+                      affectedHosts={data.affectedHosts}
+                      charts={data.charts}
+                    />
+                  </Suspense>
+                </CollapsibleSection>
+              )}
+
               {/* An errored hunt's narrative IS the failure sentence, and it
                   already sits under the verdict. One sentence twice on one
                   page reads as two facts. */}
@@ -2188,7 +2182,7 @@ export function HuntDetail() {
                           (R3-D13). A model's narrative is Markdown. */}
                       {catalog ? (
                         <p data-testid="hunt-narrative-plain" className="whitespace-pre-line">
-                          {data.narrative}
+                          {utcTimesInText(data.narrative)}
                         </p>
                       ) : (
                         <Markdown>{data.narrative}</Markdown>
@@ -2270,10 +2264,11 @@ export function HuntDetail() {
                 </CollapsibleSection>
               ) : null}
 
-              {/* L1: the order is narrative, findings, event timeline, then the
-                  lead, the charts, the diff and the steps. The findings sat
-                  under the lead timeline, two charts, a node map and the diff
-                  (review 2026-11-12). */}
+              {/* The order is the pictures, the narrative, the findings, the
+                  event timeline, then the lead, the diff and the steps. The
+                  findings sat under the lead timeline, two charts, a node map
+                  and the diff (review 2026-11-12, L1). The pictures then came
+                  last (dogfood 2026-11-17, AB3). */}
               {/* What the lead is made of. The hunt page named the lead and
                   showed nothing of it, so an analyst reading the hunt had to
                   leave it to learn what the hunt was about. */}
@@ -2287,20 +2282,6 @@ export function HuntDetail() {
                     className=""
                   />
                 </div>
-              )}
-              {/* Deterministic charts from the findings — only once the hunt has
-                  concluded WITH findings (a running or empty hunt has nothing
-                  to plot, and a chart must never render from nothing). */}
-              {complete && charted.length > 0 && (
-                <CollapsibleSection title="Visual summary">
-                  <Suspense fallback={<VisualsSkeleton />}>
-                    <HuntVisuals
-                      findings={charted}
-                      affectedHosts={data.affectedHosts}
-                      charts={data.charts}
-                    />
-                  </Suspense>
-                </CollapsibleSection>
               )}
 
               {/* "vs last run" diff — only when a prior COMPLETE run of this
@@ -2350,31 +2331,45 @@ export function HuntDetail() {
 
             {/* right rail: hosts / MITRE / recommended actions */}
             <div className="flex flex-col gap-[18px]">
-              {data.affectedHosts.length > 0 && (
+              {hostList.length > 0 && (
                 <Panel>
                   <PanelHeader
                     icon={<Crosshair size={15} />}
-                    // A hunt that found no threat names hosts. It affected
-                    // none (C5): "Affected hosts 2" sat over a hunt that
-                    // found no traffic.
-                    title={outcome === 'threat_found' ? 'Affected hosts' : 'Hosts named'}
+                    // One list with the map: the hosts the findings name,
+                    // then the hosts the report marked affected. The panel
+                    // read 12 hosts from the report beside a map of 18
+                    // (dogfood 2026-11-17, AB3). A hunt that found no threat
+                    // affected no host (C5), so the title names hosts.
+                    title="Hosts named"
                     right={
-                      <span className="font-mono text-[11px] text-accent" title={COUNT_AFFECTED_HOSTS}>
-                        {data.affectedHosts.length}
+                      <span
+                        data-testid="hunt-hosts-count"
+                        className="font-mono text-[11px] text-accent"
+                        title={COUNT_AFFECTED_HOSTS}
+                      >
+                        {hostList.length}
                       </span>
                     }
                   />
+                  {affected.size > 0 && (
+                    <div data-testid="hunt-hosts-affected" className="px-4 pt-3 text-[12px] font-semibold text-danger">
+                      {`${affected.size} affected: a threat finding or the report names ${affected.size === 1 ? 'it' : 'them'}.`}
+                    </div>
+                  )}
                   <div className="flex flex-wrap gap-1.5 p-4">
-                    {data.affectedHosts.map((h) => (
+                    {hostList.map(({ host: h }) => (
                       // Host chip → the page that holds what this grid knows about the
-            // entity. `entityPath` picks it: an address has a host page, a name
-            // has the entity page. The chip linked every host to /entity/, so
-            // one address had two pages and neither knew about the other.
+                      // entity. `entityPath` picks it: an address has a host page, a name
+                      // has the entity page. The chip linked every host to /entity/, so
+                      // one address had two pages and neither knew about the other.
                       <Link
                         key={h}
                         to={entityPath('host', h)}
-                        title={`Pivot to ${h}`}
-                        className="rounded-chip bg-surface-3 px-2 py-0.5 font-mono text-[11.5px] text-mono-amber hover:brightness-125"
+                        data-affected={affected.has(h) ? 'true' : undefined}
+                        title={affected.has(h) ? `${h} is affected. Open its page.` : `Pivot to ${h}`}
+                        className={`rounded-chip px-2 py-0.5 font-mono text-[11.5px] hover:brightness-125 ${
+                          affected.has(h) ? 'border border-danger/50 bg-danger/10 text-danger' : 'bg-surface-3 text-mono-amber'
+                        }`}
                       >
                         {h}
                       </Link>

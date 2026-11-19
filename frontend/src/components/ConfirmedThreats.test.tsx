@@ -23,6 +23,7 @@ import {
   runsWords,
   sourcesWords,
   useThreats,
+  waitingSplitWords,
 } from './ConfirmedThreats';
 
 const minutesAgo = (m: number) => new Date(Date.now() - m * 60_000).toISOString();
@@ -234,6 +235,22 @@ describe('ConfirmedThreats panel', () => {
     expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('17 true positives');
   });
 
+  it('states the split when a campaign with no decision holds some of the true positives that wait', () => {
+    const list = { ...LIST, waiting: 6, waitingInCampaigns: 2, waitingCampaigns: 1 };
+    panel(readOf({ data: { key: 'k', list } }));
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe(
+      '6 true positives wait: 4 on their own, 2 in 1 campaign.',
+    );
+    expect(waitingSplitWords({ ...list, waitingInCampaigns: 3, waitingCampaigns: 2 })).toBe(
+      '6 true positives wait: 3 on their own, 3 in 2 campaigns.',
+    );
+  });
+
+  it('control: no campaign holds a true positive that waits, so the header states no split', () => {
+    panel(readOf({ data: { key: 'k', list: { ...LIST, waiting: 6, waitingInCampaigns: 0, waitingCampaigns: 0 } } }));
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('6 true positives wait');
+  });
+
   it('states the window in the empty line, never a blank card', () => {
     panel(readOf({ data: { key: 'k', list: { ...LIST, rows: [], authorized: [], total: 0 } } }), 'last 7 days');
     expect(screen.getByTestId('confirmed-threats-empty').textContent).toBe('No confirmed threat in the last 7 days.');
@@ -432,7 +449,7 @@ describe('ConfirmedThreats campaigns', () => {
     const c = screen.getByTestId('threat-campaign');
     expect(within(c).getByRole('img')).toHaveAccessibleName('Stage reached: Action on the target, 4 of 5');
     expect(within(c).getByRole('link', { name: 'actor-a against web-1' })).toHaveAttribute('href', '/campaigns/7');
-    expect(within(c).getByTestId('campaign-status').textContent).toBe('Open');
+    expect(within(c).getByTestId('campaign-state').textContent).toBe('Open');
     expect(within(c).getByTestId('threat-campaign-parties').textContent).toBe('From actor-a to web-1');
     expect(within(c).getByRole('link', { name: 'web-1' })).toHaveAttribute('href', '/hosts/net%3A192.0.2.20');
     expect(within(c).getByTestId('threat-campaign-meta').textContent).toBe(
@@ -448,30 +465,31 @@ describe('ConfirmedThreats campaigns', () => {
     expect(within(c).getByTestId('threat-campaign-parties').className).toContain('break-words');
   });
 
-  it('states the decision of a campaign as a chip beside its status', () => {
+  it('states one state chip for each campaign, never Open beside Closed', () => {
     panel(
       withCampaigns([
-        { ...THREAT_CAMPAIGN, decision: null, waitsSince: '2026-10-24T00:40:00Z' },
-        { ...THREAT_CAMPAIGN, id: 8, title: 'actor-b against db01', decision: 'closed', waitsSince: null },
+        { ...THREAT_CAMPAIGN, decision: null, waitsSince: '2026-10-24T00:40:00Z', state: 'open' },
+        { ...THREAT_CAMPAIGN, id: 8, title: 'actor-b against db01', decision: 'closed', waitsSince: null, state: 'closed' },
       ]),
     );
     const [waits, closed] = screen.getAllByTestId('threat-campaign');
-    const chip = within(waits).getByTestId('campaign-decision-chip');
-    expect(chip.textContent).toBe('Waits on you');
-    expect(chip).toHaveAttribute('data-state', 'waits');
-    expect(within(closed).getByTestId('campaign-decision-chip').textContent).toBe('Closed');
+    const chip = within(waits).getByTestId('campaign-state');
+    expect(chip.textContent).toBe('Open');
+    expect(chip).toHaveAttribute('data-waits', 'true');
+    expect(within(closed).getAllByTestId('campaign-state').map((c) => c.textContent)).toEqual(['Closed']);
+    expect(within(closed).queryByText('Open')).toBeNull();
   });
 
-  it('states a campaign with a case as Case beside its status', () => {
+  it('states a campaign with a case as Case', () => {
     panel(withCampaigns([{ ...THREAT_CAMPAIGN, decision: 'case', waitsSince: null }]));
     const c = screen.getByTestId('threat-campaign');
-    const chip = within(c).getByTestId('campaign-decision-chip');
+    const chip = within(c).getByTestId('campaign-state');
     expect(chip.textContent).toBe('Case');
-    expect(chip).toHaveAttribute('title', 'A Security Onion case is open for this campaign.');
+    expect(chip).toHaveAttribute('title', 'A Security Onion case holds this campaign.');
     expect(forbiddenWords(c)).toEqual([]);
   });
 
-  it('states the expiry on the Authorized chip and the investigations beyond the authorization in the danger tone', () => {
+  it('states the expiry in the hover text of the Authorized chip and the investigations beyond the authorization in the danger tone', () => {
     const expiresAt = new Date(Date.now() + 7 * 86_400_000).toISOString();
     panel(
       withCampaigns([
@@ -486,7 +504,8 @@ describe('ConfirmedThreats campaigns', () => {
       ]),
     );
     const c = screen.getByTestId('threat-campaign');
-    expect(within(c).getByTestId('campaign-decision-chip').textContent).toBe(`Authorized, expires ${expiresAt.slice(0, 10)}`);
+    expect(within(c).getByTestId('campaign-state').textContent).toBe('Authorized');
+    expect(within(c).getByTestId('campaign-state').getAttribute('title')).toMatch(/^An authorization covers this campaign until /);
     const beyond = within(c).getByTestId('campaign-beyond-chip');
     // The line reads `beyond`, never `waiting`.
     expect(beyond.textContent).toBe('2 beyond the authorization');
@@ -500,7 +519,9 @@ describe('ConfirmedThreats campaigns', () => {
         { ...THREAT_CAMPAIGN, decision: 'authorized', authorization: { expiresAt: '2026-11-01T09:00:00Z', state: 'expired' } },
       ]),
     );
-    expect(screen.getByTestId('campaign-decision-chip').textContent).toBe('Authorization expired 2026-11-01');
+    expect(screen.getByTestId('campaign-state').getAttribute('title')).toBe(
+      'The authorization of this campaign expired 2026-11-01 09:00 UTC, and a later event waits on you.',
+    );
   });
 
   it('states no beyond alarm with a count of 0, and reads an older server as before', () => {
@@ -512,13 +533,13 @@ describe('ConfirmedThreats campaigns', () => {
       ]),
     );
     expect(screen.queryByTestId('campaign-beyond-chip')).toBeNull();
-    expect(screen.getAllByTestId('campaign-decision-chip').map((c) => c.textContent)).toEqual(['Authorized', 'Authorized']);
+    expect(screen.getAllByTestId('campaign-state').map((c) => c.textContent)).toEqual(['Authorized', 'Authorized']);
   });
 
-  it('states no decision chip for a server that sends no decision', () => {
+  it('claims no wait for a server that sends no decision', () => {
     // NEGATIVE CONTROL. An absent field is no "waits": the console claims nothing.
     panel(withCampaigns([THREAT_CAMPAIGN]));
-    expect(screen.queryByTestId('campaign-decision-chip')).toBeNull();
+    expect(screen.getByTestId('campaign-state')).toHaveAttribute('data-waits', 'false');
   });
 
   it('names the further targets and the investigations when the alerts are unknown', () => {
@@ -584,5 +605,118 @@ describe('HostThreatStrip with campaigns', () => {
       'This host has 12 true positive investigations outside a campaign in the last 30 days.',
     );
     expect(forbiddenWords(strip)).toEqual([]);
+  });
+});
+
+// Round "decide once" (DC2, DC3). A campaign that the analyst closed stayed in
+// the red list, and the header counted its true positives as threats.
+describe('ConfirmedThreats with decided campaigns', () => {
+  const decidedList = (over: Partial<ThreatList> = {}): ThreatList => ({
+    ...LIST,
+    rows: [],
+    authorized: [],
+    campaigns: [],
+    total: 14,
+    waiting: 0,
+    waitingHosts: 0,
+    decided: { campaigns: 1, investigations: 12 },
+    ...over,
+  });
+
+  it('states that nothing waits, then one quiet line for the decided campaigns', () => {
+    panel(readOf({ data: { key: 'k', list: decidedList() } }), 'last 7 days');
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('0 true positives wait');
+    expect(screen.getByTestId('confirmed-threats-empty').textContent).toBe('No confirmed threat waits for a decision.');
+    const line = screen.getByTestId('threat-decided');
+    expect(line.textContent).toBe('Decided: 1 campaign with 12 true positive investigations in this window.');
+    // N15: the line counts the window, and the list holds every decided
+    // campaign. The link says so.
+    const link = screen.getByTestId('threat-decided-link');
+    expect(link.textContent).toBe('Open all decided campaigns.');
+    expect(link).toHaveAttribute('href', '/campaigns?decision=decided');
+    expect(line).not.toHaveAttribute('href');
+    expect(line.className).not.toMatch(/danger|warn/);
+    expect(link.className).not.toMatch(/danger|warn/);
+    // The decided line comes after the empty line.
+    const empty = screen.getByTestId('confirmed-threats-empty');
+    expect(empty.compareDocumentPosition(line) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(forbiddenWords(screen.getByTestId('confirmed-threats'))).toEqual([]);
+  });
+
+  it('keeps a campaign with no decision in the red list and counts what waits', () => {
+    // NEGATIVE CONTROL: the server lists the campaign, and the panel shows it.
+    panel(
+      readOf({
+        data: {
+          key: 'k',
+          list: decidedList({
+            campaigns: [{ ...THREAT_CAMPAIGN, decision: null, state: 'open' }],
+            waiting: 3,
+            waitingHosts: 1,
+            decided: { campaigns: 0, investigations: 0 },
+          }),
+        },
+      }),
+    );
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('3 true positives wait');
+    expect(screen.getAllByTestId('threat-campaign')).toHaveLength(1);
+    // The line is absent at 0.
+    expect(screen.queryByTestId('threat-decided')).toBeNull();
+    expect(screen.queryByTestId('threat-decided-link')).toBeNull();
+    expect(screen.queryByTestId('confirmed-threats-empty')).toBeNull();
+  });
+
+  it('states one waiting true positive in the singular', () => {
+    panel(readOf({ data: { key: 'k', list: decidedList({ waiting: 1, rows: [row()] }) } }));
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe('1 true positive waits');
+    expect(screen.getByTestId('threat-decided').textContent).toBe(
+      'Decided: 1 campaign with 12 true positive investigations in this window.',
+    );
+  });
+});
+
+// Round 3 part 2 (W2). The Dashboard at 30 days read "36 true positives
+// wait: 6 on their own, 30 in 1 campaign". The close of the campaign had
+// covered 28 of the 30. The server takes them out of the count that waits.
+describe('ConfirmedThreats with a campaign that opened again', () => {
+  const reopenedList = (over: Partial<ThreatList> = {}): ThreatList => ({
+    ...LIST,
+    rows: [],
+    authorized: [],
+    campaigns: [{ ...THREAT_CAMPAIGN, decision: null, state: 'open' }],
+    total: 36,
+    waiting: 8,
+    waitingHosts: 2,
+    waitingInCampaigns: 2,
+    waitingCampaigns: 1,
+    decided: { campaigns: 0, investigations: 0 },
+    earlier: { campaigns: 1, investigations: 28, decision: 'closed', decidedAt: '2026-11-15T01:01:12Z' },
+    ...over,
+  });
+
+  it('states the count that waits and the true positives that the close covered', () => {
+    panel(readOf({ data: { key: 'k', list: reopenedList() } }));
+    expect(screen.getByTestId('confirmed-threats-total').textContent).toBe(
+      '8 true positives wait: 6 on their own, 2 in 1 campaign.',
+    );
+    const line = screen.getByTestId('threat-earlier');
+    expect(line.textContent).toBe('28 are in a campaign that opened again. The close of 2026-11-15 covered them.');
+    expect(line.className).not.toMatch(/danger|warn/);
+    expect(forbiddenWords(screen.getByTestId('confirmed-threats'))).toEqual([]);
+  });
+
+  it('states no such line when no earlier decision covers a true positive', () => {
+    // NEGATIVE CONTROL: an older server, or a campaign that never had a decision.
+    panel(readOf({ data: { key: 'k', list: reopenedList({ earlier: undefined }) } }));
+    expect(screen.queryByTestId('threat-earlier')).toBeNull();
+    panel(
+      readOf({
+        data: {
+          key: 'k',
+          list: reopenedList({ earlier: { campaigns: 0, investigations: 0, decision: null, decidedAt: null } }),
+        },
+      }),
+    );
+    expect(screen.queryByTestId('threat-earlier')).toBeNull();
   });
 });

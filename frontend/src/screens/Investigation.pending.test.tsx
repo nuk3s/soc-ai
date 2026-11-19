@@ -60,7 +60,42 @@ describe('recommended-actions pending count', () => {
     expect(screen.queryByText(/1 action waits for you/)).toBeNull();
   });
 
-  it('still counts a genuinely un-executed action', () => {
+  // NY5 (macro review 2026-11-17, m14). The server states whether an action
+  // waits, by the rule of Needs you. The acknowledge of a false positive
+  // stays open and waits for no one.
+  it('counts no open acknowledge of a false positive that the server rules out', () => {
+    render(
+      <MemoryRouter>
+        <Investigation
+          inv={baseInv({ actions: [{ ...appliedAction, applied: false, waits: false }] })}
+          layout="page"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/0 actions wait for you/)).toBeTruthy();
+    expect(screen.queryByText(/1 action waits for you/)).toBeNull();
+  });
+
+  // NEGATIVE CONTROL. An action that the server rules as waiting still counts.
+  it('counts an action that waits by the rule of the server', () => {
+    render(
+      <MemoryRouter>
+        <Investigation
+          inv={baseInv({
+            verdict: 'true_positive',
+            actions: [
+              { id: 'e1', title: 'Escalate to case', tag: 'escalate', rationale: 'Bad.', waits: true },
+              { ...appliedAction, id: 'a9', applied: false, waits: false },
+            ],
+          })}
+          layout="page"
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/1 action waits for you/)).toBeTruthy();
+  });
+
+  it('still counts a genuinely un-executed action of an older server', () => {
     render(
       <MemoryRouter>
         <Investigation

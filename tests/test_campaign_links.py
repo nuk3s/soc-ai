@@ -47,7 +47,7 @@ from tests.test_campaign_facts import (
     seed_run,
 )
 
-LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision"}
+LINK_KEYS = {"id", "title", "status", "stage", "differs", "decision", "state"}
 _FLOW = "1:flow-of-the-seed"
 
 
@@ -211,6 +211,7 @@ def _seed_member_and_other(client: TestClient) -> tuple[str, str, dict[str, Any]
             "stage": row.stage,
             "differs": False,
             "decision": None,
+            "state": "open",
         }
         return member, other, expect
 
@@ -234,7 +235,8 @@ def test_the_investigation_page_names_its_campaign(client: TestClient) -> None:
     member, other, expect = _seed_member_and_other(client)
     res = client.get(f"/api/v1/investigations/{member}")
     assert res.status_code == 200, res.text
-    assert res.json()["campaign"] == expect
+    # The page also states the time of a decision in force (OW4): none here.
+    assert res.json()["campaign"] == {**expect, "decidedAt": None}
     res = client.get(f"/api/v1/investigations/{other}")
     assert res.status_code == 200, res.text
     assert res.json()["campaign"] is None
@@ -294,6 +296,7 @@ def test_a_hunt_finding_names_the_campaign_of_its_investigation(client: TestClie
             "stage": row.stage,
             "differs": False,
             "decision": None,
+            "state": "open",
         }
 
     member, expect = _do(client, work)
@@ -330,7 +333,15 @@ def test_a_withdrawn_campaign_gives_null_on_every_payload(client: TestClient) ->
 
 # ── The host page (S4) ─────────────────────────────────────────────────────
 
-HOST_KEYS = LINK_KEYS | {"role", "firstEvent", "lastEvent", "alerts"}
+HOST_KEYS = LINK_KEYS | {
+    "role",
+    "firstEvent",
+    "lastEvent",
+    "alerts",
+    "alertsReadAt",
+    "alertsBehind",
+    "lastActivity",
+}
 
 
 async def _stored_campaign(

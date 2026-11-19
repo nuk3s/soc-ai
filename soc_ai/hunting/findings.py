@@ -36,6 +36,7 @@ import re
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+from soc_ai.event_time import utc_text
 from soc_ai.hunting.execute import SpecRun
 from soc_ai.hunting.spec import HuntSpec
 
@@ -137,13 +138,18 @@ def restate_failure(text: str | None) -> str:
 
 
 def _title(spec: HuntSpec, scope_key: str) -> str:
-    """``<spec title> — <entity>``, both whole.
+    """``<spec title>: <entity>``, both whole.
 
     The entity is the most identifying part: two findings from the same spec are
     told apart only by it. A first version truncated the composed string, which
     cut ``localuser`` down to ``local`` and made the two indistinguishable.
+
+    The join was an em dash until round 3 part 2 (P5), and a stored title keeps
+    it. No reader splits a title on the join: the earlier-conclusions dedupe
+    (``earlier._title_key``) reads both forms as one key, and the finding
+    identity of the hunt page strips all punctuation.
     """
-    return f"{spec.title} — {scope_key}"
+    return f"{spec.title}: {scope_key}"
 
 
 def _sentence(spec: HuntSpec) -> str:
@@ -379,9 +385,10 @@ def candidate_findings(spec: HuntSpec, run: SpecRun) -> list[dict[str, Any]]:
         span = ""
         if candidate.first_seen and candidate.last_seen:
             span = (
-                f" The first is at {candidate.first_seen}. The last is at {candidate.last_seen}."
+                f" The first is at {utc_text(candidate.first_seen)}."
+                f" The last is at {utc_text(candidate.last_seen)}."
                 if candidate.first_seen != candidate.last_seen
-                else f" The match is at {candidate.first_seen}."
+                else f" The match is at {utc_text(candidate.first_seen)}."
             )
         quoted = detail_sentence(candidate.details)
         findings.append(

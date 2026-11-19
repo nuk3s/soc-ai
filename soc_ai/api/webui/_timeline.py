@@ -12,7 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from soc_ai.api.webui._campaign_link import CampaignLinkOut
+from soc_ai.api.webui._campaign_link import InvestigationCampaignOut
 from soc_ai.api.webui._event_timeline import EventTimelineOut
 from soc_ai.config import Settings
 from soc_ai.event_time import WAVE_GAP_SECONDS, as_utc, gap_words
@@ -125,6 +125,10 @@ _TL_SKIP = {
     # shows it, with the actor and the time.
     "action_dismissed",
     "action_restored",
+    # The analyst acknowledged or escalated from the card "No automatic
+    # action" (action_rules.SETTLED_EVENT). The parts of the true positives
+    # read it.
+    "analyst_settled",
     # The Oracle rule shadow ledger. It changes nothing on the run, and
     # Detection tuning shows the tally.
     "oracle_shadow",
@@ -636,7 +640,7 @@ def _prevalence_ste(args: dict[str, Any], r: dict[str, Any]) -> str | None:
     out = f"{who}{_times(total, 'event', 'events')} on {_times(days, 'day', 'days')}."
     first, last = _day(r.get("first_seen")), _day(r.get("last_seen"))
     if first and last:
-        out += f" The first event is on {first}. The last event is on {last}."
+        out += f" The first event is on {first} UTC. The last event is on {last} UTC."
     if r.get("rarity"):
         out += f" Rarity: {r['rarity']}."
     return out
@@ -1311,6 +1315,30 @@ def _detail_for(kind: str, p: dict[str, Any] | None, result: Any = None) -> str:
     return _compact(p)
 
 
+class RuleDecisionReceiptOut(BaseModel):
+    """The rule decision that carried out an acknowledge (round 3, RS6).
+
+    ``id`` is the id of the decision, ``at`` the ISO UTC time of the receipt,
+    and ``href`` the page of the rule.
+    """
+
+    id: int
+    at: str | None = None
+    href: str | None = None
+
+
+class RuleDecisionRefOut(BaseModel):
+    """The rule decision that waits for an open false positive (round 3, RS6).
+
+    ``href`` is the page of the rule, ``count`` the open false positives of
+    the rule, and ``group`` the group of this one: ``confident`` or ``weak``.
+    """
+
+    href: str
+    count: int
+    group: str
+
+
 class RecommendedActionOut(BaseModel):
     id: str
     title: str
@@ -1363,6 +1391,17 @@ class RecommendedActionOut(BaseModel):
     noteCode: str | None = None
     note: str | None = None
     noteHref: str | None = None
+    # True when the action waits for a person: the one rule of Needs you
+    # (:func:`soc_ai.api.webui.action_rules.run_requests` and
+    # :func:`~soc_ai.api.webui.action_rules.action_waits`). The run page
+    # counts these in "N actions wait for you", so the page states only work
+    # that Needs you lists. An open acknowledge of a false positive is no
+    # such action: the analyst may press it, and nothing waits on it.
+    waits: bool = False
+    # The rule decision whose receipt carried out this acknowledge, or null
+    # (round 3, RS6). The card reads "The analyst acknowledged this with the
+    # rule decision of {time}." with the link.
+    ruleDecisionReceipt: RuleDecisionReceiptOut | None = None
 
 
 # A verdict code as the words of a sentence: "set the verdict to false positive".
@@ -2273,11 +2312,17 @@ class InvestigationOut(BaseModel):
     # a revoke of the authorization the line names.
     outsideAuthorizedScope: str | None = None
     # The active campaign that this investigation is a member of, or null.
-    campaign: CampaignLinkOut | None = None
+    # It carries the time of a decision in force (OW4).
+    campaign: InvestigationCampaignOut | None = None
     # The one line of a clear from Needs you (`soc-ai needs-you clear`):
     # "Cleared from Needs you on {date} by {user}: {reason}." Null when no
     # clear stands. The verdict stays the verdict of the run.
     needsYouCleared: str | None = None
+    # The rule decision that waits for this investigation (round 3, RS6):
+    # null, or the page of its rule, the count of the open false positives of
+    # the rule and the group of this one, when this investigation is an open
+    # false positive (soc_ai.webui.rule_decisions).
+    ruleDecision: RuleDecisionRefOut | None = None
 
 
 def _host_contexts(profiles: Any) -> list[dict[str, Any]]:
@@ -2441,6 +2486,10 @@ def _executed_actions(events: list[Any]) -> dict[str, dict[str, Any]]:
 
 def _ack_pending_note(events: list[Any]) -> str | None:
     """Why a pending ack waits for a person while auto-ack is armed, or None."""
+    from soc_ai.webui.rule_decisions import (  # noqa: PLC0415 - lazy: that module reads this one
+        hold_label as _hold_label,
+    )
+
     # Auto-ack armed but held back? Explain the pending ack instead of leaving
     # the analyst to guess why THIS one needs a click.
     ack_pending_note: str | None = None
@@ -2449,10 +2498,10 @@ def _ack_pending_note(events: list[Any]) -> str | None:
             continue
         p = e.payload or {}
         if p.get("reason") == "high_stakes":
-            ack_pending_note = (
-                "An analyst acknowledges a high or critical alert. An analyst "
-                "acknowledges a malware or exploit alert."
-            )
+            # One hold, one reason: the label of every surface. The note
+            # listed two guard sentences, and the event does not say which
+            # arm held the alert (dogfood 2026-11-19, D8).
+            ack_pending_note = f"soc-ai holds this acknowledge. {_hold_label('high_stakes')}"
         elif p.get("reason") == "analyst_verdict":
             ack_pending_note = (
                 f"An analyst set this alert to {_verdict_words(p.get('analyst_verdict'))}. "
@@ -2617,7 +2666,10 @@ def _build_actions(
             for action in _build_actions(events, report, alert_acked=alert_acked)
         ]
     # Auto-ack fired successfully? Then any ack action is already done.
-    auto_acked = any(e.kind == "auto_ack" and (e.payload or {}).get("success") for e in events)
+    auto_acks = [
+        e.payload or {} for e in events if e.kind == "auto_ack" and (e.payload or {}).get("success")
+    ]
+    auto_acked = bool(auto_acks)
     executed = _executed_actions(events)
     dismissed = _dismissals(events)
     case_unknown = _escalate_done_with_no_case(executed)
@@ -2693,6 +2745,11 @@ def _build_actions(
         dis = (
             None if applied else (dismissed.get(_action_identity(a)) or dismissed.get(f"#idx:{i}"))
         )
+        receipt = None
+        if tn == "ack_alert" and applied:
+            receipt = _rule_receipt(exec_p, at) or (
+                _rule_receipt(auto_acks[-1], ran_at) if auto_acks and exec_p is None else None
+            )
         out.append(
             RecommendedActionOut(
                 id=f"a{i}",
@@ -2708,6 +2765,7 @@ def _build_actions(
                 dismissed=dis is not None,
                 dismissedBy=_str_or_none(dis.get("by")) if dis else None,
                 dismissedAt=_str_or_none(dis.get("at")) if dis else None,
+                ruleDecisionReceipt=receipt,
             )
         )
     return out
@@ -2715,6 +2773,21 @@ def _build_actions(
 
 def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _rule_receipt(payload: dict[str, Any] | None, at: str | None) -> RuleDecisionReceiptOut | None:
+    """The receipt of a rule decision in an ``action_executed`` or ``auto_ack`` payload, or None."""
+    if not payload:
+        return None
+    decision = payload.get("rule_decision")
+    if not isinstance(decision, int) or isinstance(decision, bool):
+        return None
+    key = _str_or_none(payload.get("rule_key"))
+    return RuleDecisionReceiptOut(
+        id=decision,
+        at=_str_or_none(payload.get("at")) or at,
+        href=f"/needs-you/rule/{key}" if key else None,
+    )
 
 
 # Sanitizer categories (soc_ai.oracle.sanitize) in the order they are read out,

@@ -10,7 +10,7 @@
 import { Activity as ActivityIcon, AlertTriangle, RotateCw, Share2, Users } from 'lucide-react';
 import { cn } from '../lib/cn';
 import type { ActivityState } from '../lib/hostActivity';
-import { absTime } from '../lib/timeRange';
+import { UtcTime } from './UtcTime';
 import type { HostActivity, HostActivityRange, VolumePoint } from '../lib/types';
 import { PeerGraph } from './PeerGraph';
 import { Panel, PanelHeader } from './Panel';
@@ -98,11 +98,11 @@ function VolumeChart({
         />
       </svg>
       <div className="mt-2 flex items-baseline justify-between gap-2 font-mono text-[11px] text-faint">
-        <span data-testid="volume-start">{absTime(first.ts)}</span>
+        <UtcTime testId="volume-start" iso={first.ts} />
         <span title="The bottom of the chart is zero. The top is the busiest interval.">
           peak {peak.toLocaleString()}
         </span>
-        <span data-testid="volume-end">{absTime(end)}</span>
+        <UtcTime testId="volume-end" iso={end} />
       </div>
       {/* The flow datasets behind the counts. The page never named them
           (dogfood 2026-10-19, R4-D21). */}
@@ -178,9 +178,7 @@ function UsersCard({
           <span className="flex-none font-mono text-[11px] text-faint" title="Authentication events">
             {user.events.toLocaleString()}
           </span>
-          <span className="flex-none font-mono text-[11px] text-faint">
-            {absTime(user.last_seen)}
-          </span>
+          <UtcTime className="flex-none font-mono text-[11px] text-faint" iso={user.last_seen} />
         </div>
       ))}
       {/* The server ranks by event count and cuts the list, and SAYS SO on the

@@ -12,6 +12,7 @@ The data is synthetic: placeholder addresses, names and rule names.
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import Iterator
 from datetime import timedelta
 from typing import Any
@@ -111,7 +112,13 @@ def test_a_stage_and_a_reopen_by_activity_raise_rows_and_a_person_raises_none(
     client.get("/api/v1/campaigns")
     titles = [r["title"] for r in _campaign_rows(client)]
     assert "The campaign actor-a against web-1 reached the stage Access." in titles
-    assert "A higher stage opened the campaign actor-a against web-1 again." in titles
+    # SD3: the row of the newest reopen states the count of the new investigations.
+    (reopen,) = [t for t in titles if t.startswith("A higher stage opened the campaign")]
+    assert reopen.startswith("A higher stage opened the campaign actor-a against web-1 again. ")
+    # W3: with the split of the verdicts.
+    assert re.search(
+        r" 1 new investigation since the close of \d{4}-\d{2}-\d{2}: 1 true positive\.$", reopen
+    )
     assert len(titles) == 3
     # An open again by an analyst, after a new close, raises no row.
     client.post(f"/api/v1/campaigns/{campaign_id}/close", json={"reason": "test_over"})

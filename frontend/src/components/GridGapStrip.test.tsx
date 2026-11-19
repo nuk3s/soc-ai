@@ -14,7 +14,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { getGridGaps } from '../lib/api';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 import type { GridGap, GridGaps } from '../lib/types';
 import { GridGapStrip, gapDuration, gapSentence, gapTime } from './GridGapStrip';
 
@@ -45,9 +45,10 @@ const SHORT: GridGap = {
 // V1-S5: the strip states the console's one absolute time, with its zone,
 // the time the Dashboard panels state. It read "Oct 18 14:00 UTC" beside
 // "2026-10-19 09:15 EDT". V1-S6: each line names the type of its gap.
-const T15 = absoluteTime('2026-10-15T13:36:00Z');
-const T19 = absoluteTime('2026-10-19T10:15:00Z');
-const T15B = absoluteTime('2026-10-15T14:21:00Z');
+// Round 3, T3: the one absolute time is UTC with the label.
+const T15 = '2026-10-15 13:36 UTC';
+const T19 = '2026-10-19 10:15 UTC';
+const T15B = '2026-10-15 14:21 UTC';
 const CLOSED_TEXT = `The grid was unreadable from ${T15} to ${T19} (93 h). Counts in this window are incomplete.`;
 const OPEN_TEXT = `The grid is unreadable since ${T15} (93 h so far). Counts in this window are incomplete.`;
 const SHORT_TEXT =
@@ -88,8 +89,8 @@ describe('the gap sentence', () => {
   });
 
   it('states a time in the console format with its zone', () => {
-    expect(gapTime('2026-03-05T04:07:00Z')).toBe(absoluteTime('2026-03-05T04:07:00Z'));
-    expect(gapTime('2026-03-05T04:07:00Z')).toMatch(/^2026-03-0[45] \d\d:\d\d \S+$/);
+    expect(gapTime('2026-03-05T04:07:00Z')).toBe(utcStamp('2026-03-05T04:07:00Z'));
+    expect(gapTime('2026-03-05T04:07:00Z')).toBe('2026-03-05 04:07 UTC');
   });
 
   it('names an open sweep gap and the plane it read', () => {

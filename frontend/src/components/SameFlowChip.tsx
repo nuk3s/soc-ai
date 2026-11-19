@@ -139,7 +139,7 @@ export function SameFlowChip({ verdict, siblings, count, partial = false, onShow
                     {s.verdict ? (
                       <VerdictPill verdict={s.verdict as Verdict} conf={s.conf} inherited={false} showConf={false} showInherited={false} />
                     ) : (
-                      <span className="flex-none font-mono text-[10.5px] text-danger">Pipeline error</span>
+                      <span className="flex-none font-mono text-[10.5px] text-danger">Failed</span>
                     )}
                     <button
                       type="button"

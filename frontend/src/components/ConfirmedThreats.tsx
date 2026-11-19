@@ -11,23 +11,26 @@ import {
   type ThreatTarget,
   getThreats,
 } from '../lib/api';
-import { moreWords } from '../lib/campaignWords';
+import { gridReadWords, lastActivityOf, moreWords, sinceThreatLine } from '../lib/campaignWords';
+import { earlierPartWords } from '../lib/truePositiveParts';
 import { stageColor } from '../lib/campaignViz';
 import { plural } from '../lib/plural';
-import { timeLabel, utcStamp, utcWindow } from '../lib/timeRange';
+import { timeLabel, utcStamp } from '../lib/timeRange';
 import {
   CHIP_IMPACT,
   DEFINE_CONFIRMED_THREATS,
   THREAT_ACTIONS_WAIT,
   THREAT_AUTHORIZED,
   THREAT_CAMPAIGN_AUTHORIZED,
+  THREAT_DECIDED,
   THREAT_OPEN,
 } from '../lib/tooltips';
 import { useAsync } from '../lib/useAsync';
-import { CampaignBeyondChip, CampaignDecisionChip, CampaignStatusChip, PartyLinks } from './campaign/shared';
+import { CampaignBeyondChip, CampaignStateChip, PartyLinks } from './campaign/shared';
 import { StageMeter } from './campaign/StageMeter';
 import { Panel, PanelHeader } from './Panel';
 import { LoadingInline, StaleNotice } from './States';
+import { UtcTime } from './UtcTime';
 
 // ---------------------------------------------------------------------------
 // Confirmed threats: is anything bad happening, on which host, how bad, and
@@ -140,14 +143,57 @@ export function authorizedLine(g: AuthorizedThreatGroup): string {
 
 /** The count of a campaign row: its alert events, or its true positive
  *  investigations when the campaign holds no stored events. */
-export function campaignCountWords(c: Pick<ThreatCampaign, 'alerts' | 'investigations'>): string {
+export function campaignCountWords(
+  c: Pick<ThreatCampaign, 'alerts' | 'investigations' | 'alertsBehind' | 'alertsReadAt'>,
+): string {
   return typeof c.alerts === 'number'
-    ? plural(c.alerts, 'alert')
+    ? `${plural(c.alerts, 'alert')}${gridReadWords(c)}`
     : plural(c.investigations, 'true positive investigation');
 }
 
 /** The plain label over the rows that are in no campaign. */
 export const OTHERS_LABEL = 'Not in a campaign';
+
+/** The count of the header and the tile: "12 true positives wait". */
+export function waitingWords(n: number): string {
+  return `${plural(n, 'true positive')} ${n === 1 ? 'waits' : 'wait'}`;
+}
+
+/** The count of the header and the tile with its split, when a campaign
+ *  with no decision holds some of the true positives that wait: "6 true
+ *  positives wait: 4 on their own, 2 in 1 campaign." Else `waitingWords`. */
+export function waitingSplitWords(
+  list: Pick<ThreatList, 'waiting' | 'total' | 'waitingInCampaigns' | 'waitingCampaigns'>,
+): string {
+  const n = waitingCount(list);
+  const inCampaigns = list.waitingInCampaigns ?? 0;
+  if (inCampaigns <= 0 || inCampaigns > n) return waitingWords(n);
+  const campaigns = Math.max(1, list.waitingCampaigns ?? 1);
+  return `${waitingWords(n)}: ${(n - inCampaigns).toLocaleString()} on their own, ${inCampaigns.toLocaleString()} in ${plural(campaigns, 'campaign')}.`;
+}
+
+/** The count that the header and the tile state: the true positives that
+ *  wait, or the total from an older server that sends no such count. */
+export function waitingCount(list: Pick<ThreatList, 'waiting' | 'total'>): number {
+  return typeof list.waiting === 'number' ? list.waiting : list.total;
+}
+
+/** The panel with no campaign and no row: nothing waits on the analyst. */
+export const NOTHING_WAITS = 'No confirmed threat waits for a decision.';
+
+/** The quiet line under the list: "Decided: 1 campaign with 12 true positive
+ *  investigations in this window." */
+export function decidedLine(d: { campaigns: number; investigations: number }): string {
+  return `Decided: ${plural(d.campaigns, 'campaign')} with ${plural(d.investigations, 'true positive investigation')} in this window.`;
+}
+
+/** The campaigns list with the filter of the decided campaigns. */
+export const DECIDED_CAMPAIGNS_HREF = '/campaigns?decision=decided';
+
+/** The link after the Decided line. The line counts the window, and the list
+ *  holds every decided campaign of any time, so the link says "all"
+ *  (dogfood 2026-11-17, N15). */
+export const DECIDED_LINK_WORDS = 'Open all decided campaigns.';
 
 // Only Succeeded and Attempted wear a color: the danger and the warning
 // tokens. Unknown and none read neutral, so red keeps one meaning.
@@ -248,7 +294,7 @@ function AuthorizedRunsLine({ row }: { row: ThreatRow }) {
 
 /**
  * One campaign of the window: the stage meter, the title as the link to the
- * campaign, Open or Ended, its decision state, the actors and the targets,
+ * campaign, its one state chip, the actors and the targets,
  * the alerts, the period,
  * and the investigations that wait on a decision or that an authorization
  * holds. The machine names are links of their own, so the row is no link.
@@ -272,8 +318,7 @@ export function ThreatCampaignRow({ c }: { c: ThreatCampaign }) {
           >
             {c.title}
           </Link>
-          <CampaignStatusChip status={c.status} />
-          <CampaignDecisionChip campaign={c} />
+          <CampaignStateChip campaign={c} />
           <CampaignBeyondChip beyond={c.beyond} />
         </span>
         <span data-testid="threat-campaign-parties" className="mt-1 block break-words text-[12.5px] text-text-2">
@@ -281,8 +326,15 @@ export function ThreatCampaignRow({ c }: { c: ThreatCampaign }) {
           {more && ` ${more}`}
         </span>
         <span data-testid="threat-campaign-meta" className="mt-1 block break-words text-[11.5px] text-faint">
-          {campaignCountWords(c)} · {utcWindow(c.firstEvent, c.lastEvent)}
+          {campaignCountWords(c)} · <UtcTime iso={c.firstEvent} to={lastActivityOf(c)} seconds={false} />
         </span>
+        {/* A campaign that opened again states it and the count of its new
+            investigations (SD3). */}
+        {c.sinceDecision && (
+          <span data-testid="threat-campaign-since" className="mt-1 block break-words text-[12px] font-semibold text-warn">
+            {sinceThreatLine(c.sinceDecision)}
+          </span>
+        )}
       </span>
       {/* The campaign waits, and its investigations do not: the decision
           chip states it. The count of the investigations that wait can no
@@ -352,7 +404,7 @@ export function ConfirmedThreats({
           right={
             list ? (
               <span data-testid="confirmed-threats-total" className="text-[11.5px] text-faint">
-                {plural(list.total, 'true positive')}
+                {typeof list.waiting === 'number' ? waitingSplitWords(list) : plural(list.total, 'true positive')}
               </span>
             ) : undefined
           }
@@ -394,9 +446,11 @@ export function ConfirmedThreats({
             {list.rows.length === 0 ? (
               campaigns.length > 0 ? null : (
               <div data-testid="confirmed-threats-empty" className="px-[15px] py-3 text-[12.5px] text-dim">
-                {list.authorized.length > 0
-                  ? `No confirmed threat outside authorized activity in the ${windowLabel}.`
-                  : `No confirmed threat in the ${windowLabel}.`}
+                {list.decided
+                  ? NOTHING_WAITS
+                  : list.authorized.length > 0
+                    ? `No confirmed threat outside authorized activity in the ${windowLabel}.`
+                    : `No confirmed threat in the ${windowLabel}.`}
               </div>
               )
             ) : (
@@ -439,6 +493,28 @@ export function ConfirmedThreats({
                   </li>
                 ))}
               </ul>
+            )}
+            {/* The decided campaigns left the red list. One quiet line counts
+                them and opens the campaigns list with their filter. */}
+            {/* The true positives that the earlier decision of a reopened
+                campaign covered: they left the count that waits (W2). */}
+            {(list.earlier?.investigations ?? 0) > 0 && list.earlier && (
+              <p data-testid="threat-earlier" className="px-[15px] pb-1.5 text-[12px] text-faint">
+                {earlierPartWords(list.earlier)}
+              </p>
+            )}
+            {(list.decided?.investigations ?? 0) > 0 && list.decided && (
+              <p className={`px-[15px] pb-3 text-[12px] text-faint ${list.rows.length || campaigns.length || list.authorized.length ? '' : '-mt-1'}`}>
+                <span data-testid="threat-decided">{decidedLine(list.decided)}</span>{' '}
+                <Link
+                  data-testid="threat-decided-link"
+                  to={DECIDED_CAMPAIGNS_HREF}
+                  title={THREAT_DECIDED}
+                  className="text-text-2 hover:underline"
+                >
+                  {DECIDED_LINK_WORDS}
+                </Link>
+              </p>
             )}
           </>
         )}

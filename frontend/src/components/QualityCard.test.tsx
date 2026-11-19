@@ -5,7 +5,7 @@
 import { fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { QualityFreshness, QualityPoint } from '../lib/api';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 import {
   QualityCard,
   alarmBanner,
@@ -284,7 +284,7 @@ describe('alarmBanner', () => {
     ]);
     expect(b?.ongoing).toBe(true);
     expect(b?.runs).toBe(2);
-    expect(b?.headline).toBe(`Regression alarm, ongoing since ${absoluteTime(T2)}, 2 runs`);
+    expect(b?.headline).toBe(`Regression alarm, ongoing since ${utcStamp(T2)}, 2 runs`);
   });
 
   it('reads NEW on the run that raised the alarm (alarm_since === ts)', () => {
@@ -538,7 +538,7 @@ describe('QualityCard', () => {
       />,
     );
     expect(
-      screen.getByText(`Regression alarm, ongoing since ${absoluteTime(T2)}, 2 runs`),
+      screen.getByText(`Regression alarm, ongoing since ${utcStamp(T2)}, 2 runs`),
     ).toBeInTheDocument();
     expect(screen.queryByText('The last run raised the regression alarm.')).toBeNull();
   });

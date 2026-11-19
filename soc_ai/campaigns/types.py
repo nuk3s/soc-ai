@@ -196,6 +196,14 @@ class RunFacts:
     # finding run only. A finding that cites summary queries gives its run no
     # record between two machines, and these names are then what it states.
     named_machines: tuple[str, ...] = ()
+    # The end of the activity of the run, or None (round 4, E3). The rebuild
+    # sets it for a true positive member of an active campaign: the last
+    # alert event of a confirmed rule between its two machines that the
+    # stored grid read of the campaign holds, when that is later than the
+    # event time. A later alert takes its verdict from the run and gets no
+    # investigation of its own. A fact of the grid read, so the stored facts
+    # of the run do not hold it (:meth:`to_json`).
+    active_until: datetime | None = None
 
     @property
     def is_true_positive(self) -> bool:
@@ -235,6 +243,7 @@ class RunFacts:
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = jsonable(self)
+        out.pop("active_until", None)
         return out
 
     @classmethod
@@ -435,6 +444,20 @@ class CampaignDraft:
     @property
     def run_ids(self) -> tuple[str, ...]:
         return tuple(m.run.run_id for m in self.members)
+
+    @property
+    def active_until(self) -> datetime:
+        """The end of the activity of the campaign: the last event, or a later end of activity.
+
+        The later end is the :attr:`RunFacts.active_until` of a true positive
+        member (round 4, E3).
+        """
+        ends = [
+            m.run.active_until
+            for m in self.members
+            if not m.verdict_differs and m.run.active_until is not None
+        ]
+        return max([self.last_event, *ends])
 
     @property
     def beyond_runs(self) -> int:

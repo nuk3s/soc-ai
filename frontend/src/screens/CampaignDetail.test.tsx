@@ -81,7 +81,7 @@ describe('CampaignDetail', () => {
     expect(await screen.findByRole('heading', { name: 'actor-a against web-1' })).toBeInTheDocument();
     expect(getCampaign).toHaveBeenCalledWith(7);
     const header = screen.getByTestId('campaign-header');
-    expect(within(header).getByTestId('campaign-status')).toHaveTextContent('Open');
+    expect(within(header).getByTestId('campaign-state')).toHaveTextContent('Open');
     const stage = within(header).getByTestId('campaign-stage');
     expect(stage).toHaveTextContent('Action on the target');
     // The dot of the chip wears the color of the stage on the graphics.
@@ -106,7 +106,7 @@ describe('CampaignDetail', () => {
     mount();
     const facts = await screen.findByTestId('campaign-facts');
     expect(facts).toHaveTextContent(
-      '47 alerts of 3 rules. 1 hunt finding. 1,840 grid records between the machines.',
+      '47 alerts of 3 confirmed rules. soc-ai did not confirm 12 alerts of 2 other rules. 1 hunt finding. 1,840 grid records between the machines.',
     );
     expect(
       screen.getByTestId('campaign-bottom-line').compareDocumentPosition(facts) & Node.DOCUMENT_POSITION_FOLLOWING,
@@ -133,7 +133,8 @@ describe('CampaignDetail', () => {
     const lines = within(list).getAllByRole('listitem');
     expect(lines).toHaveLength(2);
     expect(lines[0]).toHaveTextContent(
-      'The authorization Red team test covers 3 of the 5 investigations. It expires 2026-11-20 09:00 UTC.',
+      // Four investigations: the fold "Investigations" leaves out the member whose verdict differs.
+      'The authorization Red team test covers 3 of the 4 investigations. It expires 2026-11-20 09:00 UTC.',
     );
     expect(lines[1]).toHaveTextContent('The authorization Old test is revoked.');
     // Each line has its shield icon, and the lines follow the bottom line.
@@ -177,8 +178,8 @@ describe('CampaignDetail', () => {
     mount();
     await screen.findByTestId('campaign-header');
     const counts: [string, string, string | null][] = [
-      // Five distinct rule names between actor-a and web-1.
-      ['Alerts', 'fold-alerts', '5'],
+      // The fold of the alerts names its two counts in words (G5).
+      ['Alerts', 'fold-alerts', null],
       ['Findings', 'fold-findings', '1'],
       ['Machines', 'fold-machines', '3'],
       // One investigation that needs more info, one session and one named host. The
@@ -197,6 +198,10 @@ describe('CampaignDetail', () => {
       if (count === null) expect(within(f).queryByTestId(`${testId}-count`)).toBeNull();
       else expect(within(f).getByTestId(`${testId}-count`)).toHaveTextContent(count);
     }
+    // Five distinct rule names between actor-a and web-1: three confirmed, two other.
+    expect(within(fold('Alerts')).getByTestId('fold-alerts-detail')).toHaveTextContent(
+      '3 confirmed rules, 2 other rules',
+    );
     // NEGATIVE CONTROL: a closed fold holds no table.
     expect(screen.queryByTestId('campaign-members')).toBeNull();
     expect(screen.queryByTestId('campaign-parties')).toBeNull();
@@ -235,7 +240,9 @@ describe('CampaignDetail', () => {
     mount();
     await screen.findByTestId('campaign-header');
     // Six distinct rule names: one rule is in both pairs.
-    expect(within(fold('Alerts')).getByTestId('fold-alerts-count')).toHaveTextContent('6');
+    expect(within(fold('Alerts')).getByTestId('fold-alerts-detail')).toHaveTextContent(
+      '3 confirmed rules, 3 other rules',
+    );
     const table = within(openFold('Alerts')).getByTestId('campaign-alerts');
     const head = within(table).getAllByRole('columnheader').map((h) => h.textContent);
     expect(head).toEqual(['Rule', 'Alerts', 'From', 'To', 'First', 'Last', 'soc-ai verdict']);
@@ -353,7 +360,7 @@ describe('CampaignDetail', () => {
     expect(within(session).queryByTestId('impact-chip')).toBeNull();
     expect(within(session).getByTestId('member-stage').textContent).toBe('');
     expect(within(session).getByTestId('member-link-sentence')).toHaveTextContent(
-      'This investigation shares the connection 1:abc= with the investigation "ET EXPLOIT PHP file upload".',
+      'This investigation shares a connection with the investigation "ET EXPLOIT PHP file upload".',
     );
 
     // A finding links to its investigation and to its hunt.
@@ -625,7 +632,7 @@ describe('CampaignDetail', () => {
     const merged = await screen.findByTestId('campaign-merged');
     expect(merged).toHaveTextContent('This campaign is part of campaign 3.');
     expect(within(merged).getByRole('link', { name: 'campaign 3' })).toHaveAttribute('href', '/campaigns/3');
-    expect(screen.getByTestId('campaign-status')).toHaveTextContent('Merged');
+    expect(screen.getByTestId('campaign-state')).toHaveTextContent('Merged');
     // A merged campaign has empty lists. The page shows no graphic and no fold.
     expect(screen.queryByTestId('stage-ladder')).toBeNull();
     expect(screen.queryByTestId('attack-graph')).toBeNull();

@@ -560,21 +560,25 @@ A lead of a campaign follows its campaign. See
 
 ## Leads and hunts of a campaign
 
-A lead of a campaign is a lead whose observations are all alert observations of investigations
-that one campaign holds. The step after each rebuild finds these leads from the stored rows. It
-writes the campaign id on the lead. The refresh loop runs the step again on each wake. A write of
-another process then reaches the leads too.
+A lead of a campaign is a lead whose every observation that counts maps to a true positive
+investigation of one campaign. A dismissed observation does not count. Two types of observation
+map. An alert observation maps through the alert of an alert investigation. The observation of a
+promoted hunt finding maps through the finding investigation of that finding. The step after each
+rebuild finds these leads from the stored rows. The step writes the campaign id on the lead. The
+refresh loop runs the step again on each wake. A write of another process then reaches the leads
+too.
 
 A lead of a campaign waits on its campaign. It is no item of Needs you, it is not on the Needs
 decision tab, and it raises no bell row. It never reads "hunt queued". `GET /leads/count` counts
 it in `in_campaign`, and the In progress tab leaves it out. The lead page names its campaign.
 
-A lead keeps normal handling when one of its observations is of another type. It also keeps normal
-handling when one of its observations is of an investigation that the campaign does not hold.
-soc-ai reads this rule again on each read. A lead also returns to normal handling when its
-campaign is withdrawn, and when its investigation is beyond an authorization. The campaign page
-lists such a lead under "Related, not proven" when two facts hold. The lead names a machine of the
-campaign, and one of its observations is in the period of the campaign.
+A lead keeps normal handling when one observation of the lead is of another type. A lead also
+keeps normal handling when one observation maps to an investigation that the campaign does not
+hold, or to a finding with no investigation. soc-ai reads this rule again on each read. A lead also
+returns to normal handling when the campaign is withdrawn, and when the investigation of the lead
+is beyond an authorization. The campaign page lists such a lead under "Related, not proven" when
+two facts hold. The lead names a machine of the campaign, and one observation of the lead is in the
+period of the campaign.
 
 **One hunt a day.** soc-ai starts at most one hunt for one campaign in 24 hours. The limit reads
 the hunt rows of any status and of any starter, so it holds after a restart. A hunt of a merged
@@ -619,24 +623,29 @@ own observation. The dismiss form does not offer the two reasons.
 **The payloads.** `LeadOut.campaign`, `HuntOut.campaign` and the `campaign` of a hunt list row hold
 the campaign link. `CampaignOut.leads` lists the leads of the campaign and the related leads. Each
 row holds `id`, `title`, `state`, `hunted` and `related`. `CampaignOut.hunts` lists the 20 newest
-hunts for the campaign. Each row holds `id`, `starter`, `status`, `startedAt`, `findings` and
-`threatFindings`.
+hunts for the campaign. Each row holds `id`, `starter`, `status`, `startedAt`, `findings`,
+`threatFindings`, `answer` and `steps`. `answer` is `new_activity`, `continues` or `no_new_event`
+for a hunt that read the campaign, else null. `steps` counts the steps of a hunt that stopped, else
+null. `CampaignOut.answers` lists the answers of at most 20 hunts that read the campaign, the newest
+hunt first.
 
 ## Hunt outcomes
 
-A lead settles when its hunt finishes. What the hunt found decides where the lead goes.
+A lead settles when the lead hunt finishes. Only the lead hunt closes a lead. What the hunt found
+decides where the lead goes.
 
 - The hunt found **no threat**. soc-ai closes the lead with the reason `hunt_clean`. The lead moves
-  to the Closed tab and reads "Closed. The hunt found no threat.", with the chip "closed by soc-ai".
-  No analyst chose a reason, so the lead quality report counts it separately from your dismissals.
-  soc-ai closes the lead only if the hunt read its evidence. A grid failure keeps the lead open:
-  the grid did not answer a tool call, and no later call of that tool got an answer. A grid failure
-  beside a visibility gap finding keeps it open too. A degraded run, a run error and a report from
-  the budget synthesizer keep it open. A query error does not: the model wrote a wrong query, and
-  the grid lost nothing. A visibility gap finding with no grid failure does not: it states a
-  standing fact, such as a host with no agent. An earlier hunt on the same lead with a threat
-  finding keeps the lead open. A finding that linked this lead to other leads keeps it open. A
-  true-positive alert that joined the lead after the hunt started keeps it open. The lead then waits
+  to the Closed tab and reads "Closed. The lead hunt found no threat.", with the chip "closed by
+  soc-ai". No analyst chose a reason, so the lead quality report counts such a close apart from the
+  dismissals of the analyst. soc-ai closes the lead only if the hunt read the evidence of the lead.
+  A grid failure keeps the lead open: the grid did not answer a tool call, and no later call of that
+  tool got an answer. A grid failure beside a visibility gap finding keeps the lead open too. A
+  degraded hunt, a hunt error and a report from the budget synthesizer keep the lead open. A query
+  error does not: the model wrote a wrong query, and the grid lost nothing. A visibility gap finding
+  with no grid failure does not: the finding states a standing fact, such as a host with no agent.
+  An earlier hunt on the same lead with a threat finding keeps the lead open. A finding that linked
+  this lead to other leads keeps the lead open. A true-positive alert that joined the lead after the
+  hunt started keeps the lead open. The lead then waits
   under Needs decision. The lead page and the lead row state the cause in one sentence, such as
   "The grid did not answer a query of the hunt. The hunt did not get that answer later.", "An
   earlier hunt found a threat." or "The hunt linked this lead to other leads."
@@ -646,6 +655,18 @@ A lead settles when its hunt finishes. What the hunt found decides where the lea
 - The hunt **could not run**: an error, a cancel, an interrupted process, or a query that failed.
   The lead returns to open and keeps the hunt. The loop starts one more hunt. If that one cannot
   run either, the lead waits on you as "Hunted · Could not run" and offers Hunt again.
+
+A grid failure is a tool result with the reason `grid_unavailable`. The grid refused the
+connection, ran out of time, or answered from part of the shards because a shard or a node failed.
+A query that the grid rejected is a query error with the reason `query_rejected`. The grid is up,
+and the shards that map a field rejected the query because the query is wrong for the type of the
+field. The tool result holds the reason text of Elasticsearch and a hint. The result is unknown, so
+the model corrects the query and sends the query again. A hunt does not count a rejected query as
+a grid failure, and a rejected query keeps no lead open. A console route that runs an analyst
+query answers 400 `query_rejected` with the reason. A hint comes before the reason when soc-ai
+has a hint for the reason. Before the search, the query tool of the model writes a wildcard of
+whole octets on an IP field as a CIDR. The query tool writes a time with a space on a date field as
+ISO 8601 in UTC. The tool result states each rewrite. An analyst query gets no rewrite.
 
 **Hunt again** starts a second hunt, and the lead then points at it. While the attached hunt
 still runs, the button opens that hunt. A lead the hunt closed offers Reopen only. Reopen
@@ -1036,9 +1057,11 @@ each campaign continues or shows no new event.
 
 The records block and the campaign blocks state each record one time. A true positive, a finding
 or a lead that a campaign block states leaves the three lists of the records block. A lead of a
-campaign is a lead whose every live observation is the alert observation of an investigation of
-that campaign. The all-clear check above still reads every true positive of the window. A hunt
-with no records block reads the true positives of its campaign blocks in its window. The
+campaign is a lead whose every live observation maps to a true positive investigation of that
+campaign. See [Leads and hunts of a campaign](#leads-and-hunts-of-a-campaign) for the two types of
+observation that map. The all-clear check above still reads every true positive of the window. A
+hunt with no records block reads the true positives of the campaign blocks in the window of the
+hunt. The
 authorized activity block lists a campaign record only when no campaign block states that
 campaign.
 
@@ -1047,6 +1070,21 @@ the redaction cannot remove is dropped, and the hunt starts without it. A droppe
 nothing, so its records stay in the records block. The Objective step shows the blocks that the
 hunt read, or states that a block was dropped. The started event of the hunt stores the text of
 the blocks in `campaigns` and the ids of their campaigns in `campaign_ids`.
+
+A complete hunt records one answer for each campaign whose block the hunt read, and for each open
+lead that the hunt read. A hunt that did not end complete, a degraded hunt and an evaluation hunt
+record no answer. The answer comes from stored facts. No text of the model goes into the answer. The
+answer `new_activity` means that a threat finding names a machine of the campaign or the lead, and
+no campaign holds that finding as a repeat. The answer `continues` means that a finding of the hunt
+repeats the known activity of the campaign. Every other answer is `no_new_event`. A lead hunt
+records no answer for the lead of the hunt, because the settle rule of that lead answers for the
+lead. Only the lead hunt closes a lead. Another hunt that reads the lead records an answer and
+closes no lead.
+
+The campaign page states the newest answer under the bottom line, and the timeline marks the
+answer. The fold "Leads and hunts" lists each hunt with the answer. The lead page states the newest
+answer and lists the other hunts that read the lead. At the start, soc-ai records the answers of
+the hunts of the last 30 days that have no answer. Migration 0074 adds the table `hunt_answers`.
 
 ## Campaigns
 
@@ -1070,6 +1108,13 @@ positive with the impact `none` starts no campaign. Such an investigation can jo
 **The links.** An investigation joins a campaign when one link holds between it and an
 investigation of the campaign. The horizon is the decay horizon of a lead, 207 hours. The gap is
 the wave gap, 30 minutes.
+
+Each horizon check measures the time between two activities. The activity of an investigation
+starts at the event time of the investigation. The activity of a true positive investigation of an
+active campaign can go on. That activity then ends at the last alert of a confirmed rule between
+the two machines of the investigation. The stored grid read of the campaign gives that time. The
+check measures from the end of the earlier activity to the event time of the later investigation.
+So a new attack of an actor joins the campaign that the later alerts of that actor keep open.
 
 The table names each link by its engine name. The console shows the label of the last column.
 
@@ -1110,27 +1155,63 @@ stage of the campaign is the highest stage that an investigation proves.
 A finding investigation states its stage in the report field `stage`. A stage above `attempt`
 stands only with the impact `succeeded`. An alert investigation stores no stage.
 
+**The end.** An active campaign is open until one horizon after the last activity of the campaign.
+Then the campaign ends. The last activity is the later of the last investigation event and the last
+alert of a confirmed rule between the machines of the campaign. soc-ai starts no investigation for
+such an alert. The alert takes the verdict of an earlier investigation. An acknowledged alert
+counts. An alert of a rule that soc-ai did not confirm does not count. A grid read gives the time
+of the last alert. With no grid read, a campaign ends one horizon after the last investigation
+event. Each page states the period of the campaign to the last activity, also for an ended
+campaign.
+
+A grid read can end before the horizon after the last activity. So each ended campaign gets one
+more grid read, the end check. The check reads the alerts of the confirmed rules after the last
+activity, for one horizon or until now. A found alert moves the last activity. The campaign is open
+again when that alert is less than one horizon old. Else the next wake checks the next horizon.
+With no alert the campaign stays ended, and soc-ai reads no more for the end. An alert more than
+one horizon after the last activity does not open the campaign. The refresh loop makes the end
+checks after the other reads, the oldest end first. A grid that does not answer changes nothing,
+and the next wake tries again. A campaign that ended by the rule of an earlier release gets the
+same check.
+
 **The events.** The page counts events, because one investigation can stand for many alerts. The
 detail route reads the grid for the alert events between each pair of machines of the campaign.
 A record is between two machines when its `source.ip` and `destination.ip` hold their addresses. A
 Sigma alert of Security Onion holds its matched record under `event_data`. The read also matches
-the addresses `event_data.source.ip` and `event_data.destination.ip`. The read starts 30 minutes before the first event and ends 30 minutes after the last event. A
+the addresses `event_data.source.ip` and `event_data.destination.ip`. The read starts 30 minutes
+before the first event. For an open campaign the read ends at the time of the read. For an ended
+campaign the read ends 30 minutes after the last event. A
 confirmed rule of a pair is a rule that a true positive investigation of the campaign holds between
 the two machines. The alert count of a pair counts the alerts of its confirmed rules. The page
 lists each other rule with its own count. Such a rule takes the verdict of its standing
 investigations between the two machines: false positive, needs more info, or not judged. The
 timeline counts the alerts of the confirmed rules. The route reads the grid again for a new pair,
 a new confirmed rule or a new window. It also reads again every 15 minutes while the campaign is
-open. An ended campaign does not read the grid again, because the grid forgets old records. When no
+open. An ended campaign does not read the events again, because the grid forgets old records. The
+end check of an ended campaign reads only the time of the last alert. When no
 grid read stored events, the page counts the alert documents that the investigations hold. The
 field `events.source` then reads `stored`.
+
+**The later alerts.** A later alert of a confirmed rule between the same machines takes the verdict
+of an earlier investigation. soc-ai starts no investigation for the later alert. The stored read
+holds the time of the last alert event of a confirmed rule. Each page states the span of the
+campaign to the later of that time and the last investigation event. The same read counts the
+later alert events: the alert events of the confirmed rules after the newest investigation event,
+or after the boundary of a decision when that is later. The banner of a reopened campaign, the
+Needs you row of the campaign and the hunt answer line state the later alert events. The refresh
+loop reads each open campaign whose read is older than 15 minutes. The loop reads at most 5
+campaigns on each wake, inside the time budget of the loop. The end checks count against the
+same 5 reads.
 
 **The page.** The page opens with the bottom line, which code writes from the parties, the period
 and the stage. The authorizations that the investigations match are lines under the bottom line.
 Three graphics follow, and they use one color for each stage:
 
-- The stage ladder shows the five stages in one row. A reached stage states its first time, what
-  happened, and the record that proves it.
+- The stage ladder shows the five stages in one row. A reached stage states the first time, what
+  happened, and the record that proves the stage. An action on a target needs access to that
+  target, and so does a target that acts. When such a stage has earlier proof than the access, the
+  Access step states that time with the word "by", and names the stage that gives that time. An
+  Access step with no direct proof then wears a ring in the color of the Access stage.
 - The attack graph shows the actors on the left and the targets to the right of them. A third
   column holds the targets that a target acted on. An arrow states the alert events from one
   machine to another, and its color states the highest stage. A dashed line is a session between
@@ -1139,21 +1220,28 @@ Three graphics follow, and they use one color for each stage:
   confirmed rules. A drag across the timeline zooms in.
 
 A click on a machine or an arrow opens the Alerts table for that selection. A click on a mark of
-the timeline opens the Investigations table for that time. Seven folds under the graphics hold the
-tables, and each fold starts closed:
+the timeline opens the Investigations table for that time. The folds under the graphics hold the
+tables. A fold shows only when the fold has content. Each fold starts closed, except "Activity
+beyond the authorization":
 
-- Alerts lists each rule between two machines with its alert events, its first and last time, and
-  the verdict of soc-ai.
+- "Activity beyond the authorization" lists each investigation beyond the authorization, with the
+  reason.
+- Alerts lists each rule between two machines with the alert events of the rule, the first and the
+  last time, and the verdict of soc-ai.
 - Findings lists the true positive hunt findings of the campaign.
+- "Leads and hunts" lists the leads of the campaign, the related leads and the hunts that read the
+  campaign. Each hunt states the answer of the hunt for the campaign.
 - Machines lists the actors and the targets.
 - "Related, not proven" lists what the engine did not include: investigations between two machines
   that need more info, and documents between two machines on a port that no alert of the campaign
   is on.
 - "Verdicts that differ" lists each investigation with another verdict on a session of the
-  campaign. Its verdict does not change.
+  campaign. The verdict of such an investigation does not change.
 - "Detection record" states the tier that saw each stage first.
-- Investigations lists the investigations of soc-ai, each with the link that joined it and the
-  evidence of that link.
+- Investigations lists the investigations of soc-ai, each with the link that joined the
+  investigation and the evidence of that link.
+- Excluded lists the investigations that an analyst took out of the campaign.
+- Changes lists the changes of the campaign.
 
 **The engine.** The engine reads the store only. soc-ai rebuilds the campaigns in the
 background, with no page read. A rebuild starts about 2 seconds after an investigation ends with a
@@ -1175,10 +1263,14 @@ investigation in the campaign.
 - The Alerts view marks a group when the investigation of its verdict is in a campaign.
 - The page of a hunt marks a finding when its investigation is in a campaign.
 - The host page lists the campaigns of the machine, with its role: actor, target, or both.
-- The Confirmed threats panel lists the campaigns of its window first. Each campaign states its
-  true positive investigations and the investigations that an authorization holds. The other rows
-  of the panel hold no investigation of a listed campaign. The total of the panel still counts
-  them.
+- The Confirmed threats panel first lists each campaign of the window with a true positive that
+  waits. Each campaign states the true positive investigations and the investigations that an
+  authorization holds. The other rows of the panel hold no investigation of a listed campaign. A
+  campaign with a decision in force leaves the list. A decided campaign with an investigation
+  beyond the authorization stays. One line under the list counts the decided campaigns, for
+  example "Decided: 1 campaign with 12 true positive investigations in this window." The link
+  "Open all decided campaigns." opens the campaigns list with the filter "Decided". The header of
+  the panel states the count of the true positives that wait.
 
 An investigation with another verdict on a session of a campaign has the same mark. The mark then
 states that the verdict differs.
@@ -1209,9 +1301,33 @@ close a campaign and open it again. The read-only demo refuses both.
 - A close covers only the past. soc-ai stores the last event, the stage and the machines that the
   close covered. A rebuild opens the campaign again when the campaign has a later event, a higher
   stage or a new machine. A Re-run of an old investigation with the same event time does not.
+- A close of an open campaign covers the alert events of the grid read that the page states. The
+  basis stores the end of that read as the last event. The acknowledgement takes no alert after
+  that time.
+- The refresh loop opens a closed campaign again when the activity of the campaign goes on with no
+  new investigation. The cause is `activity`. The grid must hold an open alert event of a confirmed
+  rule between the machines of the basis, after the basis. An acknowledged alert, an alert of
+  another rule and an alert before the basis open nothing. With the grid down nothing opens. An
+  ended campaign reads nothing here. When the end check of the campaign finds a later alert, the
+  campaign is open again, and this step reads the campaign.
 - "Open again" clears the decision. The audit record is `campaign_reopened`. An authorized
   campaign does not open again this way. Revoke its authorization.
 - A merged campaign passes no decision to the campaign that takes its investigations.
+
+**A campaign that opens again.** Each change that opens a campaign again keeps the earlier
+decision on record: the decision, the reason, the note, the analyst, the time and the basis. A
+rebuild, the refresh loop, "Open again" and a revoke write that record. The boundary is the last
+event of the basis, else the time of the decision. An investigation is new when the event of the
+investigation is after the boundary. The time of the investigation does not count. The banner of
+the campaign page carries the chip "Opened again". The banner states the earlier decision and the
+new investigations: the count for each verdict, the machines, the span of the events, the count
+that an authorization holds and a higher stage. The Needs you row, the Confirmed threats row and
+the bell read the same facts. "Show the new investigations" shows only the new investigations,
+and each new investigation carries the chip "New". The timeline marks the span after the boundary.
+
+A true positive of a campaign that soc-ai opened again does not wait when the event is not after
+the boundary. The earlier decision covers that true positive. After "Open again" by the analyst and
+after a revoke, each true positive of the campaign waits again.
 
 **The authorization.** An admin records the activity of a campaign as authorized. The record lists
 the machines of the campaign, each an actor or a target. It has a label, a note and an expiry. It
@@ -1326,14 +1442,22 @@ revoke, the exclusion, the inclusion and the record of the case. The campaign pa
 rebuild after the upgrade records no change for a campaign that exists.
 
 **Needs you.** Each active campaign with no decision is one item of Needs you, at any age. An
-investigation that a campaign holds is no item of its own, and no action of it waits. Its actions
-stay executable, except its Escalate, and the card names the campaign. An investigation in no campaign keeps its own
-item. An investigation whose verdict differs keeps its own item too. An authorized campaign holds
-only its inside investigations. An investigation beyond the authorization keeps its own item, and
-its item states "Beyond the authorization of the campaign" first. A verdict that needs more info
-and a waiting action stay in Needs you until a person decides. `GET /api/v1/needs-you/items` lists
-every item, the oldest first. One item holds the alert groups with no verdict. The `total` of the
-list counts each alert group, so it equals `decisions` of `GET /needs-you`.
+investigation that a campaign holds is no separate item, and no action of that investigation
+waits. The actions of such an investigation stay executable, except the Escalate, and the card
+names the campaign. An investigation in no campaign keeps a separate item. An investigation whose
+verdict differs keeps a separate item too. An authorized campaign holds only the inside
+investigations. An investigation beyond the authorization keeps a separate item. That item states
+"Beyond the authorization of the campaign" first. A verdict that needs more info and a waiting
+action stay in Needs you until a person decides. `GET /api/v1/needs-you/items` lists every item,
+the most important first: the campaigns, the true positive investigations, the leads, the other
+investigations, the rules with open false positives, then the alert groups. Inside each group the
+impact, the severity and the newest event decide. Inside the group of the rules, the count of the
+group `confident` decides first, then the newest event. Each item states the verdict, the
+confidence, the impact, the severity, at most three machines and the time of the newest event.
+Each item also states why the item waits, and the action that waits with what the action writes. A
+value that soc-ai does not hold is null. Each rule with open false positives is one item. One item
+holds the alert groups with no verdict. The `total` of the list counts each rule and each alert
+group, so the `total` equals `decisions` of `GET /needs-you`.
 
 **The bell.** Each change of the last 24 hours is one bell row in the tier of the true positives: a
 new campaign, a higher stage, a new machine, an open again after new activity, and each
@@ -1345,8 +1469,6 @@ investigation that a campaign holds does not show. The row of the campaign speak
 **The limits.** A true positive with an external source forms no campaign: such a source has no
 machine key. The waves come from the event times
 of the investigations. The grid read covers the 20 pairs of machines with the most investigations.
-It finds an alert by its top-level `source.ip` and `destination.ip`. A Sigma alert that holds its
-addresses only under `event_data` does not count in the grid read.
 
 ## The Hunts page
 
@@ -1432,8 +1554,8 @@ Each tab states its count. The counts of the first four tabs sum to the count of
 prints one more count, as in "2 new leads wait on auto-hunt. The All tab lists them."
 
 Every row carries a state pill: `New`, `In progress`, `Hunted · <outcome>`, `Dismissed`,
-`Closed. The hunt found no threat.`, `Promoted`, `Fleet condition`. A new lead whose hunt the loop
-has taken reads `New · hunt queued`. A lead whose loop hunt could not run twice reads
+`Closed. The lead hunt found no threat.`, `Promoted`, `Fleet condition`. A new lead whose hunt the
+loop has taken reads `New · hunt queued`. A lead whose loop hunt could not run twice reads
 `Hunted · Could not run`. The pill is the state. The tab is a filter.
 
 Every row prints the hunt result on its own line: "found a threat", "found no threat", "hunt
@@ -1511,8 +1633,9 @@ Keep open. Keep open answers the verdict of one investigation on one lead.
 
 ### 4. Hunts
 
-The list of agent runs, with a Started-by column that reads Manual, Schedule or Lead. The objective
-of a lead hunt links to the lead. Scheduled hunts sit under the list. The catalog sweep adds no
+The list of agent runs. The type chips include "Manual", "Schedule", "Lead" and "Campaign". The
+Started by column names the analyst, "schedule", "campaign" or "lead N", and "lead N" links to the
+lead. The objective links to the hunt. Scheduled hunts sit under the list. The catalog sweep adds no
 entry here, so this list holds agent runs only.
 
 ### 5. New hunt
@@ -1867,7 +1990,11 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 |---|---|
 | `GET /hunts/hits` | Every analytic hit from the last `days` days. Under `all`: unread shadow hits, then live hits, then read shadow hits. `filter` takes `all`, `unread`, `live` or `shadow`. `limit` and `offset` page through the order. Each hit states its machine in `machine_key` and `machine_name`. `window` holds the hits in the window and the older unread hits. `groups` holds one row for each analytic, counted over the whole list: `hits`, `unread`, `machines` and `accounts`. |
 | `GET /hunts/needs-you` | The counts of the sidebar badges and the Needs-you strip. `decisions` counts the leads that wait on a decision. `review` counts the unread shadow hits. `total` is the sum of the two. It is kept for an older console and is deprecated. |
-| `GET /needs-you` | The Needs-you count of the Dashboard tile, the bell and the sidebar. Each part has its own field. `decisions` sums `campaigns`, `investigations_waiting`, `leads_needing_decision` and `untriaged_groups`: each decision once. `needs_more_info` and `pending_actions` stay as detail and are no part of the sum. `pending_actions` counts actions, and one investigation can hold two. `review` counts the unread shadow hits. `total` is the sum of the two. It is kept for an older console and is deprecated. `investigations_waiting` counts the investigations that need more info or hold a waiting action. It is the total of `GET /investigations?needs_you=true` over `verdict_window`. |
+| `GET /needs-you` | The Needs-you count of the Dashboard tile, the bell and the sidebar. Each part has a separate field. `decisions` sums `campaigns`, `investigations_waiting`, `leads_needing_decision`, `untriaged_groups` and `rules_waiting`: each decision once. `needs_more_info` and `pending_actions` stay as detail and are no part of the sum. `pending_actions` counts actions, and one investigation can hold two. `review` counts the unread shadow hits. `total` is the sum of the two. soc-ai keeps `total` for an older console, and `total` is deprecated. `investigations_waiting` counts the investigations that need more info and the true positives that wait, with or without a waiting action. The value is the total of `GET /investigations?needs_you=true` over `verdict_window`. `rules_waiting` counts the rules with one or more open false positives. |
+| `GET /rule-decisions` | The standing rule decisions in force, the newest first, and the newest 20 that ended. |
+| `GET /rule-decisions/{rule_key}` | The facts of one rule for the decision: the open false positives in the two groups, the machines, the hold reasons, the true positives of the rule and the standing decision in force. An unknown key answers 404 `rule_not_found`. |
+| `POST /rule-decisions/{rule_key}` | Record a decision on the open false positives of one rule. The body names `decision`, `acknowledge` or `standing`, and the optional `includeWeak`, `includeTruePositivePairs` and `note`. The audit record `rule_decision_made` comes first, and the route answers 202. The acknowledges run in the background. The route answers 409 `rule_decision_running` while an earlier decision on the rule runs. An acknowledge with an empty selection answers 409 `rule_nothing_open`. A standing decision also answers 409 for a rule with a true positive verdict, for a rule with a standing decision in force and while `auto_ack_fp_enabled` is off. |
+| `POST /rule-decisions/{rule_key}/end` | End the standing decision in force for the rule. The audit record `rule_decision_ended` comes first. The hold `high_stakes` then applies to the rule again. A rule with no standing decision answers 409 `rule_no_standing`. |
 | `GET /leads` | The lead list, newest first. `status` takes a stored value, `all`, or one of the aliases `new`, `closed`, `needs_decision`, `in_progress` and `open_or_hunting`. `entity` keeps the leads that name one entity, under every key of its machine. The filter runs before `limit`. Each row states the result of its hunt: `hunt_answer` is the first sentence of the narrative, and `hunt_not_checked` lists the visibility gaps. `hold_reason` and `hold_sentence` state why a finished hunt did not settle the lead. `repeats_after_close` and `last_repeat_at` state the observations that joined a closed lead after its close. |
 | `GET /leads/count` | The total for the same `status` and `entity` filter. The list stops at `limit`. The count does not. |
 | `GET /leads/quality` | The lead rule, the noise floor rule, and what the rule produced per ISO week and per observation-type pair, with `closed_by_hunt` counted separately from `dismissed`. `weeks` sets the window. |
@@ -1893,7 +2020,7 @@ Every route sits under `/api/v1`. The console uses these, and an integrator can 
 | `GET /analytics/{id}` | One analytic with its version history, its outcome ledger and its recent observations. A version row carries `system` for a change soc-ai made, and `evidence` for a system demotion. |
 | `POST /analytics/{id}/status` | Move an analytic between candidate, shadow, live and retired, with a reason. |
 | `GET /hunt-catalog` | The health of the catalog: the last sweep, the last firing and the 24-hour counts for each analytic. |
-| `GET /campaigns` | The active campaigns, newest last event first. Each row states the title, the status, the stage, the actors, at most three targets, the count of investigations and `alerts`. `alerts` is the alert count of the last grid read, or null before the first read. `stale` is true when the engine failed on this read and the rows are older. |
+| `GET /campaigns` | The active campaigns, newest last event first. Each row states the title, the status, the stage, the actors, at most three targets, the count of investigations and `alerts`. `status` is `open` while the last activity is inside one horizon, else `ended`. The last activity is the later of the last investigation event and the last alert event of a confirmed rule. `alerts` is the alert count of the last grid read, or null before the first read. `stale` is true when the engine failed on this read and the rows are older. |
 | `GET /campaigns/{id}` | One campaign: the bottom line, the stage ladder, the parties, the waves, the investigations with link and evidence, the related investigations and documents, and the detection record. Each step of `ladder` states `headline`, what happened, and `evidence`, the record that proves the stage, or null. `graph.edges` holds the arrows of the attack graph. Each arrow states `source`, `target`, `runs`, `alerts`, `stage`, `firstAt`, `lastAt`, `beyond` and `fromDocuments`. `runs` counts the investigations of the arrow, and `alerts` counts its alert events, or is null. Each entry of `members` states `sourceKey` and `targetKey`, the machine keys of its two ends, or null. `events` states `source`, `readAt`, `alerts`, `rules`, `findings`, `records`, `pairs` and `timeline`. `source` is `grid`, `stored` or `none`. Each pair states its alerts by rule, the alerts of other rules, the records and the datasets. A campaign of an earlier release has an empty `graph.edges` until the next rebuild. A campaign that merged into another answers with `status` `merged`, `mergedInto`, empty lists and `events.source` `none`. |
 
 `GET /investigations/{id}` carries a `subject` block for a hunt run. The block holds the hunt id,
@@ -1903,7 +2030,8 @@ carries `subjectType`, which reads `alert` or `hunt`.
 
 ## Known limits
 
-- A campaign joins runs. It does not join leads. Related leads name the leads that may be one
+- A campaign joins investigations by proven links. A related lead with an observation outside the
+  investigations of the campaign keeps normal handling. Related leads name the leads that may be one
   activity.
 - soc-ai computes related leads on read. A hunt objective holds the list as it stood when the hunt
   started, and it says so.

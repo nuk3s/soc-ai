@@ -2,7 +2,8 @@ import { Activity, ArrowUpRight, Crosshair, Database, Gauge, Ghost, Inbox, Rotat
 import { type ReactNode, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { PipelineErrorChip, StatusTag, VerdictPill } from '../components/Badges';
-import { ConfirmedThreats, threatsFor, useThreats } from '../components/ConfirmedThreats';
+import { ConfirmedThreats, threatsFor, useThreats, waitingCount, waitingSplitWords } from '../components/ConfirmedThreats';
+import { earlierPartWords } from '../lib/truePositiveParts';
 import { DashboardGrid, LAYOUT_HELP_ID, LayoutControls } from '../components/DashboardGrid';
 import { FlowBadge } from '../components/FlowBadge';
 import { GridGapStrip } from '../components/GridGapStrip';
@@ -44,7 +45,7 @@ import { PIPELINE_ERRORS_URL, livePipelineErrors } from '../lib/investigationFil
 import { statusDetail, statusMeta } from '../lib/labels';
 import { formatSkipReasons } from '../lib/skipReasons';
 import { COUNTING } from '../lib/text';
-import { absoluteTime, agoWords, rangeToSinceUntil, utcWindow, windowFromSearch, windowParams } from '../lib/timeRange';
+import { absTime, agoWords, localTitle, rangeToSinceUntil, utcWindow, windowFromSearch, windowParams } from '../lib/timeRange';
 import { VERDICT } from '../lib/tokens';
 import {
   COUNT_AGE,
@@ -188,12 +189,23 @@ function recentDestination(range: string, custom: CustomRange | null): string {
   return `/investigations?${new URLSearchParams(windowParams(range, custom))}`;
 }
 
-/** The Investigations list the true-positive tile counts: the same window and
- *  the verdict filter. */
+/** The Investigations list the true-positive tile counts: the same window,
+ *  the verdict filter and the filter of the true positives that wait. The
+ *  server reads one rule for the tile and the list, so the list opens the
+ *  counted rows (round "decide once", DC3). */
 function truePositiveDestination(range: string, custom: CustomRange | null): string {
   const p = new URLSearchParams(windowParams(range, custom));
   p.set('verdict', 'true_positive');
+  p.set('waits', 'true');
   return `/investigations?${p}`;
+}
+
+/** Where the Alert events tile lands: the Alerts list in the window of the
+ *  tile, with acknowledged alerts shown. The tile counts them, and the list
+ *  hides them by default: one window read 9,598 on the tile and 1,877 on the
+ *  list (dogfood 2026-11-17, AA6). */
+export function alertEventsDestination(range: string, custom: CustomRange | null): string {
+  return `/alerts?${alertsWindowParams(range, custom)}`;
 }
 
 function severityDestination(sev: string, range: string, custom: CustomRange | null): string {
@@ -334,6 +346,7 @@ const TILE_LINE_ID: Partial<Record<PartKey, string>> = {
   investigations_waiting: 'investigations',
   leads_needing_decision: 'leads',
   untriaged_groups: 'alerts',
+  rules_waiting: 'rules',
 };
 
 /**
@@ -353,7 +366,9 @@ function needsYouScopeSentence(data: NeedsYouCount): string {
     if (campaigns) parts.push(`campaigns ${ANY_AGE}`);
     parts.push(`investigations of the ${verdicts}`);
   }
-  parts.push('all open leads', `alert groups of the ${alerts}`);
+  parts.push('all open leads');
+  if (data.rules_waiting !== undefined) parts.push(`rules with open false positives ${ANY_AGE}`);
+  parts.push(`alert groups of the ${alerts}`);
   return `The count covers ${parts.slice(0, -1).join(', ')}, and ${parts[parts.length - 1]}.`;
 }
 
@@ -628,8 +643,8 @@ function AutoTriageDegradedNote({ s }: { s: AutoTriageStatus }) {
         {when ? (
           <>
             The sweep of{' '}
-            <time dateTime={when} title={agoWords(when)} data-testid="autotriage-degraded-time">
-              {absoluteTime(when)}
+            <time dateTime={when} title={`${agoWords(when)}. ${localTitle(when)}`} data-testid="autotriage-degraded-time">
+              {absTime(when)}
             </time>{' '}
             could not read the grid
           </>
@@ -681,8 +696,12 @@ function AutoTriagePanel({ s, loading }: { s: AutoTriageStatus | null; loading: 
       {s.finished_at ? (
         <>
           Last batch at{' '}
-          <time dateTime={s.finished_at} title={agoWords(s.finished_at)} data-testid="autotriage-last-batch-time">
-            {absoluteTime(s.finished_at)}
+          <time
+            dateTime={s.finished_at}
+            title={`${agoWords(s.finished_at)}. ${localTitle(s.finished_at)}`}
+            data-testid="autotriage-last-batch-time"
+          >
+            {absTime(s.finished_at)}
           </time>{' '}
           · <span className="font-semibold text-text">{s.hunted}</span> investigated
           {s.skipped ? `, ${s.skipped} skipped` : ''}
@@ -1141,10 +1160,14 @@ export function Dashboard() {
     const w = rangeToSinceUntil(range, custom);
     return `window ${utcWindow(w.since, w.until ?? new Date().toISOString())}`;
   })();
-  // The hosts the count lands on: one per target, threats and authorized.
+  // The machines of the true positives that wait, the machines of a campaign
+  // included. The server counts them. An older server sends none: one per
+  // target of the rows and the authorized groups.
   const threatHosts = threatList
-    ? new Set([...threatList.rows, ...threatList.authorized].map((g) => g.target.machineKey ?? g.target.address)).size
+    ? (threatList.waitingHosts ??
+      new Set([...threatList.rows, ...threatList.authorized].map((g) => g.target.machineKey ?? g.target.address)).size)
     : 0;
+  const threatsWaiting = threatList ? waitingCount(threatList) : 0;
   const triageActiveRef = useRef(false);
   const triageTick = useRef(0);
   const triage = useAsync(getAutoTriageStatus, [], {
@@ -1396,7 +1419,7 @@ export function Dashboard() {
   const esDegraded = down.some((d) => d.key === 'es');
   const i = (n: number): string => (invs.data ? n.toLocaleString() : invs.error ? '—' : COUNTING);
   const tpCount = (): string =>
-    threatList ? threatList.total.toLocaleString() : threats.error && !threats.loading ? '?' : COUNTING;
+    threatList ? threatsWaiting.toLocaleString() : threats.error && !threats.loading ? '?' : COUNTING;
   // Is this KPI row still showing counts from a grid that has since gone dark?
   // A failed BACKGROUND poll keeps the last-good data on screen and never sets
   // `error` — deliberate, so a blip doesn't blank a working console — which
@@ -1569,7 +1592,19 @@ export function Dashboard() {
           key="kpi-alert-events"
           label={`Alert events · ${range}`}
           value={a(m.events)}
-          sub={`${a(m.groups)} detection groups`}
+          sub={
+            <>
+              <span data-testid="alert-events-sub">{a(m.groups)} detection groups, acknowledged alerts included</span>{' '}
+              ·{' '}
+              <Link
+                to={alertEventsDestination(range, custom)}
+                data-testid="alert-events-link"
+                className="text-accent hover:underline"
+              >
+                Show in Alerts
+              </Link>
+            </>
+          }
           color="#4b8bf5"
           icon={<Activity size={16} />}
           title={COUNT_ALERT_EVENTS}
@@ -1589,12 +1624,15 @@ export function Dashboard() {
             and one window read 3 and 0 (review 2026-11-12, ui-core 3). */}
         <StatCard
           key="kpi-true-positives"
-          label={`True positives · ${range}`}
+          label={`True positives that wait · ${range}`}
           value={<span data-testid="tp-total">{tpCount()}</span>}
           sub={
             <>
               <div>
-                {threatList ? (
+                {threatList && threatsWaiting === 0 ? (
+                  // No "on 0 hosts" under a count of 0.
+                  <span data-testid="tp-hosts">None waits in this window.</span>
+                ) : threatList ? (
                   <>
                     <span data-testid="tp-hosts">
                       on {threatHosts === 1 ? '1 host' : `${threatHosts.toLocaleString()} hosts`} in this window
@@ -1610,6 +1648,16 @@ export function Dashboard() {
                   <LoadingInline>Reading the confirmed threats</LoadingInline>
                 )}
               </div>
+              {/* The split, when a campaign with no decision holds some of
+                  them: the analyst decides those on the campaign (OW2). */}
+              {threatList && (threatList.waitingInCampaigns ?? 0) > 0 && (
+                <div data-testid="tp-split">{waitingSplitWords(threatList)}</div>
+              )}
+              {/* The true positives that the earlier decision of a reopened
+                  campaign covered wait on nothing (W2). */}
+              {threatList?.earlier && threatList.earlier.investigations > 0 && (
+                <div data-testid="tp-earlier">{earlierPartWords(threatList.earlier)}</div>
+              )}
               {pipelineErrors > 0 && (
                 <div>
                   <button
@@ -1623,15 +1671,15 @@ export function Dashboard() {
                     style={{ color: '#fca5a5' }}
                   >
                     {pipelineErrors.toLocaleString()}
-                    {pipelineErrorsTruncated ? '+' : ''} pipeline error
+                    {pipelineErrorsTruncated ? '+' : ''} failed investigation
                     {pipelineErrors === 1 && !pipelineErrorsTruncated ? '' : 's'}
                   </button>
-                  <span className="text-faint"> · investigations, last 30 days</span>
+                  <span className="text-faint"> · last 30 days</span>
                 </div>
               )}
             </>
           }
-          color={(threatList?.total ?? 0) > 0 ? '#f04438' : '#8b949e'}
+          color={threatsWaiting > 0 ? '#f04438' : '#8b949e'}
           icon={<ShieldCheck size={16} />}
           title={COUNT_TRUE_POSITIVES}
           // The count reads the store. A grid outage does not change it, so

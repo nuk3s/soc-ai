@@ -17,7 +17,7 @@ import {
 import { Markdown } from '../components/Markdown';
 import { mdToPlainExcerpt } from '../lib/mdExcerpt';
 import { ErrorState, LoadingState, Spinner } from '../components/States';
-import { absoluteTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import { useAsync } from '../lib/useAsync';
 import { dominantVerdictLabel, dominantVerdictTitle, formatVerdictMix } from '../lib/verdictMix';
 
@@ -793,7 +793,7 @@ export function Runbooks() {
                           <EmbedChip rb={rb} />
                           <span
                             className="text-[10.5px] text-faint"
-                            title={absoluteTime(rb.updated_at)}
+                            title={timeTitle(rb.updated_at)}
                             data-testid={`runbook-updated-${rb.id}`}
                           >
                             updated {ago(rb.updated_at)}

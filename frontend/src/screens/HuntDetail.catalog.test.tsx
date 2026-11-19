@@ -28,6 +28,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 import { getAbout, getEvent, getHunt } from '../lib/api';
 import { ShellProvider } from '../shell/ShellContext';
 import { HuntDetail } from './HuntDetail';
+import { utcTimesInText } from '../lib/timeRange';
 
 const about: AboutInfo = {
   version: '1.5.1',
@@ -315,7 +316,9 @@ describe("HuntDetail — a catalog finding's authoring-time prose vs this run", 
     mount();
     await screen.findByText(catalogFinding.title);
     expect(screen.queryByText(/the author wrote this text before this run/i)).toBeNull();
-    expect(screen.getByText(catalogFinding.detail)).toBeInTheDocument();
+    // Round 3 part 2, P1: the detail states each ISO time in the UTC form.
+    expect(screen.getByText(utcTimesInText(catalogFinding.detail))).toBeInTheDocument();
+    expect(screen.getByText(/first at 2026-09-04 17:58:42 UTC, last at 2026-09-04 18:02:11 UTC/)).toBeInTheDocument();
   });
 });
 

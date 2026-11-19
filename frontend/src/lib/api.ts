@@ -545,6 +545,15 @@ export interface ThreatCampaign extends CampaignRow {
   authorized: number;
 }
 
+/** The true positives that the earlier decision of a reopened campaign
+ *  covered (round 3 part 2, W2). They wait on nothing. */
+export interface TruePositivesEarlier {
+  campaigns: number;
+  investigations: number;
+  decision: string | null;
+  decidedAt: string | null;
+}
+
 export interface ThreatList {
   window: { since: string; until: string };
   /** The active campaigns with a true positive investigation in the window,
@@ -555,9 +564,29 @@ export interface ThreatList {
    *  investigations that are in no campaign. */
   rows: ThreatRow[];
   authorized: AuthorizedThreatGroup[];
-  /** The count the True positives tile states: every true positive of the
-   *  window, the investigations of the campaigns included. */
+  /** Every true positive of the window that stands, the investigations of
+   *  the campaigns included. */
   total: number;
+  /** The true positives that wait on the analyst: the verdict stands, no
+   *  campaign with a decision in force holds it, and no authorization mark
+   *  holds it. The True positives tile and the panel header state it. An
+   *  older server sends none. */
+  waiting?: number;
+  /** The affected machines of those, the machines of a campaign included. */
+  waitingHosts?: number;
+  /** The Investigations list of exactly those, over the window of the answer. */
+  waitingHref?: string;
+  /** The true positives of `waiting` that a campaign with no decision holds,
+   *  and the count of those campaigns. An older server sends none. */
+  waitingInCampaigns?: number;
+  waitingCampaigns?: number;
+  /** The true positives of the window that a campaign with a decision in
+   *  force holds, and the count of those campaigns. */
+  decided?: { campaigns: number; investigations: number };
+  /** The true positives that the earlier decision of a reopened campaign
+   *  covered (W2). `decision` and `decidedAt` name that decision when one
+   *  campaign holds them all. An older server sends none. */
+  earlier?: TruePositivesEarlier;
 }
 
 export interface ThreatQuery {
@@ -590,6 +619,9 @@ export function getThreats(q: ThreatQuery): Promise<ThreatList> {
 /** The status the API states. The store holds `active`; the API splits it
  *  into `open` and `ended` by the newest member event. */
 export type CampaignStatus = 'open' | 'ended' | 'withdrawn' | 'merged';
+/** The one state of a campaign that each page shows: the decision in force,
+ *  else the status. The server sends it as `state`. */
+export type CampaignState = CampaignStatus | 'closed' | 'authorized' | 'case';
 export type CampaignStage = 'reconnaissance' | 'attempt' | 'access' | 'action' | 'movement';
 export type CampaignLink =
   | 'seed'
@@ -642,6 +674,108 @@ export interface CampaignRow {
   authorization?: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'> | null;
   /** The true positive investigations beyond the authorization. An earlier server sends none. */
   beyond?: number;
+  /** The one state: the decision in force, else the status. An earlier server sends none. */
+  state?: CampaignState;
+  /** What is new since the decision that a reopen ended, else null. An
+   *  earlier server sends none. */
+  sinceDecision?: CampaignSinceDecision | null;
+  /** The time of the grid read of `alerts`. `alertsBehind` is true when the
+   *  content of the campaign changed after that read: the count can be
+   *  behind, and the console states the time of the read. */
+  alertsReadAt?: string | null;
+  alertsBehind?: boolean;
+  /** The last alert event of a confirmed rule of the stored grid read, else
+   *  null. `lastActivity` is the later of it and `lastEvent`: the end of the
+   *  span of the campaign. An earlier server sends neither. */
+  lastAlertAt?: string | null;
+  lastActivity?: string | null;
+}
+
+/** One machine of the investigations that are new since the earlier decision. */
+export interface CampaignSinceMachine {
+  machineKey: string;
+  name: string | null;
+  address: string | null;
+}
+
+/** What is new in a campaign since the decision that a reopen ended (SD2).
+ *  The server gives it for a campaign that opened again and holds no
+ *  decision now, else null. */
+export interface CampaignSinceDecision {
+  /** The decision that the reopen ended. `label` is the words of the reason
+   *  of a close or the label of an authorization. `noteKnown` is false for a
+   *  decision of an earlier release: its note is unknown. */
+  earlier: {
+    decision: CampaignDecisionType;
+    reason: string | null;
+    label: string | null;
+    note: string | null;
+    noteKnown: boolean;
+    by: string | null;
+    at: string | null;
+  };
+  cause: CampaignReopenCause;
+  reopenedAt: string;
+  reopenedBy: string | null;
+  /** The last event of the basis of the earlier decision, else its time. */
+  boundary: string;
+  boundarySource: 'basis' | 'decision';
+  /** The investigations of the campaign with an event after the boundary,
+   *  the oldest first, with any verdict. `investigations` counts them. */
+  runIds: string[];
+  investigations: number;
+  /** The count by verdict, the true positives first. */
+  verdicts: { verdict: string; count: number }[];
+  /** Those whose authorization mark holds. */
+  authorized: number;
+  actors: CampaignSinceMachine[];
+  targets: CampaignSinceMachine[];
+  /** The distinct rules of the new alert investigations. */
+  rules: number;
+  firstEvent: string | null;
+  lastEvent: string | null;
+  /** The highest stage among the new investigations. */
+  stage: CampaignStage | null;
+  /** The stage of the campaign at the decision and now. */
+  stageBefore: CampaignStage | null;
+  stageNow: CampaignStage | null;
+  stageRose: boolean;
+  /** Each machine that the earlier decision did not hold, by name. */
+  newMachines: string[];
+  /** The new true positives that no authorization holds, and their rule
+   *  names (W1). An older server sends none. */
+  outsideTruePositives?: number;
+  outsideNames?: string[];
+  /** Each authorization that holds new investigations, the most first. */
+  authorizations?: CampaignSinceHolding[];
+  /** The hunt that the reopen started, else null. */
+  reopenHunt?: CampaignSinceHunt | null;
+  /** The alert events of the confirmed rules after the newest investigation
+   *  event, or after the boundary when it is later: the count, the count of
+   *  the rules and the time of the last. They take the verdict of an
+   *  earlier investigation. An earlier server sends none. */
+  laterAlerts?: number;
+  laterRules?: number;
+  laterLastAt?: string | null;
+}
+
+/** One authorization that holds new investigations of a reopened campaign. */
+export interface CampaignSinceHolding {
+  id: number;
+  label: string;
+  /** `active`, `expired` or `revoked`. */
+  state: string;
+  expiresAt: string | null;
+  investigations: number;
+}
+
+/** The hunt that the reopen of a campaign started. `outcome` holds the words
+ *  of the hunt page, and it is null while the hunt runs. */
+export interface CampaignSinceHunt {
+  id: string;
+  startedAt: string;
+  status: string;
+  outcome: string | null;
 }
 
 /** The decisions of a campaign. Part A of phase 2 writes only `closed`. */
@@ -791,10 +925,31 @@ export interface CampaignHunt {
   startedAt: string | null;
   findings: number;
   threatFindings: number;
+  /** The answer of a hunt that read the campaign, else null. Absent on an
+   *  older server. */
+  answer?: HuntAnswerOutcome | null;
+  /** The steps of a hunt that stopped, else null. */
+  steps?: number | null;
 }
 
 /** The most hunts that `GET /campaigns/{id}` lists. */
 export const CAMPAIGN_HUNTS_CAP = 20;
+
+/** What a hunt found for a campaign or a lead that it read (migration 0074):
+ *  new activity on a machine of the subject, the known activity of the
+ *  campaign again, or no new event. */
+export type HuntAnswerOutcome = 'new_activity' | 'continues' | 'no_new_event';
+
+/** One answer on `GET /campaigns/{id}`, newest hunt first. */
+export interface CampaignHuntAnswer {
+  huntId: string;
+  /** The time that the hunt started. */
+  huntAt: string | null;
+  starter: string;
+  outcome: HuntAnswerOutcome;
+  findingOrdinal: number | null;
+  findingTitle: string | null;
+}
 
 /** One machine of the draft of an authorization. `listed` is the default of
  *  its check box. */
@@ -854,6 +1009,16 @@ export interface CampaignChangeDetail {
   runId?: string;
   /** `beyond`: why the investigation is outside the authorization. */
   why?: CampaignBeyondWhy;
+  /** `reopened`: the decision that the reopen ended. A change of an earlier
+   *  release holds none. */
+  was?: {
+    decision: CampaignDecisionType | null;
+    reason: string | null;
+    note: string | null;
+    by: string | null;
+    decidedAt: string | null;
+    label?: string;
+  };
 }
 
 /** One change of a campaign. */
@@ -894,6 +1059,11 @@ export interface InvestigationCampaign {
   decision?: CampaignDecisionType | null;
   /** Since when the campaign waits on a decision. Null when it holds one. */
   waitsSince?: string | null;
+  /** The one state: the decision in force, else the status. An earlier server sends none. */
+  state?: CampaignState;
+  /** When the analyst made the decision in force, ISO-8601 UTC. Null with no
+   *  decision. An earlier server sends none. */
+  decidedAt?: string | null;
 }
 
 /** The part a machine plays in a campaign. */
@@ -907,6 +1077,12 @@ export interface HostCampaign extends InvestigationCampaign {
   /** The alert events of the campaign, as in a list row. Null when the
    *  campaign holds no stored events. */
   alerts?: number | null;
+  /** The time of the grid read of `alerts`, and whether the count can be
+   *  behind, as in a list row. */
+  alertsReadAt?: string | null;
+  alertsBehind?: boolean;
+  /** The end of the span of the campaign, as in a list row. */
+  lastActivity?: string | null;
 }
 
 export interface CampaignList {
@@ -939,6 +1115,10 @@ export interface CampaignLadderStep {
   headline?: string | null;
   /** The record that proves the stage. An earlier server sends none. */
   evidence?: CampaignStageEvidence | null;
+  /** Set when a later stage that needs this stage has earlier proof: the
+   *  stage held by `at`, and `stage` is the later stage. A stage with no
+   *  proof of its own can hold one. An earlier server sends none. */
+  heldBy?: { at: string; stage: CampaignStage } | null;
 }
 
 /** The record of the grid that proves a stage. */
@@ -1011,6 +1191,9 @@ export interface CampaignMember {
   authorized?: boolean;
   /** True when an analyst included the investigation. An earlier server sends none. */
   included?: boolean;
+  /** The note of a finding whose text names a known machine that is no host of
+   *  the finding. null for no note. An earlier server sends none. */
+  nameNote?: string | null;
 }
 
 /** One arrow of the attack graph: the true positive runs from one machine to
@@ -1144,6 +1327,18 @@ export interface CampaignEvents {
   records: number | null;
   pairs: CampaignPairEvents[];
   timeline: { bucketSeconds: number; lanes: CampaignTimelineLane[] };
+  /** True for a grid read that is older than the content of the campaign:
+   *  the grid did not answer since. The page states `readAt`. */
+  behind?: boolean;
+  /** The last alert event of a confirmed rule of a pair, else null. */
+  lastAlertAt?: string | null;
+  /** The alert events of the confirmed rules after the newest investigation
+   *  event, or after the boundary of a decision when it is later: the
+   *  count, the count of the rules and the time of the last. 0 when the
+   *  stored read holds none. An earlier server sends none. */
+  laterAlerts?: number;
+  laterRules?: number;
+  laterLastAt?: string | null;
 }
 
 /** `GET /campaigns/{id}`. A merged or a withdrawn campaign has empty lists. */
@@ -1152,6 +1347,8 @@ export interface CampaignDetail {
   id: number;
   title: string;
   status: CampaignStatus;
+  /** The one state: the decision in force, else the status. An earlier server sends none. */
+  state?: CampaignState;
   mergedInto: number | null;
   earlierCampaign: { id: number; title: string } | null;
   bottomLine: string;
@@ -1189,6 +1386,15 @@ export interface CampaignDetail {
   /** The Security Onion case of the campaign, or null. An earlier server
    *  sends none, and the page then offers no case. */
   case?: CampaignCase | null;
+  /** What the hunts that read the campaign found, newest first. Absent on an
+   *  older server. */
+  answers?: CampaignHuntAnswer[];
+  /** What is new since the decision that a reopen ended, else null. An
+   *  earlier server sends none. */
+  sinceDecision?: CampaignSinceDecision | null;
+  /** The later of `lastEvent` and `events.lastAlertAt`: the end of the span
+   *  of the campaign. An earlier server sends none. */
+  lastActivity?: string | null;
 }
 
 /** The active campaigns. */
@@ -1417,6 +1623,12 @@ export interface InvestigationListQuery {
   clock?: 'event' | 'investigated';
   limit?: number;
   offset?: number;
+  /** Only the true positives that wait on the analyst, by the rule of the
+   *  True positives tile. The tile links here. */
+  waits?: boolean;
+  /** Ask for `truePositiveParts`: the parts of the true positives of the
+   *  filter set. */
+  tpParts?: boolean;
 }
 
 /** One filtered, counted, paged slice of the investigations list. */
@@ -1436,6 +1648,8 @@ export function listInvestigations(q: InvestigationListQuery = {}): Promise<Inve
   if (q.clock === 'investigated') p.set('clock', 'investigated');
   if (q.limit != null) p.set('limit', String(q.limit));
   if (q.offset != null) p.set('offset', String(q.offset));
+  if (q.waits) p.set('waits', 'true');
+  if (q.tpParts) p.set('tp_parts', 'true');
   const qs = p.toString();
   return request<InvestigationList>(`/investigations${qs ? `?${qs}` : ''}`);
 }
@@ -3641,12 +3855,19 @@ function groupActionBody(
   return body;
 }
 
-/** Acknowledge all events for a detection group via the SO ack_alert write tool. */
+/** Acknowledge all events for a detection group via the SO ack_alert write tool.
+ *  `investigationId` names the investigation whose card "No automatic
+ *  action" made the press: the server records the decision on it. */
 export function ackGroup(
   group: Pick<AlertGroup, 'name' | 'kind'>,
   query: AlertQuery = {},
+  investigationId?: string,
 ): Promise<AckGroupResult> {
-  return post<AckGroupResult>('/alerts/ack-group', groupActionBody(group, query), SO_WRITE_OPTS);
+  const body = { ...groupActionBody(group, query), investigation_id: investigationId };
+  return post<AckGroupResult>('/alerts/ack-group', body, SO_WRITE_OPTS).then((answer) => {
+    if (investigationId) emitNeedsYouChanged();
+    return answer;
+  });
 }
 
 /** Acknowledge a specific set of events by ES id (per-event selection). */
@@ -3662,12 +3883,13 @@ export function ackEvents(esIds: string[]): Promise<AckGroupResult> {
 export function escalateGroup(
   group: { name: string; kind: string },
   query: AlertQuery = {},
+  investigationId?: string,
 ): Promise<EscalateGroupResult> {
-  return post<EscalateGroupResult>(
-    '/alerts/escalate-group',
-    groupActionBody(group, query),
-    SO_WRITE_OPTS,
-  );
+  const body = { ...groupActionBody(group, query), investigation_id: investigationId };
+  return post<EscalateGroupResult>('/alerts/escalate-group', body, SO_WRITE_OPTS).then((answer) => {
+    if (investigationId) emitNeedsYouChanged();
+    return answer;
+  });
 }
 
 // ── Internal-identifier managed list ────────────────────────────────────────────
@@ -4066,9 +4288,17 @@ export function getHostLastEvents(ips: string[]): Promise<MachineLastEvents> {
 }
 
 /** An address, a name, a MAC or an agent id to its machine key. A value that
- *  names no machine is a 404 (`no_host`). */
+ *  names no machine rejects with a not-found error (`no_host`), as a 404 did.
+ *  The request asks with `empty=true`, and the server answers that case with
+ *  200 and no key: the entity page of an external address made a request that
+ *  answered 404 (dogfood 2026-11-17, N17). */
 export function resolveMachine(value: string): Promise<MachineResolve> {
-  return request<MachineResolve>(`/hosts/resolve?value=${encodeURIComponent(value)}`);
+  return request<Partial<MachineResolve> | null>(
+    `/hosts/resolve?value=${encodeURIComponent(value)}&empty=true`,
+  ).then((r) => {
+    if (r && typeof r.key === 'string' && r.key) return r as MachineResolve;
+    throw new ApiError('No machine holds this value.', 404, 'no_host');
+  });
 }
 
 /** The name and the role of the machine that holds one address. `roleGuess`
@@ -4467,6 +4697,49 @@ export interface LeadDetail extends Lead {
   /** The findings of those hunts that an analyst promoted, newest first,
    *  each with the verdict its investigation reached. */
   promoted_findings?: LeadPromotedFinding[];
+  /** The campaign that the lead is part of, with its decision. Absent on an
+   *  older server. */
+  campaign_context?: LeadCampaignContext | null;
+  /** The observations whose investigation matched an authorization. */
+  authorized?: LeadAuthorizedPart[];
+  /** What the other hunts that read the lead found, newest first. */
+  answers?: LeadHuntAnswer[];
+}
+
+/** The campaign of a lead, as the top of the lead page states it. */
+export interface LeadCampaignContext {
+  id: number;
+  title: string;
+  decision: string | null;
+  decided_at: string | null;
+  decided_by: string | null;
+  /** True when soc-ai closed the lead with the close or the authorization
+   *  of its campaign. */
+  closed_with_campaign: boolean;
+  /** The time of that close. An older server sends none. */
+  closed_at?: string | null;
+  /** W4: the decision that closed the lead (`closed` or `authorized`), its
+   *  analyst, and the newest reopen of the campaign after the close. An
+   *  older server sends none. */
+  closed_by_decision?: string | null;
+  closed_by?: string | null;
+  reopened_at?: string | null;
+}
+
+/** The observations of a lead whose investigation matched one authorization. */
+export interface LeadAuthorizedPart {
+  label: string;
+  observations: number;
+}
+
+/** What one other hunt found for the lead when it read it. */
+export interface LeadHuntAnswer {
+  hunt_id: string;
+  hunt_at: string | null;
+  starter: string;
+  outcome: HuntAnswerOutcome;
+  finding_ordinal: number | null;
+  finding_title: string | null;
 }
 
 /** One finding of a hunt on the lead that an analyst promoted. The
@@ -5259,7 +5532,7 @@ export function getNeedsYouCount(): Promise<NeedsYouCount> {
 
 /** The type of one item of the Needs you list. `alerts` is one item for
  *  every alert group with no verdict. */
-export type NeedsYouItemType = 'campaign' | 'investigation' | 'lead' | 'alerts';
+export type NeedsYouItemType = 'campaign' | 'investigation' | 'lead' | 'alerts' | 'rule';
 
 /** One item of the Needs you list: what waits, why, since when and where
  *  the analyst decides it. */
@@ -5273,9 +5546,44 @@ export interface NeedsYouItem {
   href: string;
   /** The stage of a campaign. Null for the other types. */
   stage?: CampaignStage | null;
+  // The facts of the prepared row. A value that soc-ai does not hold is
+  // null. Absent on an older server.
+  verdict?: string | null;
+  confidence?: number | null;
+  impact?: ThreatImpact | null;
+  severity?: 'critical' | 'high' | 'medium' | 'low' | null;
+  /** At most three machines. `machinesMore` counts the rest. */
+  machines?: NeedsYouMachine[] | null;
+  machinesMore?: number;
+  /** The time of the newest event of the item, ISO-8601 UTC. */
+  eventAt?: string | null;
+  /** Why the item waits, in one sentence. */
+  why?: string;
+  /** The action that waits, and what it writes. */
+  action?: NeedsYouAction | null;
+  /** True when the record holds a source and a target, and `machines` names
+   *  the source first and the target second. The row then shows the
+   *  direction. An older server sends none. */
+  machinesDirected?: boolean;
+  /** A campaign that opened again: the new facts since the earlier
+   *  decision, one line under `why`. Null for any other item. */
+  newFacts?: string | null;
 }
 
-/** `GET /needs-you/items`: oldest first, at most 200. `total` is the count
+/** One machine of a Needs you item. Each part is null when soc-ai holds none. */
+export interface NeedsYouMachine {
+  name: string | null;
+  address: string | null;
+}
+
+/** The action that waits on a Needs you item: the words of the button and
+ *  what the action writes. */
+export interface NeedsYouAction {
+  label: string;
+  writes: string;
+}
+
+/** `GET /needs-you/items`: the most important first, at most 200. `total` is the count
  *  that the top bar states: `decisions` of `GET /needs-you`, with each alert
  *  group counted. */
 export interface NeedsYouItems {
@@ -5476,4 +5784,289 @@ export interface AuditVerifySchedule {
 
 export function getAuditVerifySchedule(): Promise<AuditVerifySchedule> {
   return request<AuditVerifySchedule>('/audit/verify-schedule');
+}
+
+// ── Rule decisions ──────────────────────────────────────────────────────────
+//
+// soc-ai gives a false positive verdict, and a guard holds the automatic
+// acknowledge (the rule is high stakes, the confidence is under the limit).
+// The alert then stays open on the grid, and no queue held it. A rule decision
+// acknowledges the open false positives of one rule at once. The server
+// computes the selection, never the console.
+//
+// The two interfaces below merge into the needs-you types above. A rule item
+// and the rule part of the count are additions of this block, so the block
+// keeps them together.
+
+/** The rule part of the needs-you count. */
+export interface NeedsYouCount {
+  /** The rules with one or more open false positives. `decisions` holds
+   *  them. Null when the server could not count them. Absent on an older
+   *  server. */
+  rules_waiting?: number | null;
+}
+
+/** The facts of a rule item of the Needs you list. */
+export interface NeedsYouItem {
+  /** A rule: its open false positives. Absent on the other types. */
+  count?: number;
+  /** A rule: the open false positives of the group `confident`. */
+  confident?: number;
+  /** A rule: the open false positives of the group `weak`. */
+  weak?: number;
+}
+
+/** The group of an open false positive: `confident` when the evidence guards
+ *  passed, `weak` when soc-ai is not sure of the verdict. */
+export type RuleDecisionGroupName = 'confident' | 'weak';
+
+/** The two decisions of a rule. `standing` also acknowledges each later
+ *  false positive of the rule for a period. */
+export type RuleDecisionChoice = 'acknowledge' | 'standing';
+
+/** One rule decision as the server records it. */
+export interface RuleDecisionRecord {
+  id: string | number;
+  decision: RuleDecisionChoice;
+  by: string;
+  at: string;
+  note: string | null;
+  state: 'acknowledging' | 'done' | 'failed';
+  /** The alerts that the decision acknowledged. */
+  alerts: number | null;
+  /** The alerts that the grid did not acknowledge. */
+  failed: number | null;
+  endedAt: string | null;
+  endCause: string | null;
+}
+
+/** One entry of `GET /rule-decisions`: a record with its rule. */
+export interface RuleDecisionListEntry extends Partial<RuleDecisionRecord> {
+  id: string | number;
+  ruleKey?: string;
+  ruleName?: string;
+  /** A standing decision: the end of its period. */
+  endsAt?: string | null;
+  /** A standing decision: the false positives that it acknowledged. */
+  acknowledged?: number | null;
+}
+
+/** `GET /rule-decisions`: each standing decision in force, and the newest 20
+ *  that ended. */
+export interface RuleDecisionList {
+  standing: RuleDecisionListEntry[];
+  ended: RuleDecisionListEntry[];
+}
+
+export function getRuleDecisions(): Promise<RuleDecisionList> {
+  return request<RuleDecisionList>('/rule-decisions');
+}
+
+/** The key of a rule in a path: the rule name as UTF-8 in base64url with no
+ *  padding. The server reads the same key. */
+export function ruleKeyOf(name: string): string {
+  const bytes = new TextEncoder().encode(name);
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/** The rule name of a key, or null when the key does not decode. */
+export function ruleNameOf(key: string): string | null {
+  try {
+    const b64 = key.replace(/-/g, '+').replace(/_/g, '/');
+    const bin = atob(b64 + '='.repeat((4 - (b64.length % 4)) % 4));
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    return null;
+  }
+}
+
+/** The page of the decision on one rule. */
+export function ruleDecisionHref(ruleKey: string): string {
+  return `/needs-you/rule/${ruleKey}`;
+}
+
+/** One hold reason of a group, with its label in words and its count. */
+export interface RuleDecisionReason {
+  code: string;
+  label: string;
+  count: number;
+}
+
+/** One group of the open false positives of a rule. `sources` and
+ *  `destinations` count the machines at each end. */
+export interface RuleDecisionGroup {
+  count: number;
+  reasons: RuleDecisionReason[];
+  sources: number | readonly unknown[] | null;
+  destinations: number | readonly unknown[] | null;
+  firstEvent: string | null;
+  lastEvent: string | null;
+}
+
+/** One machine of the rule, with the events of the open false positives. */
+export interface RuleDecisionMachine {
+  key: string | null;
+  name: string | null;
+  address: string | null;
+  role: 'source' | 'destination';
+  count: number;
+  /** The machine is an end of a true positive of the rule that stands. */
+  truePositive?: boolean;
+}
+
+/** The events of one UTC day, for each group. */
+export interface RuleDecisionDay {
+  day: string;
+  confident: number;
+  weak: number;
+}
+
+/** One sample investigation of a group. */
+export interface RuleDecisionSample {
+  id: string;
+  eventAt: string | null;
+  src: string | null;
+  dst: string | null;
+  confidence: number | null;
+  /** The one sentence of soc-ai. */
+  summary: string | null;
+  group: RuleDecisionGroupName;
+  /** The hold reason of the sample, as a code of the group reasons. */
+  reason: string | null;
+}
+
+/** A standing true positive verdict of the rule. */
+export interface RuleDecisionTruePositive {
+  id: string;
+  eventAt: string | null;
+  title: string;
+}
+
+/** The standing decision in force on a rule. */
+export interface RuleDecisionStanding {
+  id: string | number;
+  by: string;
+  at: string;
+  endsAt: string;
+  /** The false positives that soc-ai acknowledged under the decision. */
+  acknowledged: number;
+}
+
+/** `GET /rule-decisions/{ruleKey}`: the facts of one rule for its decision. */
+export interface RuleDecisionDetail {
+  ruleKey: string;
+  ruleName: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | null;
+  /** When soc-ai last read the state of the alerts on the grid. Null when
+   *  it did not read them yet. */
+  readAt: string | null;
+  /** False when the grid did not answer the last read. */
+  gridAnswered: boolean;
+  confident: RuleDecisionGroup;
+  weak: RuleDecisionGroup;
+  /** The top 10 machines. */
+  machines: RuleDecisionMachine[];
+  histogram: RuleDecisionDay[];
+  /** At most 8, each hold reason at least once. */
+  samples: RuleDecisionSample[];
+  truePositives: RuleDecisionTruePositive[];
+  /** The open alerts of the rule on the grid. Null when the grid did not
+   *  count them. */
+  openAlerts: number | null;
+  standing: RuleDecisionStanding | null;
+  history: RuleDecisionRecord[];
+  canStanding: boolean;
+  canStandingWhy: string | null;
+  investigationsHref: string;
+  /** soc-ai acknowledges the false positives of the rule by itself, from
+   *  stored facts. Null when the guard still holds the rule. */
+  selfAcknowledging?: RuleDecisionSelfAck | null;
+  /** The window of `openAlerts` and of the scan of a decision, in days. */
+  openAlertsDays?: number;
+  /** What each choice writes, from the plan of the decision. */
+  plans?: RuleDecisionPlan[];
+  /** False when the grid did not answer: the count of the alerts is unknown. */
+  planKnown?: boolean;
+  /** The most events that the scan of the grid reads. */
+  scanMax?: number;
+  /** The open false positives on the machine pair of a true positive of the
+   *  rule, by group. The main choice leaves them out. */
+  truePositivePairs?: { confident: number; weak: number };
+}
+
+/** What the press of one choice writes in Security Onion. */
+export interface RuleDecisionPlan {
+  includeWeak: boolean;
+  investigations: number;
+  /** The open alerts of the selected investigations. */
+  alerts: number;
+  /** The open alerts that inherit their verdict. */
+  inherit: number;
+  /** The alerts of the rule that a verdict of their own keeps open. */
+  held: number;
+  /** The scan of the grid stopped at its limit. */
+  capped: boolean;
+  /** The choice also takes the false positives on the machines of a true positive. */
+  includeTruePositivePairs?: boolean;
+}
+
+/** soc-ai acknowledges the false positives of a rule by itself since a date. */
+export interface RuleDecisionSelfAck {
+  since: string | null;
+  /** The automatic acknowledges since the date. */
+  acknowledged: number;
+  /** The open false positives that the guard held before the date. */
+  before: number;
+  /** The fact for the analyst, from the server. */
+  sentence: string;
+}
+
+export function getRuleDecision(ruleKey: string): Promise<RuleDecisionDetail> {
+  return request<RuleDecisionDetail>(`/rule-decisions/${encodeURIComponent(ruleKey)}`);
+}
+
+/** Decide on a rule. The server computes the selection again and starts the
+ *  acknowledge in the background: the answer is the record, 202, with the
+ *  state `acknowledging`. A decision moves the needs-you count. */
+export function postRuleDecision(
+  ruleKey: string,
+  body: { decision: RuleDecisionChoice; includeWeak: boolean; note: string; includeTruePositivePairs?: boolean },
+): Promise<RuleDecisionRecord> {
+  return post<RuleDecisionRecord>(`/rule-decisions/${encodeURIComponent(ruleKey)}`, body).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** End the standing decision on a rule. */
+export function endRuleDecision(ruleKey: string): Promise<RuleDecisionRecord> {
+  return post<RuleDecisionRecord>(`/rule-decisions/${encodeURIComponent(ruleKey)}/end`, {}).then((answer) => {
+    emitNeedsYouChanged();
+    return answer;
+  });
+}
+
+/** `ruleDecision` of an investigation: set when the investigation is an open
+ *  false positive. The card of its Acknowledge links the rule page. */
+export interface InvestigationRuleDecision {
+  /** The page of the rule decision. */
+  href: string;
+  /** The open false positives of the rule. */
+  count: number;
+  /** The group of this investigation. */
+  group: RuleDecisionGroupName;
+}
+
+/** The receipt of an acknowledge that a rule decision wrote, on the action of
+ *  an investigation. */
+export interface RuleDecisionReceipt {
+  /** The id of the rule decision. */
+  id: string | number;
+  /** The time of the rule decision. */
+  at: string | null;
+  /** The page of the rule decision. */
+  href: string | null;
 }

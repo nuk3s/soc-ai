@@ -78,6 +78,17 @@ describe('HuntDetail outcome', () => {
     vi.mocked(getAbout).mockResolvedValue(about);
   });
 
+  // F5: the hunt page read "Could not run" for a hunt that the lead page
+  // states as "Stopped with an error after 14 steps".
+  it('states the steps of a hunt that stopped after it ran steps', async () => {
+    vi.mocked(getHunt).mockResolvedValue(
+      hunt({ status: 'error', findings: [], outcome: 'could_not_run', outcome_label: 'Could not run', steps: 14 }),
+    );
+    mount();
+    const badge = await screen.findByTestId('hunt-disposition');
+    expect(badge.textContent).toBe('Stopped with an error after 14 steps');
+  });
+
   it('reads Could not run on a catalog run the grid refused', async () => {
     vi.mocked(getHunt).mockResolvedValue(
       hunt({

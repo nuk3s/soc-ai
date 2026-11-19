@@ -164,8 +164,10 @@ describe('Investigations pipeline_error deep link', () => {
       ]),
     );
     mount('/investigations?verdict=pipeline_error');
-    expect(await screen.findByText('Pipeline error')).toBeTruthy();
-    expect(screen.getAllByText('GPL ICMP Large ICMP Packet')).toHaveLength(1);
+    // Wait for the row itself. The word "Failed" is also on the view control,
+    // which draws before the rows arrive.
+    expect(await screen.findAllByText('GPL ICMP Large ICMP Packet')).toHaveLength(1);
+    expect(screen.getAllByText('Failed').length).toBeGreaterThan(0);
   });
 
   // The tile counted runs after excluding the dismissed and the superseded; the
@@ -473,7 +475,7 @@ describe('Investigations verdict filter options', () => {
     // byRole, not byText: 'Verdict'/'Status' are also column headers.
     fireEvent.click(await screen.findByRole('button', { name: 'Verdict' }));
     expect(screen.queryByLabelText('Untriaged')).toBeNull();
-    expect(screen.getByLabelText('Pipeline error')).toBeTruthy();
+    expect(screen.getByLabelText('Failed')).toBeTruthy();
 
     fireEvent.click(screen.getByRole('button', { name: 'Status' }));
     expect(screen.getByLabelText('Failed: error')).toBeTruthy();

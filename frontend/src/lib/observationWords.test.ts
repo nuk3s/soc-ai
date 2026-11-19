@@ -4,7 +4,7 @@
 // time the sweep wrote it.
 import { describe, expect, it } from 'vitest';
 import { anchoredSummary } from './observationWords';
-import { absoluteTime } from './timeRange';
+import { utcStamp } from './timeRange';
 
 const NOW = Date.parse('2026-10-19T10:00:00Z');
 const OLD = '2026-09-29T10:21:00Z';
@@ -12,10 +12,10 @@ const OLD = '2026-09-29T10:21:00Z';
 describe('anchoredSummary', () => {
   it('anchors a relative window of an old observation to its sweep', () => {
     expect(anchoredSummary('new port for this host: 4444. 3 documents in the last 24 h', OLD, NOW)).toBe(
-      `new port for this host: 4444. 3 documents in the 24 h before ${absoluteTime(OLD)}`,
+      `new port for this host: 4444. 3 documents in the 24 h before ${utcStamp(OLD)}`,
     );
     expect(anchoredSummary('The sweep did not see the host in the window', OLD, NOW)).toBe(
-      `The sweep did not see the host in the window before ${absoluteTime(OLD)}`,
+      `The sweep did not see the host in the window before ${utcStamp(OLD)}`,
     );
   });
 

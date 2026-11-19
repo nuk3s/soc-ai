@@ -87,6 +87,64 @@ describe('StageLadder', () => {
     expect((movement.querySelector('span[aria-hidden]') as HTMLElement).style.background).toBe('');
   });
 
+  it('states the earlier time with "by" when a later stage proves a stage earlier', () => {
+    // Access has its first proof on 2026-11-12. The action on the target has
+    // proof on 2026-10-28, and an action needs access.
+    const ladder = CAMPAIGN.ladder.map((s) =>
+      s.stage === 'access'
+        ? {
+            ...s,
+            reached: true,
+            firstAt: '2026-11-12T00:09:00Z',
+            members: 1,
+            proofRunId: 'inv-late',
+            heldBy: { at: '2026-10-28T22:44:56Z', stage: 'action' as const },
+          }
+        : s,
+    );
+    mount(ladder);
+    const access = screen.getByTestId('ladder-access');
+    expect(access).toHaveAttribute('data-reached', 'true');
+    expect(access).toHaveAttribute('data-implied', 'false');
+    expect(within(access).getByTestId('ladder-time')).toHaveTextContent(/^by 2026-10-28 22:44:56/);
+    const note = within(access).getByTestId('ladder-held');
+    expect(note).toHaveTextContent('Action on the target needs this stage and has proof at this time.');
+    expect(note).toHaveTextContent(/First proof of this stage itself: 2026-11-12 00:09:00/);
+    expect(note.className).toContain('break-words');
+    // The times of the ladder do not run backward.
+    const times = ['attempt', 'access', 'action'].map(
+      (stage) => within(screen.getByTestId(`ladder-${stage}`)).getByTestId('ladder-time').textContent ?? '',
+    );
+    const stamps = times.map((t) => t.replace(/^by /, ''));
+    expect([...stamps].sort()).toEqual(stamps);
+    // NEGATIVE CONTROL: a stage with the earliest proof of its own states no "by".
+    expect(within(screen.getByTestId('ladder-action')).getByTestId('ladder-time').textContent).not.toMatch(/^by /);
+    expect(within(screen.getByTestId('ladder-action')).queryByTestId('ladder-held')).toBeNull();
+  });
+
+  it('marks a stage that a later stage needs and that no investigation proves', () => {
+    const ladder = CAMPAIGN.ladder.map((s) =>
+      s.stage === 'access' ? { ...s, heldBy: { at: '2026-10-28T22:44:56Z', stage: 'action' as const } } : s,
+    );
+    mount(ladder);
+    const access = screen.getByTestId('ladder-access');
+    expect(access).toHaveAttribute('data-reached', 'false');
+    expect(access).toHaveAttribute('data-implied', 'true');
+    expect(within(access).queryByText('Not seen')).toBeNull();
+    expect(within(access).getByTestId('ladder-time')).toHaveTextContent(/^by 2026-10-28 22:44:56/);
+    expect(within(access).getByTestId('ladder-held')).toHaveTextContent(
+      'No investigation proves this stage itself. Action on the target needs this stage and has proof at this time.',
+    );
+    // A ring in the color of the stage, and no filled dot: the stage has no proof of its own.
+    const dot = access.querySelector('span[aria-hidden]') as HTMLElement;
+    expect(dot.style.background).toBe('');
+    expect(dot.style.borderColor).not.toBe('');
+    expect(within(access).queryByRole('link')).toBeNull();
+    // NEGATIVE CONTROL: a stage that no later stage needs still reads "Not seen".
+    expect(within(screen.getByTestId('ladder-movement')).getByText('Not seen')).toBeInTheDocument();
+    expect(screen.getByTestId('ladder-movement')).toHaveAttribute('data-implied', 'false');
+  });
+
   it('draws five steps when the server sends fewer', () => {
     mount([CAMPAIGN.ladder[1]]);
     const ladder = screen.getByTestId('stage-ladder');

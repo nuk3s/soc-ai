@@ -147,9 +147,10 @@ async def describe_dataset(
             "sampled": 0,
             "fields": [],
             "note": (
-                f"no documents named {ds} under event.dataset or data_stream.dataset "
-                "— check the exact name against the auto-discovered grid inventory (a "
-                "dataset that isn't listed there has no data on this grid)."
+                f"No document holds {ds} in event.dataset or data_stream.dataset. "
+                "Check the exact name against the grid inventory that soc-ai "
+                "discovers. A dataset that is not in the inventory has no data on "
+                "this grid."
             ),
         }
 
@@ -270,8 +271,9 @@ async def field_values(
                 "type": type(exc).__name__,
                 "message": str(exc),
                 "hint": (
-                    "the field may be text (not aggregatable) or unknown — run "
-                    "t_describe_dataset first to see the exact populated field names."
+                    "The field can be a text field, which does not aggregate, or an "
+                    "unknown field. Run t_describe_dataset first to see the exact "
+                    "names of the fields that hold data."
                 ),
             }
         buckets = ((result.aggregations or {}).get("vals") or {}).get("buckets") or []

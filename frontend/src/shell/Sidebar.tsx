@@ -6,6 +6,7 @@ import {
   ChevronsRight,
   Crosshair,
   History,
+  Inbox,
   Info,
   LayoutDashboard,
   Network,
@@ -19,11 +20,16 @@ import { Link, NavLink, useLocation } from 'react-router-dom';
 import { type ReactNode, useEffect, useState } from 'react';
 import { getAbout, getMe } from '../lib/api';
 import {
+  NEEDS_YOU_PAGE,
   campaignsWaiting,
+  decisionCount,
+  decisionFloor,
   investigationsWaiting,
   needsYouLinks,
   needsYouPart,
   reviewCount,
+  scopeOfWindow,
+  ANY_AGE,
   useNeedsYouCount,
 } from '../lib/needsYou';
 import type { AboutInfo, Me } from '../lib/types';
@@ -57,6 +63,10 @@ const NAV_GROUPS: NavGroup[] = [
     // The analyst's loop. Always open.
     label: 'Analyst',
     items: [
+      // The one list of every decision that waits, with the count of the top
+      // bar and the Dashboard tile. The analyst found the page through the
+      // tile and the bell only (dogfood 2026-11-17).
+      { to: NEEDS_YOU_PAGE, label: 'Needs you', icon: <Inbox size={16} /> },
       { to: '/dashboard', label: 'Dashboard', icon: <LayoutDashboard size={16} /> },
       // The campaign is the unit of work of the analyst (owner, 2026-11-14),
       // so Campaigns sits directly after Dashboard. Its item lights on the
@@ -129,17 +139,18 @@ interface NavBadge {
   tone: 'decision' | 'review';
   /** The words after the count in the accessible name: "need you". */
   noun: (n: number) => string;
+  /** True when a part of the count could not be read: the count is a floor
+   *  and shows "+", as the bell badge does. */
+  floor?: boolean;
 }
 
 const needYou = (n: number) => `need${n === 1 ? 's' : ''} you`;
 
-/** "7d" as "7 days", "24h" as "24 hours", for a badge tooltip. */
-function windowWords(range: string): string {
-  const m = range.match(/^(\d+)([mhd])$/);
-  if (!m) return range;
-  const n = Number(m[1]);
-  const unit = m[2] === 'm' ? 'minute' : m[2] === 'h' ? 'hour' : 'day';
-  return `${n} ${unit}${n === 1 ? '' : 's'}`;
+/** The scope of a badge tooltip in words: "in the last 7 days", or "at any
+ *  age" for the window "all". The Investigations badge read "in the last
+ *  all" (round 3 part 2, P3). */
+function scopeWords(range: string): string {
+  return range === 'all' ? ANY_AGE : `in the ${scopeOfWindow(range)}`;
 }
 
 /** What a badge shows: null for nothing, "?" for an unknown part, else the
@@ -208,7 +219,7 @@ function NeedsYouBadge({
       style={unknown || badge.tone === 'review' ? BADGE_STYLE.neutral : BADGE_STYLE.decision}
       title={unknown ? 'Could not read what needs you. Open the page to try again.' : badge.title}
     >
-      {unknown ? '?' : compact && value > 99 ? '99+' : value}
+      {unknown ? '?' : compact && value > 99 ? '99+' : `${value}${badge.floor ? '+' : ''}`}
     </Link>
   );
 }
@@ -271,8 +282,20 @@ export function Sidebar() {
   // with the same query, so the badge and the view state one number (ui-core 7).
   const needsYou = useNeedsYouCount();
   const links = needsYouLinks(needsYou.data);
-  const verdictWindow = windowWords(needsYou.data?.verdict_window ?? '30d');
+  const verdictScope = scopeWords(needsYou.data?.verdict_window ?? '30d');
   const badges: Record<string, NavBadge[]> = {
+    [NEEDS_YOU_PAGE]: [
+      {
+        testId: 'sidebar-needs-you-total',
+        value: needsYou.data ? decisionCount(needsYou.data) : null,
+        floor: needsYou.data ? decisionFloor(needsYou.data) : false,
+        title:
+          'Decisions that wait on you: the number of the top bar and the Dashboard. Select the badge to open the list.',
+        to: NEEDS_YOU_PAGE,
+        tone: 'decision',
+        noun: (n) => `${n === 1 ? 'decision waits' : 'decisions wait'} on you`,
+      },
+    ],
     '/campaigns': [
       {
         testId: 'sidebar-needs-you-campaigns',
@@ -287,7 +310,7 @@ export function Sidebar() {
       {
         testId: 'sidebar-needs-you-alerts',
         value: needsYouPart(needsYou.data, 'untriaged_groups'),
-        title: `Alert groups with no verdict in the last ${windowWords(needsYou.data?.alert_window ?? '7d')}. The count hides acknowledged groups.`,
+        title: `Alert groups with no verdict ${scopeWords(needsYou.data?.alert_window ?? '7d')}. The count hides acknowledged groups.`,
         to: links.untriaged,
         tone: 'decision',
         noun: needYou,
@@ -297,7 +320,7 @@ export function Sidebar() {
       {
         testId: 'sidebar-needs-you-investigations',
         value: investigationsWaiting(needsYou.data),
-        title: `Investigations that need more info or have a recommended action that waits for you, in the last ${verdictWindow}. An investigation of a campaign waits on the campaign. Select the badge to open the Needs you view.`,
+        title: `Investigations that need more info or have a recommended action that waits for you, ${verdictScope}. An investigation of a campaign waits on the campaign. Select the badge to open the Needs you view.`,
         to: links.investigations,
         tone: 'decision',
         noun: needYou,

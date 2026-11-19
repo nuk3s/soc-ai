@@ -139,7 +139,7 @@ describe('Hunts list keeps the whole hunt title', () => {
     expect(screen.getByTestId('schedule-objective-8').textContent).toBe('Nightly beacon sweep');
   });
 
-  it('holds a re-run objective whole on the hover in the bulk re-hunt result', async () => {
+  it('holds a re-run objective whole on the hover in the bulk hunt again result', async () => {
     vi.mocked(getHunts).mockResolvedValue([ROW]);
     rehuntHuntsMock.mockResolvedValue({
       started: [{ old_id: 'H-LONG', new_id: 'H-NEW', objective: TITLE_180 }],
@@ -150,7 +150,7 @@ describe('Hunts list keeps the whole hunt title', () => {
     const boxes = screen.getAllByRole('checkbox');
     fireEvent.click(boxes[boxes.length - 1]);
     const strip = await screen.findByTestId('list-toolbar-selection');
-    fireEvent.click(within(strip).getByText(/Re-hunt selected \(1\)/));
+    fireEvent.click(within(strip).getByText(/Hunt again \(1 selected\)/));
     fireEvent.click(await screen.findByText('Show detail'));
     const line = await screen.findByTestId('rehunt-objective-H-NEW');
     expect(line.textContent).toBe(TITLE_180);

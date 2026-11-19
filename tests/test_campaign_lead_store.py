@@ -35,7 +35,7 @@ def _columns(sc: Connection, table: str) -> dict[str, bool]:
     return {str(c["name"]): bool(c["nullable"]) for c in inspect(sc).get_columns(table)}
 
 
-async def test_the_head_is_0073_and_both_tables_hold_an_indexed_campaign_id(
+async def test_the_head_is_0076_and_both_tables_hold_an_indexed_campaign_id(
     settings_kratos: Settings,
 ) -> None:
     engine = make_engine(settings_kratos)
@@ -47,7 +47,7 @@ async def test_the_head_is_0073_and_both_tables_hold_an_indexed_campaign_id(
         lead_ix = await conn.run_sync(_indexes, "leads")
         hunt_ix = await conn.run_sync(_indexes, "hunts")
     await engine.dispose()
-    assert head == "0073"
+    assert head == "0076"
     assert leads["campaign_id"] is True
     assert hunts["campaign_id"] is True
     assert lead_ix["ix_leads_campaign_id"] == ["campaign_id"]

@@ -148,7 +148,9 @@ export function PipelineErrorChip({ hint, large }: { hint?: string | null; large
       title={hint ?? 'This investigation failed before it reached a verdict. Run it again.'}
     >
       <Wrench size={large ? 12 : 10} strokeWidth={2.5} />
-      Pipeline error
+      {/* One term for one state: the Failed view of the Investigations list
+          and the status read "Failed" (dogfood 2026-11-17, AB5). */}
+      Failed
     </span>
   );
 }

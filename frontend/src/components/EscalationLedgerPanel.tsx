@@ -3,7 +3,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 
 import { checkEscalationClaim, getStrandedEscalations, type StrandedClaim } from '../lib/api';
-import { absTime, agoWords } from '../lib/timeRange';
+import { agoWords, timeTitle } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import { useAsync } from '../lib/useAsync';
 import { Panel, PanelHeader } from './Panel';
@@ -114,7 +114,7 @@ function ClaimRow({ claim, check }: { claim: StrandedClaim; check: CheckState })
         </div>
         {/* The age is the fact: four minutes is a request in flight, and five
             days is an alert nobody can escalate. */}
-        <div className="mt-0.5 text-[12px] text-dim" title={absTime(claim.claimed_at)}>
+        <div className="mt-0.5 text-[12px] text-dim" title={timeTitle(claim.claimed_at)}>
           Escalation sent {agoWords(claim.claimed_at)}. Security Onion has not confirmed a case.
         </div>
       </div>

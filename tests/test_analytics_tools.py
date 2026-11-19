@@ -1843,3 +1843,35 @@ async def test_every_sweep_summary_names_the_population_it_counted(
     out = await first_seen(elastic=elastic, settings=settings_kratos)
     assert out["items"], "the novel-destination branch is the one under test here"
     assert "live telemetry only" in out["summary"]
+
+
+def test_the_first_seen_summary_of_a_cut_baseline_has_no_dash() -> None:
+    """The hunt step read "novelty here is approximate — a destination could"
+    (dogfood 2026-11-17, AB5). The console prints the summary of the tool as a
+    step title, so the text is soc-ai's and keeps the STE rules."""
+    from soc_ai.tools._provenance import LIVE
+    from soc_ai.tools.analytics import _first_seen_summary
+
+    cut = _first_seen_summary(
+        [{"dst": "198.51.100.7", "recent_events": 4}],
+        recent_destinations=100,
+        baseline_destinations=1000,
+        internal_excluded=0,
+        baseline_truncated=True,
+        provenance=LIVE,
+    )
+    assert "—" not in cut and "–" not in cut
+    assert cut.endswith(
+        " The baseline scan was cut, so the novelty is approximate. A new destination "
+        "can have an earlier record that the scan did not read."
+    )
+    # NEGATIVE CONTROL: a whole baseline adds no sentence about a cut.
+    whole = _first_seen_summary(
+        [{"dst": "198.51.100.7", "recent_events": 4}],
+        recent_destinations=100,
+        baseline_destinations=1000,
+        internal_excluded=0,
+        baseline_truncated=False,
+        provenance=LIVE,
+    )
+    assert "cut" not in whole

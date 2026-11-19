@@ -27,11 +27,11 @@ import {
   TAB_NEEDS_DECISION,
   WEIGHT_AT_FORMATION,
 } from '../lib/tooltips';
-import { outcomeLabel } from '../lib/labels';
 import {
   DISMISS_REASONS,
   HUNT_CLEAN_REASON,
   HUNT_CLOSED_LABEL,
+  closedOnVerdictsLabel,
   LEAD_ACTION,
   LeadsStrip,
   REASON_LABEL,
@@ -435,8 +435,22 @@ describe('LeadsStrip state pills', () => {
     expect(earlierThreat({ hunt_outcome: 'threats', hunt_threat_count: 2 })).toBe(false);
     expect(earlierThreat({ hunt_outcome: 'no_threat', hunt_threat_count: 2 })).toBe(true);
     expect(earlierThreat({ hunt_outcome: 'clean', hunt_threat_count: 0 })).toBe(false);
-    // The closure words are the label of the clean outcome.
-    expect(HUNT_CLOSED_LABEL).toBe(`Closed. ${outcomeLabel('no_threat')}.`);
+    // The closure words name the lead hunt, in the words of the one
+    // outcome map of a lead (F12).
+    expect(HUNT_CLOSED_LABEL).toBe('Closed. The lead hunt found no threat.');
+  });
+
+  // F12, shot i05: the pill read "Closed. No threat confirmed." above an
+  // investigation with a true positive on the card. The pill names whose
+  // conclusion it is.
+  it('names the lead hunt in the pill of a close on the verdicts', () => {
+    expect(closedOnVerdictsLabel('No threat confirmed')).toBe('Closed. The lead hunt confirmed no threat.');
+    // Negative controls: a count sentence keeps its counts, and no label
+    // states the rule.
+    expect(closedOnVerdictsLabel('1 confirmed · 0 not judged · of 1 threat finding')).toBe(
+      'Closed. 1 confirmed · 0 not judged · of 1 threat finding.',
+    );
+    expect(closedOnVerdictsLabel(null)).toMatch(/^Closed\. /);
   });
 
   it('derives the state from the record', () => {
@@ -740,7 +754,12 @@ describe('the fold', () => {
     expect(screen.queryByTestId('lead-7')).toBeNull();
     // The tabs filter a list nobody can see.
     expect(screen.queryByRole('button', { name: 'Needs decision' })).toBeNull();
-    expect(screen.queryByTestId('leads-legend')).toBeNull();
+    // N8: the definition and the legend sit in one closed disclosure, which
+    // stays while the section is folded.
+    const how = screen.getByTestId('how-leads-work');
+    expect(how.hasAttribute('open')).toBe(false);
+    expect(how).toContainElement(screen.getByTestId('define-lead'));
+    expect(how).toContainElement(screen.getByTestId('leads-legend'));
   });
 
   it('draws the rows and the tabs again when it is open', async () => {
@@ -774,7 +793,7 @@ describe('a lead the hunt closed', () => {
     mount();
     const row = await screen.findByTestId('lead-21');
     const pill = within(row).getByTestId('lead-status');
-    expect(pill.textContent).toBe('Closed. No threat found.');
+    expect(pill.textContent).toBe('Closed. The lead hunt found no threat.');
     expect(pill.getAttribute('title')).toBe(PILL_CLOSED_BY_HUNT);
     expect(pill.getAttribute('data-lead-state')).toBe('dismissed');
     expect(within(row).getByText('closed by soc-ai')).toBeTruthy();

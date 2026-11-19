@@ -19,7 +19,7 @@ import {
 import { evaluations, loopRuns, runsInProfileSweep } from '../lib/analyticRuns';
 import { entityPath as pathOfEntity } from '../lib/entityPath';
 import { plural } from '../lib/plural';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import {
   CHIP_ANALYTIC_REMOVED,
   CHIP_LIVE,
@@ -608,7 +608,7 @@ function HitCard({
           <span
             data-testid="analytic-hit-time"
             className="font-mono text-[11px] text-dim"
-            title={absTime(when)}
+            title={timeTitle(when)}
           >
             first seen {ago(when)}
           </span>

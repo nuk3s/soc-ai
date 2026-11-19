@@ -56,9 +56,11 @@ def test_a_candidate_becomes_a_finding_with_real_citations() -> None:
 def test_the_title_holds_the_whole_spec_title_and_the_entity() -> None:
     """The title was cut to 60 characters before the store, so the range held
     "Directory replication requested by a non-machin… — localuser". The console
-    wraps a long title, so the store keeps the spec title whole."""
+    wraps a long title, so the store keeps the spec title whole. The spec title
+    and the entity join with a colon (round 3 part 2, P5)."""
     (finding,) = candidate_findings(DCSYNC, _run())
-    assert finding["title"] == f"{DCSYNC.title} — localuser"
+    assert finding["title"] == f"{DCSYNC.title}: localuser"
+    assert "\u2014" not in finding["title"] and "\u2013" not in finding["title"]
     assert "…" not in finding["title"]
 
 
@@ -68,7 +70,7 @@ def test_a_200_character_spec_title_survives_the_store() -> None:
     ].strip()
     spec = DCSYNC.model_copy(update={"title": title})
     (finding,) = candidate_findings(spec, _run())
-    assert finding["title"] == f"{title} — localuser"
+    assert finding["title"] == f"{title}: localuser"
     assert len(finding["title"]) > 200
 
 
@@ -76,7 +78,7 @@ def test_a_very_long_spec_title_is_stored_whole_with_the_entity() -> None:
     """No title is cut. The owner banned the ellipsis cut on 2026-10-07."""
     spec = DCSYNC.model_copy(update={"title": "directory replication " * 40})
     (finding,) = candidate_findings(spec, _run())
-    assert finding["title"] == f"{spec.title} — localuser"
+    assert finding["title"] == f"{spec.title}: localuser"
     assert "…" not in finding["title"]
 
 
@@ -414,7 +416,7 @@ def test_every_shipped_spec_produces_a_renderable_finding() -> None:
             ],
         )
         (finding,) = candidate_findings(spec, run)
-        assert finding["title"] == f"{spec.title} — x"
+        assert finding["title"] == f"{spec.title}: x"
         assert len(finding["detail"]) > 40
         assert finding["severity"] in {"info", "low", "medium", "high", "critical"}
 
@@ -503,4 +505,32 @@ def test_a_spec_with_no_look_back_reports_exactly_as_it_did() -> None:
     clean = spec_report(DCSYNC, _run(candidates=[], matched_docs=0))
     assert (
         "Its precondition matched 47 document(s). This is a clean result." in (clean["narrative"])
+    )
+
+
+def test_the_detail_states_the_match_time_in_the_utc_form_of_the_console() -> None:
+    """Round 3 part 2, P1: the detail read "The match is at
+    2026-09-04T16:35:51Z", a raw ISO time beside the UTC times of the page."""
+    (finding,) = candidate_findings(DCSYNC, _run())
+    assert "The match is at 2026-09-04 16:35:51 UTC." in finding["detail"]
+    assert "T16:35" not in finding["detail"]
+    two = _run(
+        candidates=[
+            Candidate(
+                DCSYNC.id,
+                "localuser",
+                "user",
+                2,
+                ("idA", "idB"),
+                "idA",
+                ".ds-x",
+                "2026-09-04T16:35:51Z",
+                "2026-09-04T18:02:11.900Z",
+            )
+        ]
+    )
+    (finding,) = candidate_findings(DCSYNC, two)
+    assert (
+        "The first is at 2026-09-04 16:35:51 UTC. The last is at 2026-09-04 18:02:11 UTC."
+        in finding["detail"]
     )

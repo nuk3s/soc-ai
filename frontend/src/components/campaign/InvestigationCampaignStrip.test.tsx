@@ -19,7 +19,7 @@ describe('InvestigationCampaignStrip decisions', () => {
     expect(screen.getByTestId('investigation-campaign-sentence')).toHaveTextContent(
       'Part of the campaign actor-a against web-1. An analyst closed the campaign.',
     );
-    expect(screen.getByTestId('campaign-decision-chip')).toHaveTextContent('Closed');
+    expect(screen.getByTestId('campaign-state')).toHaveTextContent('Closed');
     expect(forbiddenWords(screen.getByTestId('investigation-campaign'))).toEqual([]);
   });
 
@@ -29,7 +29,8 @@ describe('InvestigationCampaignStrip decisions', () => {
       'Part of the campaign actor-a against web-1.',
     );
     expect(screen.getByTestId('investigation-campaign-sentence')).not.toHaveTextContent('closed');
-    expect(screen.getByTestId('campaign-decision-chip')).toHaveTextContent('Waits on you');
+    expect(screen.getByTestId('campaign-state')).toHaveTextContent('Open');
+    expect(screen.getByTestId('campaign-state')).toHaveAttribute('data-waits', 'true');
   });
 
   it('keeps the sentence of a verdict that differs, and states no decision for an older server', () => {
@@ -38,6 +39,6 @@ describe('InvestigationCampaignStrip decisions', () => {
     expect(screen.getByTestId('investigation-campaign-sentence')).toHaveTextContent(
       'Same session as the campaign actor-a against web-1. The verdict differs.',
     );
-    expect(screen.queryByTestId('campaign-decision-chip')).toBeNull();
+    expect(screen.getByTestId('campaign-state')).toHaveAttribute('data-waits', 'false');
   });
 });

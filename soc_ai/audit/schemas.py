@@ -357,6 +357,18 @@ AuditKind = Literal[
     # write then failed. The trail must state that the change did not happen.
     "needs_you_clear_failed",
     "needs_you_restore_failed",
+    # A decision of the analyst on the open false positives of a rule
+    # (soc_ai/api/webui/routes_rule_decisions.py). The decision writes to
+    # Security Onion, so ``rule_decision_made`` comes before the first write
+    # and fails closed. ``rule_decision_result`` states what the background
+    # work wrote. ``rule_decision_ended`` states the end of a standing
+    # decision. ``rule_decision_failed`` states a decision that the store did
+    # not save after its record. Each must be a valid audit kind or _audit
+    # drops it.
+    "rule_decision_made",
+    "rule_decision_result",
+    "rule_decision_ended",
+    "rule_decision_failed",
     "done",
     "error",
 ]

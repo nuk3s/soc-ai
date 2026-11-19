@@ -330,6 +330,28 @@ def finding_ends(
     return source, target
 
 
+def finding_pair(
+    src: str | None, dst: str | None, hosts: Sequence[str]
+) -> tuple[str | None, str | None]:
+    """(source, target) that the anchor document gives a finding run, or (None, None).
+
+    The source and the target of a finding investigation come from the hosts
+    of the finding. The flow of the anchor counts only when one of its ends is
+    an address that the finding names, the match of :func:`finding_ends`. An
+    anchor between other machines gives no pair. Prod run
+    01M7DPGFP4P5Q5HFR8QJM5QZXA judged a finding on a web server and one
+    client, and it stored the flow of a record between two other machines
+    that another finding cites. The page called that flow lateral movement.
+    The campaign and authorization reads take the columns of a row, so the
+    pair must hold a host of the finding or nothing.
+    """
+    named = {str(h).strip() for h in hosts if str(h).strip()}
+    source, target = _clean(src), _clean(dst)
+    if (source is not None and source in named) or (target is not None and target in named):
+        return source, target
+    return None, None
+
+
 def alert_ends(
     src: str | None, dst: str | None, host_name: str | None
 ) -> tuple[str | None, str | None]:
@@ -372,7 +394,9 @@ def run_values(inv: Any) -> list[str]:
     return [value for value in run_ends(inv) if value]
 
 
-def of_run(inv: Any, labels: Mapping[str, HostLabel] | None = None) -> str | None:
+def of_run(
+    inv: Any, labels: Mapping[str, HostLabel] | None = None, *, now: bool = False
+) -> str | None:
     """The first line of a stored run.
 
     The stored line, when the run has one and its verdict still stands. An
@@ -380,6 +404,13 @@ def of_run(inv: Any, labels: Mapping[str, HostLabel] | None = None) -> str | Non
     an older release stored does not exist: both are built here, from the
     verdict, the stored impact and the ends of the row. None for a run with
     no verdict and for a pipeline error.
+
+    ``now`` builds the line from ``labels``, the Hosts data of now, also for
+    a run that stores its line (round 3 part 2, W6). The page of one
+    investigation reads it: its host chips state the name and the role of
+    now, and the stored line stated the role of the end of the run. A page
+    read "actor (workstation)" in a chip and "actor (server)" in the line
+    below.
     """
     report = getattr(inv, "report", None)
     held = report if isinstance(report, dict) else {}
@@ -388,7 +419,12 @@ def of_run(inv: Any, labels: Mapping[str, HostLabel] | None = None) -> str | Non
     if words is None or is_pipeline_fallback(held):
         return None
     stored = held.get(FIRST_LINE_KEY)
-    if isinstance(stored, str) and stored.startswith(f"{words}.") and not held.get("resolution"):
+    if (
+        not now
+        and isinstance(stored, str)
+        and stored.startswith(f"{words}.")
+        and not held.get("resolution")
+    ):
         return stored
     source, target = run_ends(inv)
     return build(verdict, held.get("impact"), source, target, labels)
@@ -415,6 +451,7 @@ __all__ = [
     "end_text",
     "event_time_of",
     "finding_ends",
+    "finding_pair",
     "headline",
     "is_address",
     "labels_for",

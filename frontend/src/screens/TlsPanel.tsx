@@ -5,6 +5,7 @@ import type { TlsStatus } from "../lib/api";
 import { CollapseChevron } from "../components/Panel";
 import { ErrorState, LoadingState } from "../components/States";
 import { useAsync } from "../lib/useAsync";
+import { UtcTime } from "../components/UtcTime";
 
 function Row({ label, children }: { label: string; children: ReactNode }) {
   return (
@@ -136,7 +137,7 @@ export function TlsPanel({
               )}
               <dl>
                 <Row label="Expires">
-                  {data.not_after ? data.not_after.slice(0, 10) : "unknown"}
+                  {data.not_after ? <UtcTime iso={data.not_after} seconds={false} /> : "unknown"}
                   {daysSuffix(data)}
                 </Row>
                 <Row label="Names">

@@ -1,4 +1,5 @@
 import type { CustomRange } from '../components/TimeRangeFilter';
+import { consoleTimeZone } from './clock';
 
 // Shared time-range helpers so every page filters by the same presets the
 // TimeRangeFilter offers (and the backend's TIME_RANGES). Presets are
@@ -103,7 +104,8 @@ export function rangeToSinceUntil(
 // "4d", "4d ago" and "27h ago" on one page.
 //
 //   ago(iso)              "now", "8m ago", "4h ago", "4d ago"
-//   absoluteTime(iso)     "2026-10-01 08:18 EDT", in the browser zone
+//   absoluteTime(iso)     "2026-10-01 08:18 EDT", in the local zone of the
+//                         console: the browser zone or the picked zone
 //   formatDuration(199)   "3m 19s"
 //   timeLabel(iso)        { text: ago, title: absoluteTime } for a cell
 //   utcStamp(iso)         "2026-10-05 04:12 UTC", or with { seconds: true }
@@ -145,10 +147,14 @@ export function ago(iso: string | number | null | undefined, now = Date.now()): 
   return `${Math.floor(days / 365.25)}y ago`;
 }
 
-/** An absolute time in the browser zone, with the zone named:
+/** An absolute time in the local zone of the console, with the zone named:
  *  "2026-10-01 08:18 EDT". Year first, so two dates sort as they read. An
  *  empty value reads as an empty string, and an unparseable one as itself.
- *  `timeZone` is for tests. */
+ *
+ *  This is the one helper that gives the local time of a tooltip. The local
+ *  zone is the zone of the browser, or the zone that the analyst picked for
+ *  the second clock of the top bar (round 4, C4). `timeZone` names a zone
+ *  for a caller that needs one. */
 export function absoluteTime(
   iso: string | number | null | undefined,
   opts: { timeZone?: string } = {},
@@ -156,6 +162,7 @@ export function absoluteTime(
   if (iso == null || iso === '') return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return String(iso);
+  const timeZone = opts.timeZone ?? consoleTimeZone();
   const parts = new Intl.DateTimeFormat('en-US', {
     year: 'numeric',
     month: '2-digit',
@@ -164,7 +171,7 @@ export function absoluteTime(
     minute: '2-digit',
     hourCycle: 'h23',
     timeZoneName: 'short',
-    ...(opts.timeZone ? { timeZone: opts.timeZone } : {}),
+    ...(timeZone ? { timeZone } : {}),
   }).formatToParts(d);
   const get = (type: Intl.DateTimeFormatPartTypes): string =>
     parts.find((p) => p.type === type)?.value ?? '';
@@ -189,31 +196,51 @@ export function agoFromLabel(label: string | null | undefined): string {
   return /^\d+[smhd]$/.test(label.trim()) ? `${label.trim()} ago` : label;
 }
 
-/** The relative time for a cell and the absolute time for its title. */
+/** The relative time for a cell and the absolute time for its title. The
+ *  title states the time in UTC and the local time with its zone. */
 export function timeLabel(
   iso: string | number | null | undefined,
   now = Date.now(),
 ): { text: string; title: string } {
-  return { text: ago(iso, now), title: absoluteTime(iso) };
+  return { text: ago(iso, now), title: timeTitle(iso) };
 }
 
-/** Format an ISO timestamp as a readable absolute LOCAL time ("Jul 06, 2026,
- * 14:23:05"). Falls back to the raw string when unparseable, '—' when empty.
+/** An absolute time as a page shows it: UTC with the zone named, to the
+ *  second, "2026-07-06 18:23:05 UTC". It is the form of {@link utcStamp} on
+ *  the investigation page. An empty value reads as '—', and an unparseable
+ *  one as itself.
  *
- * `zone` adds the short name of the browser's time zone ("Jul 06, 2026,
- * 14:23:05 EDT"). A line of text that dates a list states its zone. The Hosts
- * note read 08:10 for a sweep that ran at 12:10 UTC, and nothing on the line
- * said which clock it read. A tooltip sits beside a relative time and can
- * leave the zone out. */
-export function absTime(iso?: string | null, opts: { zone?: boolean } = {}): string {
+ *  It gave the local time with no zone. The host rows, the entity rows and
+ *  other lists read a local time beside the UTC times of the investigation
+ *  page, and nothing said which clock they read (round 3, T3). The local
+ *  time with its zone goes in the tooltip: {@link localTitle}. */
+export function absTime(iso?: string | null): string {
   if (!iso) return '—';
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    ...(opts.zone ? { timeZoneName: 'short' as const } : {}),
-  });
+  return utcStamp(iso, { seconds: true });
+}
+
+/** The tooltip of an absolute time: the local time with its zone, "Local
+ *  time: 2026-07-06 14:23 EDT". An empty or unparseable value gives no
+ *  tooltip. `timeZone` is for tests. */
+export function localTitle(
+  iso: string | number | null | undefined,
+  opts: { timeZone?: string } = {},
+): string | undefined {
+  if (iso == null || iso === '' || Number.isNaN(new Date(iso).getTime())) return undefined;
+  return `Local time: ${absoluteTime(iso, opts)}`;
+}
+
+/** The tooltip of a relative time: the time in UTC, then the local time with
+ *  its zone. "2026-07-06 18:23 UTC. Local time: 2026-07-06 14:23 EDT". An
+ *  empty value gives an empty string, and an unparseable one itself. */
+export function timeTitle(
+  iso: string | number | null | undefined,
+  opts: { timeZone?: string } = {},
+): string {
+  if (iso == null || iso === '') return '';
+  const at = new Date(iso);
+  if (Number.isNaN(at.getTime())) return String(iso);
+  return `${utcStamp(at.toISOString())}. ${localTitle(iso, opts)}`;
 }
 
 /** A relative time in words, for a sentence: "5 days ago", "3 hours ago",
@@ -267,4 +294,30 @@ export function utcWindow(start: string, end: string, opts: UtcOptions = {}): st
   return aDay === bDay
     ? `${aDay} ${aTime} to ${bTime} UTC`
     : `${aDay} ${aTime} to ${bDay} ${bTime} UTC`;
+}
+
+// An ISO 8601 instant as a model or a tool writes it into prose:
+// 2026-11-04T15:36:54Z, 2026-11-04T15:36:54.120+00:00, 2026-11-04T15:36. A
+// time with no zone is UTC, the clock of the text the server writes.
+const ISO_INSTANT = /\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?(?![\w:])/g;
+
+/** Prose with each ISO instant in the form of {@link utcStamp}: one time form
+ *  on a page (dogfood 2026-11-17, AA5). The investigation page showed one
+ *  event in local time, in UTC and as "2026-11-04T15:36:54Z". An instant that
+ *  does not parse stays as it is. */
+/** The time of a step, "18:42:01", in the UTC form of the page: "18:42:01
+ *  UTC". The server stamps a step with the time of day in UTC, and the step
+ *  showed no zone (dogfood 2026-11-17, F15). Any other text stays. */
+export function stepTimeUtc(time: string | null | undefined): string {
+  const t = (time ?? '').trim();
+  return /^\d{2}:\d{2}(?::\d{2})?$/.test(t) ? `${t} UTC` : t;
+}
+
+export function utcTimesInText(text: string): string {
+  return text.replace(ISO_INSTANT, (instant) => {
+    const zoned = /(?:Z|[+-]\d{2}:?\d{2})$/.test(instant) ? instant : `${instant}Z`;
+    const at = new Date(zoned);
+    if (Number.isNaN(at.getTime())) return instant;
+    return utcStamp(at.toISOString(), { seconds: /T\d{2}:\d{2}:\d{2}/.test(instant) });
+  });
 }

@@ -302,7 +302,7 @@ describe('HuntDetail findings, part of a campaign', () => {
     const line = within(card(inCampaign.title)).getByTestId('finding-investigation');
     const chip = within(line).getByTestId('finding-campaign');
     expect(chip).toHaveAttribute('href', '/campaigns/7');
-    expect(chip).toHaveAccessibleName(/^Campaign: actor-a against web-1\. Stage reached: Action on the target/);
+    expect(chip).toHaveAccessibleName(/^Campaign 7 · Open: actor-a against web-1\. Stage reached: Action on the target/);
     // The chip leads the line.
     expect(line.firstElementChild).toBe(chip);
     expect(forbiddenWords(line)).toEqual([]);

@@ -31,8 +31,9 @@ export const DEFINE_HIT =
 
 export const DEFINE_LEAD =
   'A lead is a set of observations on one entity that are worth one look. soc-ai hunts each ' +
-  'new lead that is not a shadow lead. A clean hunt or a verdict on each threat it found ' +
-  'closes the lead. A lead of a campaign holds only alerts of the investigations of one ' +
+  'new lead that is not a shadow lead. A clean lead hunt or a verdict on each threat it found ' +
+  'closes the lead. Another hunt that reads the lead closes nothing: it writes its answer on ' +
+  'the lead. A lead of a campaign holds only observations of the investigations of one ' +
   'campaign. It waits on that campaign, and a close or an authorization of the campaign ' +
   'dismisses it. Any other lead waits on you.';
 
@@ -82,10 +83,10 @@ export const DEFINE_CAMPAIGN_DECISION =
   'authorization gets normal handling.';
 
 export const DEFINE_NEEDS_YOU =
-  'Needs you lists the work that waits on you, the oldest first. The work is the campaigns ' +
-  'with no decision, the investigations that wait, the leads that need a decision and the ' +
-  'alert groups with no verdict. The top bar, the Dashboard and the Needs you page state the ' +
-  'same number.';
+  'Needs you lists the work that waits on you, the most important first. The work is the campaigns ' +
+  'with no decision, the investigations that wait, the leads that need a decision, the rules ' +
+  'with open false positives and the alert groups with no verdict. The top bar, the Dashboard ' +
+  'and the Needs you page state the same number.';
 
 export const DEFINE_TWO_VERBS =
   '"Hunt this lead" starts the hunt of a lead now. "Open an investigation" is the control on ' +
@@ -507,10 +508,14 @@ export const CHIP_SEVERITY = 'The severity of this finding, as the hunt reported
  *  `label` is the screen word, "High". */
 export function severityTitle(label: string, source: 'rule' | 'finding' = 'rule'): string {
   if (source === 'finding') return `Finding severity: ${label}. The hunt reported it.`;
+  // The alert severity is the level that Security Onion records on the alert
+  // (`event.severity_label`). The rule metadata of a Suricata rule can carry a
+  // second level, `signature_severity`, and a card showed "rule severity High"
+  // beside "Signature severity Informational" (round 3 part 2, P4).
   if (label.toLowerCase() === 'unknown') {
-    return 'Rule severity: none. The alert document carries no severity label.';
+    return 'Alert severity: none. The alert document carries no severity label.';
   }
-  return `Rule severity: ${label}. The detection rule that raised the alert sets it.`;
+  return `Alert severity: ${label}. Security Onion records this level on the alert. The rule that raised the alert sets it.`;
 }
 
 /** The count beside the host and finding map of a hunt. It read "1F · 0H",
@@ -598,7 +603,8 @@ export function detectionKindTitle(kind: string): string {
 // ── The Dashboard counts ────────────────────────────────────────────────────
 
 export const COUNT_ALERT_EVENTS =
-  'The alert documents the grid holds in this window, and the detection groups they fall into.';
+  'The alert documents the grid holds in this window, and the detection groups they fall into. ' +
+  'The count includes acknowledged alerts.';
 
 /** The flow in the analyst's words, under the Needs you tile (owner,
  *  2026-10-07: "What is the user flow?"). The "How this flows" link follows
@@ -611,7 +617,7 @@ export const COUNT_NEEDS_YOU =
   'The decisions that wait on you: campaigns with no decision, leads to decide, alert groups with no verdict, verdicts that need more info and recommended actions. The bell states the same count. Unread shadow hits are review work, and the tile states them on their own line.';
 
 export const COUNT_TRUE_POSITIVES =
-  'True positives in this window. The Confirmed threats panel states the same count and lists each target host.';
+  'True positives in this window that wait on a decision. A true positive that a decided campaign or an authorization holds, and a superseded one, wait on nothing. The Confirmed threats panel states the same count.';
 
 // ── Confirmed threats ───────────────────────────────────────────────────────
 //
@@ -662,6 +668,10 @@ export const THREAT_AUTHORIZED =
 /** The count of the investigations of a campaign inside an authorized activity record. */
 export const THREAT_CAMPAIGN_AUTHORIZED =
   'True positive investigations of this campaign inside an authorized activity record. They request no case.';
+
+/** The quiet line of the decided campaigns under the Confirmed threats list. */
+export const THREAT_DECIDED =
+  'An analyst decided on these campaigns. Their true positive investigations wait on nothing. The link opens the decided campaigns.';
 
 export const COUNT_RUNNING = 'Investigations soc-ai is working now.';
 
@@ -866,9 +876,9 @@ export const ORACLE_REASON: Record<string, string> = {
   confidence_in_band: 'The confidence is in the gate band, from 0.4 to below 0.7.',
   template_split: 'The decision template and the model disagree on the verdict.',
   deep_needs_more_info: 'A deep investigation ended with the verdict Needs more info.',
-  needs_more_info: 'The local verdict is Needs more info.',
-  malware_non_tp: 'A malware or attack rule has a local verdict other than True positive.',
-  below_confidence: 'The local confidence is below 0.6.',
+  needs_more_info: 'The soc-ai verdict is Needs more info.',
+  malware_non_tp: 'A malware or attack rule has a soc-ai verdict other than True positive.',
+  below_confidence: 'The soc-ai confidence is below 0.6.',
   fallback_route: 'A fallback model route served this investigation.',
 };
 

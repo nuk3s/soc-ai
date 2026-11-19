@@ -22,6 +22,11 @@ one link holds between it and a member:
 
 An end with no machine never equals a machine. A true positive from a source
 outside the estate therefore joins no campaign of another actor.
+
+Each horizon check measures the gap between two activities (:func:`_apart`).
+The activity of a run goes from its event time to its end: the later alerts
+of a confirmed rule between its two machines (:attr:`RunFacts.active_until`).
+A run with no such end is one point in time, as before.
 """
 
 from __future__ import annotations
@@ -79,7 +84,30 @@ def _order(run: RunFacts) -> tuple[datetime, str]:
     return (_at(run), run.run_id)
 
 
+def _end(run: RunFacts) -> datetime:
+    """The end of the activity of an eligible run: its event time, or a later end.
+
+    The service sets :attr:`RunFacts.active_until` from the later alerts of
+    the run (round 4, E3). The engine reads no store and no clock.
+    """
+    at = _at(run)
+    held = run.active_until
+    return held if held is not None and held > at else at
+
+
 def _apart(a: RunFacts, b: RunFacts) -> timedelta:
+    """The gap between the activities of two runs, for each horizon check.
+
+    Each activity is an interval from the event time of the run to its end
+    (:func:`_end`). The gap goes from the end of the earlier one to the event
+    time of the later one, and it is 0 when the two overlap. With no end of
+    activity it is the distance between the two event times, as before.
+    """
+    return max(timedelta(0), _at(b) - _end(a), _at(a) - _end(b))
+
+
+def _distance(a: RunFacts, b: RunFacts) -> timedelta:
+    """The distance between the event times of two runs. The nearest member reads it."""
     return abs(_at(a) - _at(b))
 
 
@@ -160,7 +188,7 @@ class _Rules:
             and _is_hit(m)
             and r.source is not None
             and r.source == m.target
-            and _at(m) - self.gap <= _at(r) <= _at(m) + self.horizon
+            and _at(m) - self.gap <= _at(r) <= _end(m) + self.horizon
         )
 
     def joins(self, r: RunFacts, m: RunFacts) -> bool:
@@ -274,10 +302,11 @@ def _join_by_documents(
 def _actor_clusters(runs: Sequence[RunFacts], rules: _Rules) -> dict[str, list[RunFacts]]:
     """For each attack run with a source machine, the runs that the Actor link chains to it.
 
-    The attack runs of one source machine in time order, cut where two
-    neighbours are more than one horizon apart. Each run of a part reaches
-    each other run of it by Actor links, so the part joins as a whole. This
-    keeps the work linear for a source machine with thousands of runs.
+    The attack runs of one source machine in time order, cut where a run
+    starts more than one horizon after the end of the activity of the part
+    before it (:func:`_end`). Each run of a part reaches each other run of
+    it by Actor links, so the part joins as a whole. This keeps the work
+    linear for a source machine with thousands of runs.
     """
     by_source: dict[str, list[RunFacts]] = defaultdict(list)
     for r in runs:
@@ -286,10 +315,15 @@ def _actor_clusters(runs: Sequence[RunFacts], rules: _Rules) -> dict[str, list[R
     out: dict[str, list[RunFacts]] = {}
     for held in by_source.values():
         part: list[RunFacts] = []
+        # The latest end of the activity of the part. In time order and with
+        # no end of activity, this is the event time of the last run.
+        until: datetime | None = None
         for r in sorted(held, key=_order):
-            if part and _at(r) - _at(part[-1]) > rules.horizon:
+            if part and until is not None and _at(r) - until > rules.horizon:
                 part = []
+                until = None
             part.append(r)
+            until = _end(r) if until is None else max(until, _end(r))
             out[r.run_id] = part
     return out
 
@@ -673,7 +707,7 @@ def _parties(
 
 
 def _nearest(m: RunFacts, candidates: Sequence[RunFacts]) -> RunFacts:
-    return min(candidates, key=lambda o: (_apart(m, o), o.run_id))
+    return min(candidates, key=lambda o: (_distance(m, o), o.run_id))
 
 
 @dataclass

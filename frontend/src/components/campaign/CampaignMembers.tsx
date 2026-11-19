@@ -11,6 +11,8 @@ import {
 import {
   AUTHORIZED_CHIP,
   AUTHORIZED_CHIP_TITLE,
+  NEW_CHIP,
+  NEW_CHIP_TITLE,
   EXCLUDE_ACTION,
   EXCLUDE_CONFIRM,
   INCLUDED_CHIP,
@@ -21,7 +23,7 @@ import {
   UNDO_INCLUDE_CONFIRM,
   VIEW_HUNT,
   linkLabel,
-  linkSentence,
+  linkPieces,
   memberTypeLabel,
   partyName,
   stageLabel,
@@ -68,6 +70,10 @@ export function CampaignMembers({
   onClearSelection,
   embedded = false,
   writes,
+  fresh,
+  newOnly = false,
+  newWords,
+  onShowAll,
 }: {
   members: CampaignMember[];
   parties: CampaignParty[];
@@ -76,9 +82,20 @@ export function CampaignMembers({
   embedded?: boolean;
   /** Exclude and Undo on each row. */
   writes?: MemberWrites;
+  /** The investigations that are new since the earlier decision. Each row
+   *  of one carries the chip "New". */
+  fresh?: ReadonlySet<string>;
+  /** Show only the new investigations, with any verdict. */
+  newOnly?: boolean;
+  /** The line over the table while it shows only the new investigations. */
+  newWords?: string;
+  onShowAll?: () => void;
 }) {
   const [filter, setFilter] = useState<LinkFilter>('all');
-  const rows = members.filter((m) => !m.verdictDiffers);
+  // The new investigations are the rows of the control "Show the new
+  // investigations": a new one whose verdict differs is one of them too, so
+  // the count of the server and the rows are the same list.
+  const rows = newOnly && fresh ? members.filter((m) => fresh.has(m.runId)) : members.filter((m) => !m.verdictDiffers);
   if (rows.length === 0) return null;
   const picked = selection ? rows.filter((m) => selectionHolds(selection, m)) : rows;
 
@@ -113,6 +130,23 @@ export function CampaignMembers({
 
   const body = (
     <>
+      {newOnly && (
+        <div
+          data-testid="members-new-only"
+          className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-border-faint bg-warn/5 px-[15px] py-2 text-[12.5px] text-text-2"
+        >
+          <span className="break-words">{newWords ?? `Showing ${plural(rows.length, 'new investigation')}.`}</span>
+          {onShowAll && (
+            <button
+              type="button"
+              onClick={onShowAll}
+              className="rounded-control border border-border-strong bg-surface-2 px-2 py-0.5 text-[11.5px] text-text-2 hover:border-accent"
+            >
+              Show all investigations
+            </button>
+          )}
+        </div>
+      )}
       {selection && (
         <div
           data-testid="members-selection"
@@ -170,7 +204,14 @@ export function CampaignMembers({
           </thead>
           <tbody>
             {shown.map((m) => (
-              <MemberRow key={m.runId} m={m} names={names} labels={labels} writes={writes} />
+              <MemberRow
+                key={m.runId}
+                m={m}
+                names={names}
+                labels={labels}
+                writes={writes}
+                isNew={fresh?.has(m.runId) ?? false}
+              />
             ))}
           </tbody>
         </table>
@@ -191,11 +232,14 @@ function MemberRow({
   names,
   labels,
   writes,
+  isNew = false,
 }: {
   m: CampaignMember;
   names: Record<string, string>;
   labels: Record<string, string>;
   writes?: MemberWrites;
+  /** The event of the investigation is after the earlier decision. */
+  isNew?: boolean;
 }) {
   const [confirming, setConfirming] = useState(false);
   const outside = writes?.outside?.has(m.runId) ?? false;
@@ -215,8 +259,17 @@ function MemberRow({
         <Link to={runHref(m.runId)} className="break-words text-accent hover:underline">
           {m.label}
         </Link>
-        {(m.authorized || included || outside) && (
+        {(m.authorized || included || outside || isNew) && (
           <div className="mt-1 flex flex-wrap gap-1.5">
+            {isNew && (
+              <span
+                data-testid="member-new"
+                title={NEW_CHIP_TITLE}
+                className={`${CHIP} border-warn/50 bg-warn/10 font-semibold text-warn`}
+              >
+                {NEW_CHIP}
+              </span>
+            )}
             {m.authorized && (
               <span
                 data-testid="member-authorized"
@@ -275,9 +328,7 @@ function MemberRow({
       </td>
       <td className="min-w-[16rem] px-[15px] py-2.5">
         <div className="font-semibold text-text-2">{linkLabel(m.link)}</div>
-        <div data-testid="member-link-sentence" className="mt-0.5 text-dim [overflow-wrap:anywhere]">
-          {linkSentence(m, names, labels)}
-        </div>
+        <LinkSentence m={m} names={names} labels={labels} />
       </td>
     </tr>
     {writes && confirming && (
@@ -307,5 +358,38 @@ function MemberRow({
       </tr>
     )}
     </>
+  );
+}
+
+/** The link sentence of a row (W5). The id of the other investigation is
+ *  behind its link, and the id of a shared connection is in the hover of the
+ *  sentence. */
+function LinkSentence({
+  m,
+  names,
+  labels,
+}: {
+  m: CampaignMember;
+  names: Record<string, string>;
+  labels: Record<string, string>;
+}) {
+  const p = linkPieces(m, names, labels);
+  return (
+    <div data-testid="member-link-sentence" title={p.title} className="mt-0.5 text-dim [overflow-wrap:anywhere]">
+      {p.before}
+      {p.other &&
+        (p.other.runId ? (
+          <Link
+            data-testid="member-link-other"
+            to={runHref(p.other.runId)}
+            className="text-text-2 hover:text-accent hover:underline"
+          >
+            {p.other.words}
+          </Link>
+        ) : (
+          p.other.words
+        ))}
+      {p.after}
+    </div>
   );
 }

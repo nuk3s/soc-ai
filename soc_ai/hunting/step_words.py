@@ -64,6 +64,13 @@ _PAGE_SENTENCES: tuple[tuple[str, str], ...] = (
 _GRID_UNAVAILABLE_RE = re.compile(r"^\s*The Security Onion grid did not answer this query\b", re.I)
 _GRID_UNAVAILABLE_WORDS = "The grid did not answer this query. The result is unknown."
 
+# The text soc-ai writes for the model when the grid answered and rejected the
+# query (soc_ai.so_client.rejected_query.model_message). The model reads the
+# reason of Elasticsearch and corrects the query. The page states what
+# happened. The grid was up, so the page must not say that it did not answer.
+_QUERY_REJECTED_RE = re.compile(r"^\s*The Security Onion grid is up\. It rejected this query\b")
+_QUERY_REJECTED_WORDS = "The grid rejected the query. The result is unknown."
+
 _UNIT_MINUTES = {"time_range_minutes": 1, "lookback_hours": 60, "lookback_days": 1440}
 
 # What the agent does while a tool runs, by tool. Any other tool reads as
@@ -115,6 +122,8 @@ def translate_tool_error(message: str | None, *, retried: bool = False) -> str |
             sentence = _LEADING_WILDCARD_WORDS
         elif _GRID_UNAVAILABLE_RE.search(text):
             sentence = _GRID_UNAVAILABLE_WORDS
+        elif _QUERY_REJECTED_RE.search(text):
+            sentence = _QUERY_REJECTED_WORDS
         elif "partial search results" in text.lower():
             # The grid client's text is the model's (R3 STE 14). The catalog
             # composer already words it for the page, so the two agree.

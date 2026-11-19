@@ -11,12 +11,13 @@ module exposes a plain ``async def`` so step 5 can wrap it without restructuring
 
 from __future__ import annotations
 
+import logging
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal, get_args
 
 from soc_ai.config import Settings
-from soc_ai.so_client import fields
+from soc_ai.so_client import fields, query_forms
 from soc_ai.so_client.elastic import ElasticClient, EsSearchResult
 from soc_ai.so_client.oql import (
     And,
@@ -39,6 +40,8 @@ from soc_ai.so_client.widen import Widening, widen_filter
 from soc_ai.tools._field_check import CheckedField, absent_field_note
 from soc_ai.tools._registry import tool
 from soc_ai.tools._synth_scope import SynthScope, synth_scope_must_not
+
+_LOGGER = logging.getLogger(__name__)
 
 # Hard ceiling on the requested window. This is an LLM-callable read tool —
 # alert-embedded text is in-scope prompt-injection surface, so an unbounded
@@ -237,7 +240,7 @@ WindowMode = Literal["around", "before"]
 
 _AROUND_NOTE = (
     "This window is CENTRED on the alert: half of it is BEFORE the alert and "
-    "half AFTER. It is not 'the last {minutes} minutes' — it reaches back only "
+    "half AFTER. It is not 'the last {minutes} minutes'. It reaches back only "
     "{half} minutes. For a how-often / how-many-in-the-last-N question, ask "
     "again with window_mode='before', which puts the whole span behind the "
     "alert."
@@ -330,6 +333,24 @@ def _build_time_filter(
     return {"range": {"@timestamp": {"gte": gte, "lte": lte}}}, descriptor
 
 
+async def _field_types(
+    elastic: ElasticClient, index: str, names: set[str]
+) -> query_forms.FieldTypes | None:
+    """The field types of ``names`` over ``index``, or ``None`` with no answer.
+
+    No answer covers a grid that refuses the read and a client double that has
+    no ``field_types``: the query then goes as written.
+    """
+    if not names:
+        return None
+    try:
+        types = await elastic.field_types(index, names)
+    except Exception as exc:
+        _LOGGER.info("field types of %s not read (the query goes as written): %r", index, exc)
+        return None
+    return types if isinstance(types, dict) else None
+
+
 def _utc_z(at: datetime) -> str:
     """An aware time as ISO UTC with a ``Z`` suffix."""
     return at.astimezone(UTC).isoformat().replace("+00:00", "Z")
@@ -350,6 +371,7 @@ async def query_events_oql(
     window_mode: WindowMode = "around",
     include_synth: SynthScope = False,
     widen_names: bool = True,
+    rewrite_forms: bool = True,
 ) -> EsSearchResult:
     """Run a validated OQL query against ``settings.events_index_pattern``.
 
@@ -377,6 +399,11 @@ async def query_events_oql(
             both dataset name fields and both alert labels
             (:func:`soc_ai.so_client.widen.widen_filter`). The Sigma dry run
             passes false, because it must test the rule as written.
+        rewrite_forms: When true, a wildcard of whole octets on an ``ip``
+            field becomes the CIDR and a time with a space on a ``date`` field
+            becomes ISO 8601 (:func:`soc_ai.so_client.query_forms.rewrite`).
+            :attr:`EsSearchResult.rewrites` states each one. The Sigma dry run
+            passes false for the reason of ``widen_names``.
 
     Returns:
         An :class:`EsSearchResult`. For ``groupby`` queries the response holds
@@ -407,8 +434,24 @@ async def query_events_oql(
     # One value has several field names, so a filter on one name reads each
     # name (soc_ai.so_client.widen). The Sigma dry run turns this off: Security
     # Onion matches the name that a rule holds.
+    index = settings.events_index_pattern
+    # The field types of the grid decide the forms that the grid takes
+    # (soc_ai.so_client.query_forms). One cached field-caps read, only for a
+    # query that has such a form.
+    types = await _field_types(
+        elastic, index, query_forms.fields_to_type(ast, rewrite=rewrite_forms)
+    )
+    rewrites: tuple[str, ...] = ()
+    if rewrite_forms:
+        rewritten = query_forms.rewrite(ast, types)
+        ast, rewrites = rewritten.ast, rewritten.notes
+    unmapped_type = query_forms.sort_unmapped_type(ast, types, index=index)
     widening = widen_filter(ast.filter_) if widen_names else Widening(filter_=ast.filter_)
-    body = ast_to_es_dsl(replace(ast, filter_=widening.filter_), default_size=max_results)
+    body = ast_to_es_dsl(
+        replace(ast, filter_=widening.filter_),
+        default_size=max_results,
+        sort_unmapped_type=unmapped_type,
+    )
 
     time_filter, window = _build_time_filter(time_range_minutes, time_anchor, window_mode)
     wrapped_bool: dict[str, Any] = {
@@ -447,6 +490,8 @@ async def query_events_oql(
     )
     result.counted = _counted_descriptor(result.aggregations, settings.events_index_pattern)
     result.window = window
+    # The model sees the form that the grid took, so its next query is right.
+    result.rewrites = list(rewrites) or None
     # A query with no aggregating stage documents `aggregations is None`; the
     # reserved keys must not be what makes it a dict.
     if not result.aggregations:

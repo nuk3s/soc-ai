@@ -31,11 +31,23 @@ describe('finding citations in words', () => {
   it('names a tool citation in words', () => {
     expect(citationWords('t_origin_chain(10.99.0.40)')).toBe('Origin chain of 10.99.0.40');
     expect(citationWords('t_decode_payload(doc_id="abc123")')).toBe('Decoded payload of abc123');
-    expect(citationWords('t_host_dossier(10.1.10.11)')).toBe('Host dossier of 10.1.10.11');
+    expect(citationWords('t_host_dossier(10.1.10.11)')).toBe('Host record of 10.1.10.11');
     expect(citationWords('t_new_tool(x)')).toBe('New tool of x');
     // Negative control: a document id stays a document id.
     expect(citationWords('tel-doc-000001')).toBeNull();
     expect(citationWords('AZK3x9_tq7')).toBeNull();
+  });
+
+  it('names the space form and a bare known tool in words (AB5)', () => {
+    // Dogfood 2026-11-17: the chips printed "t_query_events_oql BPFDoor
+    // groupby" and "t_first_seen".
+    expect(citationWords('t_query_events_oql BPFDoor groupby')).toBe('Event search: BPFDoor groupby');
+    expect(citationWords('t_prevalence 192.0.2.10 198.51.100.4')).toBe('Prevalence check: 192.0.2.10 198.51.100.4');
+    expect(citationWords('t_first_seen')).toBe('First sighting');
+    // NEGATIVE CONTROL: a document id that starts with "t_" and names no
+    // tool stays a document id.
+    expect(citationWords('t_iok6EB6RQ6BUvoCeug')).toBeNull();
+    expect(citationWords('t_abcdef')).toBeNull();
   });
 
   it('renders the words and keeps the document chip for a document', async () => {

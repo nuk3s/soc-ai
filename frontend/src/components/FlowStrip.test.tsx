@@ -471,17 +471,17 @@ describe('huntFlow', () => {
     });
   });
 
-  it('a hunt whose every query failed reads could not run and names Re-hunt', () => {
+  it('a hunt whose every query failed reads could not run and names Hunt again', () => {
     const failed = threat({ category: 'visibility_gap', title: 'DCSync by a non-machine: could not run' });
     const steps = huntFlow(
       hunt({ kind: 'triggered', starter: 'catalog', outcome: 'could_not_run', findings: [failed], findingsTotal: 0 }),
     );
     expect(step(steps, 'hunt').note).toBe('could not run');
-    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', control: 'Re-hunt' });
+    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', control: 'Hunt again' });
     expect(step(steps, 'investigations').note).toBeUndefined();
     // An older server sends no outcome. The findings answer.
     const legacy = huntFlow(hunt({ kind: 'triggered', starter: 'catalog', findings: [failed] }));
-    expect(step(legacy, 'investigations')).toMatchObject({ state: 'next', control: 'Re-hunt' });
+    expect(step(legacy, 'investigations')).toMatchObject({ state: 'next', control: 'Hunt again' });
   });
 
   it('two findings that share one investigation count its actions once', () => {
@@ -501,10 +501,10 @@ describe('huntFlow', () => {
   });
 
   // Negative control: a stopped hunt is never a hunt with findings.
-  it('a stopped hunt names Re-hunt and no investigation', () => {
+  it('a stopped hunt names Hunt again and no investigation', () => {
     const steps = huntFlow(hunt({ status: 'error', findings: [] }), 12);
     expect(step(steps, 'hunt').note).toBe('stopped');
-    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', control: 'Re-hunt' });
+    expect(step(steps, 'investigations')).toMatchObject({ state: 'next', control: 'Hunt again' });
     expect(step(steps, 'verdicts').state).toBe('not_yet');
   });
 });

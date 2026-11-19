@@ -8,12 +8,14 @@ keep per-event write amplification off the SQLite WAL.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from soc_ai.run_meter import RunMeter, SearchMeter
 from soc_ai.so_client.fields import detection_kind_of_alert_payload
+from soc_ai.store import first_line
 from soc_ai.store import investigations as inv_svc
 
 _LOGGER = logging.getLogger(__name__)
@@ -74,6 +76,7 @@ class InvestigationRecorder:
         finding_ordinal: int | None = None,
         is_synth_eval: bool = False,
         subject: dict[str, Any] | None = None,
+        finding_hosts: Sequence[str] | None = None,
     ) -> None:
         self._maker = maker
         self._alert_id = alert_id
@@ -113,6 +116,10 @@ class InvestigationRecorder:
         # at birth so the row says what it was about even if the run dies
         # before its first event.
         self._subject = subject
+        # The hosts of the promoted finding, on a finding run only. The flow of
+        # the anchor counts only when it touches one of them
+        # (first_line.finding_pair). None on every other run.
+        self._finding_hosts = list(finding_hosts) if finding_hosts is not None else None
         # What the run costs: read off the same events this recorder persists,
         # so the counters on the row and the trail cannot disagree.
         self._meter = RunMeter()
@@ -166,10 +173,12 @@ class InvestigationRecorder:
                 )
                 if rule:
                     self._rule_name = str(rule)
+            pair = self._anchor_pair(payload)
             if self._src_ip is None:
-                self._src_ip = _dig(payload, "alert.source_ip")
-                self._dest_ip = _dig(payload, "alert.destination_ip")
-            if self._host_name is None:
+                self._src_ip, self._dest_ip = pair
+            # The machine of an anchor that gives a finding run no pair is no
+            # host of the finding either, so the row does not name it.
+            if self._host_name is None and (self._finding_hosts is None or any(pair)):
                 self._host_name = _dig(payload, "alert.host_name")
             if self._detection_kind is None and self._kind not in inv_svc.PROMOTED_KINDS:
                 # The row was born with the "suricata" default. The alert
@@ -189,6 +198,18 @@ class InvestigationRecorder:
             self._report = payload
         if len(self._buffer) >= FLUSH_EVERY:
             await self._flush()
+
+    def _anchor_pair(self, payload: dict[str, Any]) -> tuple[Any, Any]:
+        """The source and the target of the anchor that the row stores.
+
+        A finding run keeps the flow of its anchor only when one end is a host
+        of the finding. Every other run keeps the flow of its anchor.
+        """
+        src = _dig(payload, "alert.source_ip")
+        dst = _dig(payload, "alert.destination_ip")
+        if self._finding_hosts is None:
+            return src, dst
+        return first_line.finding_pair(src, dst, self._finding_hosts)
 
     async def _flush(self) -> None:
         if not self._buffer or self.investigation_id is None:

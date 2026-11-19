@@ -9,11 +9,12 @@
 // The server builds the list from the documents the run already stores, so
 // the page makes no grid query. No time is sliced from an ISO string here:
 // every time goes through the one formatter in lib/timeRange.ts.
-import { formatDuration, utcStamp, utcWindow } from '../lib/timeRange';
+import { formatDuration, utcWindow } from '../lib/timeRange';
 import { EVENT_CITED, eventFindingTitle } from '../lib/tooltips';
 import type { EventTimeline, EventTimelineEntry, EventTimelineWave } from '../lib/types';
 import { DocumentChip } from './DocumentDrawer';
 import { Panel } from './Panel';
+import { UtcTime } from './UtcTime';
 
 const CHIP_CLASS =
   'rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] text-text-2';
@@ -77,7 +78,7 @@ function EntryRow({ entry, markCited }: { entry: EventTimelineEntry; markCited: 
   return (
     <li data-testid="event-row" className="px-[15px] py-2 text-[12.5px]">
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="font-mono text-[11.5px] text-text-2">{utcStamp(entry.at, { seconds: true })}</span>
+        <UtcTime className="font-mono text-[11.5px] text-text-2" iso={entry.at} />
         {entry.dataset && <span className="font-mono text-[11.5px] text-dim">{entry.dataset}</span>}
         {flow && <span className="font-mono text-[11.5px] text-dim">{flow}</span>}
         {lasted != null && lasted > 0 && <span className="text-[11.5px] text-dim">{`lasted ${formatDuration(lasted)}`}</span>}

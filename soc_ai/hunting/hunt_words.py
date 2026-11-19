@@ -19,6 +19,7 @@ from collections.abc import Mapping
 
 __all__ = [
     "ALERT_ONLY_NOTE",
+    "NAME_NOTE",
     "campaign_of",
     "catalog_parts",
     "first_sentence",
@@ -203,6 +204,14 @@ def _reworded(text: str) -> str:
     return text
 
 
+# The note of a finding whose text names a known machine that is no host of
+# the finding (soc_ai.campaigns.finding_names). A host name holds no space.
+NAME_NOTE = "The text names {name}. The hosts of this finding do not include {name}."
+_NAME_NOTES = re.compile(
+    r"\s*The text names (?P<name>\S+)\. The hosts of this finding do not include (?P=name)\."
+)
+
+
 def validator_note(text: str | None) -> str | None:
     """A stored validator note, reworded when an older build wrote it.
 
@@ -210,14 +219,19 @@ def validator_note(text: str | None) -> str | None:
     gate, then :data:`DEGRADED_FINDING_NOTE`. The gate note is reworded alone,
     and the degraded note stays behind it. A rewording of the whole field
     dropped the mark, and the finding then did not state it on the page.
+    A name note (:data:`NAME_NOTE`) stays behind the gate note for the same
+    reason.
     """
     if not text:
         return None
+    names = "".join(f" {m.group(0).strip()}" for m in _NAME_NOTES.finditer(text))
+    text = _NAME_NOTES.sub("", text).strip()
     head, mark, _tail = text.partition(DEGRADED_FINDING_NOTE)
     if not mark:
-        return _reworded(text)
+        return f"{_reworded(text) if text else ''}{names}".strip() or None
     head = head.strip()
-    return f"{_reworded(head)} {DEGRADED_FINDING_NOTE}" if head else DEGRADED_FINDING_NOTE
+    words = f"{_reworded(head)} {DEGRADED_FINDING_NOTE}" if head else DEGRADED_FINDING_NOTE
+    return f"{words}{names}"
 
 
 # A step that needs the grid, the sensors or the data pipeline. The analyst

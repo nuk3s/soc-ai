@@ -6,6 +6,280 @@ All notable changes to this project are documented here. The format is based on
 
 ## [Unreleased]
 
+### Rejected queries
+
+- **The cause.** Elasticsearch answers a query that is wrong for the type of a field with failed
+  shards, and the other shards answer. soc-ai called this "the grid did not answer". The model
+  then could not correct the query, and a hunt stated that the hunt could not read evidence that
+  the grid holds.
+- **The model.** A tool result of such a query holds the reason `query_rejected`, the reason text
+  of Elasticsearch and a hint with the correct form. A hunt does not count a rejected query as a
+  grid failure, and a rejected query keeps no lead open.
+- **The analyst.** An analyst query that the grid rejects answers 400 `query_rejected`. The
+  answer states the correct form first, then the reason text of Elasticsearch. The Alerts page
+  shows the answer under "The grid rejected the filter" and stops the poll.
+- **Two rewrites.** The OQL tool writes an IP wildcard of whole octets as a CIDR, and a time with
+  a space as ISO 8601 in UTC. The OQL tool reads the field types of the grid first, and the tool
+  result states each rewrite.
+- **The sort.** The `unmapped_type` of a `sortby` field comes from the field types of the grid.
+  An index that does not map the field does not fail the search.
+- **Partial results.** With `es_fail_on_partial_results=false`, a rejected query returns no hits.
+
+### The end of a campaign
+
+- **The rule.** A campaign ends one horizon after the last activity of the campaign. The last
+  activity is the later of the last investigation event and the last alert of a confirmed rule
+  between the machines of the campaign. An alert of a rule that soc-ai did not confirm does not
+  count.
+- **The end check.** An ended campaign gets one more grid read of the horizon after the last
+  activity. An alert in that horizon opens the campaign again.
+- **New investigations.** A new attack of an actor joins the campaign that later alerts of that
+  actor keep open.
+- **The chips.** The hover text of the chips "Open" and "Ended" states the activity of the last
+  horizon. The chip "Closed" of a campaign that ended states that new activity starts a new
+  campaign.
+- **Two authorizations.** With an authorization on the campaign, the line of a stored record with
+  a rule list names that record as the earlier authorization. Two records with one name read as
+  two statements of one authorization.
+- **Migration 0076.** Two columns of `campaigns` hold the last alert time and the end of the grid
+  read. The migration fills the two columns from the stored grid read.
+
+### The clock of the top bar
+
+- **UTC.** The top bar states the time now in UTC, for example "14:32 UTC". The tooltip of the
+  clock states the full date and time.
+- **A second clock.** The analyst can add a second clock for the zone of the browser or for
+  another IANA zone. The second clock states the weekday when the date of that zone is not the
+  UTC date. The browser keeps the choice, and a second tab follows a change.
+- **One local time.** A zone from "Another zone" is the local time of each time tooltip.
+- **Width.** At 1100 px the top bar holds both clocks with no cut text. With no room, the Ask
+  button reads "Ask soc-ai". A long health label takes the room of the second clock.
+
+### Rule decisions
+
+- **Open false positives.** soc-ai gives a false positive verdict and a guard holds the automatic
+  acknowledge. The alert stays open and no list holds the alert. Before this change the analyst
+  opened each investigation and pressed Acknowledge once for each.
+- **One row for each rule.** Needs you lists each rule with open false positives after the
+  investigations. The row states the count, the two groups, the machines, the span of the events
+  and why soc-ai held the acknowledge. The count, the sidebar, the Dashboard tile and the bell add
+  the rules.
+- **Two groups.** The group "checked evidence" passed the evidence guards, and the hold is the
+  class of the rule or a failed acknowledge. The group "weak evidence" has a confidence under the
+  limit, no record read, no citation, an Oracle dissent or an earlier true positive. An
+  investigation can come from a time when automatic acknowledge was off. Such an investigation has
+  checked evidence only when the confidence reaches the limit and the investigation read a record.
+- **The page of a rule.** The page shows the events of the rule for each UTC day, the machines,
+  the hold reasons and sample investigations with the sentence of soc-ai. A rule that also holds a
+  true positive states that at the top.
+- **One decision.** The analyst acknowledges the false positives with checked evidence of a rule
+  at once. A check box adds those with weak evidence. In the background, soc-ai acknowledges the
+  alert and the inherited cluster of each investigation. Each investigation gets a receipt. The
+  decision never acknowledges an alert with a true positive verdict, a needs more information
+  verdict or an analyst verdict.
+- **A standing decision.** The analyst can let soc-ai acknowledge each later false positive of the
+  rule for 30 days. The setting `rule_decision_days` holds the term. The decision lifts the hold
+  for a high stakes rule class and no other guard. The decision ends after the term, when the
+  analyst ends the decision, and at once when the rule gets a true positive verdict. soc-ai
+  refuses a standing decision for a rule that holds a true positive, and while automatic
+  acknowledge is off.
+- **The state of the grid.** A background step reads if each alert is open, acknowledged or gone.
+  An alert that Security Onion acknowledged is in no count. When the grid does not answer, the
+  page states the time of the last read.
+- **What a press writes.** Each button states the count before the press: the alerts of the
+  investigations, the alerts that inherit the verdict of those investigations and the alerts that
+  stay open. The count of the open alerts of the rule states the window of 30 days. When the grid
+  does not answer, the text says that the count is unknown.
+- **The machines of a true positive.** The main choice leaves out each false positive between the
+  two machines of a true positive of the rule. A check box adds those false positives. The chart
+  marks the day of each true positive, and the machine list marks the machines of each true
+  positive.
+- **A rule that soc-ai acknowledges by itself.** When soc-ai acknowledges the new false positives
+  of a rule with no rule decision, the page states the date. The page also states that the open
+  false positives are from before that date. soc-ai offers no standing decision for such a rule.
+- **The investigation page.** The card of a held acknowledge states the open false positives of
+  the rule and links the decision. The page names "Decide on the rule" as the next step. After a
+  rule decision the card states the receipt.
+- **The chart "How this flows"** names the rules in the Needs you box of the chart.
+- **Migration 0075** adds the tables `rule_decisions` and `rule_alert_states`.
+
+### A campaign that opens again
+
+- **The earlier decision stays on record.** Each change that opens a campaign again holds the
+  decision that the change ended: the decision, the reason, the note, the analyst, the time and
+  what the decision covered. The rebuild, "Open again" and a revoked authorization write such a
+  change.
+- **What is new since the decision.** A campaign that opens again states the earlier decision and
+  the investigations with an event after that decision: the count for each verdict, the machines,
+  the span of the events, how many an authorization holds and whether the stage rose. One function
+  gives these facts to each surface.
+- **Where the new facts show.** The Needs you row states the reason and the new facts, with the
+  machines of the new activity first. The campaign page states the new facts in the banner. The
+  Confirmed threats row and the bell state the count.
+- **The new investigations.** "Show the new investigations" on the campaign page opens only the
+  new investigations. Each one carries the chip "New". The timeline marks the span after the
+  earlier decision.
+- **The words of a hunt answer.** A hunt that found nothing new on a campaign or a lead reads "It
+  found no activity that the campaign does not hold." Before this change the line read "found no
+  new event" beside a campaign that opened again on the same day.
+- **The span of a campaign.** A campaign that is not ended reads the grid to now. The span of the
+  campaign ends at the later of the last investigation event and the last alert event of the
+  confirmed rules. Before this change the read ended 30 minutes after the last investigation
+  event. A later alert takes the verdict of an earlier investigation, so the campaign did not show
+  the later alert.
+- **Later alert events.** The banner, the Needs you row and the hunt answer line state the alert
+  events after the newest investigation event: the count, the rules and the last time.
+- **A close covers what the page states.** A close acknowledges the alerts up to the grid read
+  that the page states, and the decision records that time.
+- **A closed campaign opens again when the activity continues.** The refresh loop reads the grid
+  for a closed campaign that is not ended. After the close, an open alert of a confirmed rule
+  between the machines of the campaign opens the campaign again. An alert of another rule and an
+  acknowledged alert open nothing. An authorized campaign and a campaign with a case do not
+  change.
+- **Outside the authorization.** The banner and the Needs you row name the new true positives
+  that no authorization holds, with the rules of those true positives. The banner and the row
+  state each authorization in force and when that authorization ends. The banner links the hunt
+  that the reopen started, with the outcome of the hunt.
+- **True positives that an earlier close covered.** A true positive of a campaign that soc-ai
+  opened again does not wait when the event of the true positive is before the earlier decision.
+  The tile, the panel, the true positives view and the host page state those apart. After
+  "Open again" by the analyst each true positive of the campaign waits.
+- **The split of the new investigations.** The Confirmed threats row and the bell state the count
+  for each verdict and what an authorization holds.
+- **One count for each fact.** The authorization line counts the investigations that the campaign
+  holds. The header and the Alerts fold name the confirmed rules and the other rules apart.
+- **The lead of a campaign that opened again** states the reopen and stays closed.
+- **The link column** of the campaign investigations states each link in words. The ids are
+  behind the links.
+- **One alert count.** The refresh loop reads the grid after a rebuild changes a campaign. The
+  Dashboard, Needs you, the campaigns list and the campaign page state the same count. When the
+  grid does not answer, each surface states the time of the grid read.
+
+### Times and the top bar
+
+- **One time form.** Each page states an absolute time in UTC with the label. The tooltip states
+  the local time with the zone. A relative time keeps the relative form, and the tooltip of a
+  relative time states both times. One component gives each form. The host page and the hunt page
+  state a stored time in the same form, and a new shadow hit names the zone of the hour in the
+  hit.
+- **Needs more info.** A "Needs more info" row of Needs you states the first open question of the
+  investigation.
+- **Two severities.** The verdict card names the alert severity that Security Onion records. A
+  citation names the severity of the rule metadata. Each tooltip states the source of the
+  severity.
+- **Finding titles.** A new hunt finding title joins the title and the machine with a colon.
+- **The top bar.** The search field gives way to the breadcrumb. The id of a page stays whole at
+  1100 px.
+- **Tool text.** The notes, hints and errors of the tools hold no dash. A hunt step shows this
+  text.
+
+### One decision, every surface
+
+- **One rule for a true positive that waits.** Each true positive whose verdict stands is in one
+  part: decided, authorized, handled or waits. The Dashboard tile, the Confirmed threats panel, the
+  host page, the true positives view and Needs you read one function. Before this change the tile
+  and Needs you used two rules, and the two rules gave 16 and 13 on one deployment.
+- **Handled by the analyst.** A true positive waits no more after the analyst decides on the true
+  positive: a resolution with no open action, each action applied or dismissed, or an acknowledge
+  or an escalate from the card "No automatic action". That card now records the acknowledge and
+  the escalate on the investigation.
+- **A true positive with no action.** Needs you lists a true positive that holds no action that
+  the console can execute. The row reads "Acknowledge or escalate". Before this change no list
+  asked the analyst about such an investigation.
+- **A decided campaign asks for nothing.** The card of an investigation of a campaign with a
+  decision in force states the decision and the date of the decision: "No action waits." The card
+  shows no next step that asks for an escalate.
+- **One state for a campaign.** Each campaign surface shows one state chip: Open, Ended, Closed,
+  Authorized or Case. The chip states the decision when one is in force, else the activity. The
+  header, the campaigns list, a Confirmed threats row, the campaign chip of a row, the strip on an
+  investigation page and the host page use that chip. No surface reads "Open" beside "Closed".
+- **Confirmed threats that wait.** A campaign with a decision in force leaves the red list of the
+  Confirmed threats panel. One line under the list counts the decided campaigns and opens those
+  campaigns. The campaigns list has a Decided filter. A campaign with an investigation beyond the
+  authorization of the campaign stays in the list.
+- **One count.** One rule gives the true positives that wait: the verdict stands, no campaign with
+  a decision in force holds the investigation, and no authorization mark holds the investigation.
+  The Dashboard tile, the panel and the list that the tile opens use the rule. The tile counts the
+  machines of those investigations, and the link of the tile opens exactly the counted rows. The
+  true positives view states each part: those that wait, those in a decided campaign and those
+  that are superseded.
+- **The host page.** The host page states the true positives that wait in the danger color. The
+  host page states those in a decided campaign in neutral text, with a link to the campaign.
+- **A lead joins a campaign through the investigations of the lead.** An observation of a
+  promoted hunt finding counts when the finding investigation of that finding is in the campaign.
+  A lead joins a campaign when each observation that counts maps to an investigation of that
+  campaign. Before this change only an alert observation counted, so a lead of one test stayed open
+  after the campaign closed.
+- **Hunt answers.** A hunt that ends complete records one answer for each campaign and each open
+  lead that the hunt read: no new event, the known activity again, or new activity with the
+  finding. The answer comes from stored facts. A partial hunt, a degraded hunt and an evaluation
+  hunt record none. Migration 0074 adds the table `hunt_answers`. A start step fills the answers of
+  the hunts of the last 30 days.
+- **Where an answer shows.** The campaign page states the newest answer under the bottom line,
+  marks that answer on the timeline, and lists the hunts that read the campaign. The lead page
+  states the newest answer and lists the other hunts that read the lead.
+- **The lead page.** A lead names the campaign that holds the lead, and the state of that
+  campaign. The lead page states how many observations of the lead are authorized activity. A lead
+  that closed with the campaign says so.
+- **A clean lead hunt.** A clean lead hunt closes the lead. Each other hunt records an answer and
+  closes no lead. The chart "How this flows" states that rule.
+- **The stage ladder.** An action on a target needs access to that target, and so does a target
+  that acts. When such a stage has earlier proof, the Access step states that time with the word
+  "by" and names the stage. Before this change a ladder could read Access after Action on the
+  target. The campaign block of a hunt and the text of a case use the same rule.
+
+### Facts on a page
+
+- **The outcome of a hunt.** A hunt that explains what the hunt saw and finds no threat reads "No
+  threat found". "No answer" is only for a hunt that reached no conclusion.
+- **A stopped hunt.** The Hunts list, the hunt page, the lead page and the campaign page state a
+  stopped hunt in one form: "Stopped with an error after N steps".
+- **A lead that closed with the campaign** states the close date of the lead. The pill of a closed
+  lead names the lead hunt: "The lead hunt confirmed no threat."
+- **A finding investigation with no source** lists the hosts of the finding in the list row, with
+  no arrow.
+- **The campaign timeline.** The mark of a stage states the earlier "by" time of the ladder. The
+  Changes lane draws every change: a filled mark for a change that can start a hunt, and a hollow
+  mark for each other change.
+- **The policy of leads** sits behind one closed disclosure, "How leads work", on the Hunts page,
+  the host page and the lead page. The facts of the page come first.
+- **Stated windows.** The header of the Hunt Console states the window. The Hosts column reads
+  "Findings · 7d". The Decided link states that the link opens every decided campaign.
+- **Times and tool names in prose.** Evidence chips and hunt step times read in UTC. A tool name
+  in prose shows plain words, with the name in the tooltip.
+- **The flow chart** states the order of Needs you: the most important first.
+- **Small corrections.** The top bar keeps the id of a page on one line at 1100 px. The
+  notifications use one term, "daily hit limit". The entity page of an external address makes no
+  request that fails.
+- **The machines of a finding investigation.** A finding investigation takes the source and the
+  target from the hosts of the finding. An anchor record between other machines gives no pair.
+  Before this change one investigation of a finding on a web server showed two other machines and
+  the words "lateral movement". The page and the list row apply the rule to stored rows.
+- **A name outside the hosts of a finding.** A finding whose text names a known machine that is no
+  host of the finding states a note. soc-ai does not rewrite the text of the model. The campaign
+  page and the finding investigation page show the note for stored findings.
+- **Impact beside a title.** A row states why the impact guard lowered "succeeded": the report
+  cites no record that proves success.
+- **One investigation for one alert row.** The verdict, the sentence, the hosts and "Open report"
+  of an alert row come from the investigation that gave the verdict on the row. A later
+  investigation that disagrees adds one line with a link.
+- **One time form.** The investigation page states each time in UTC, in the form of the event
+  timeline.
+- **Alert counts.** The Alert events tile links to the Alerts page with the same filter. The tile
+  and the header of the Alerts page state whether each count holds acknowledged alerts.
+- **The host page window.** Each count on the host page obeys the 24h or 7d toggle. The Services
+  card sits apart. The card states that the services are a fact of the machine.
+- **Event time in lists.** The investigation lists of the host page and the entity page, and the
+  observation rows of the lead page, show the time of the event.
+- **The hunt page.** The "Hosts named" count and the map read one list. The pictures come before
+  the narrative.
+- **The top bar.** The console reads the health route once more before the console shows
+  "soc-ai API unreachable". The console names the reason.
+- **Words.** The console says "Failed" for a failed investigation and "Hunt again" for a new hunt.
+  A chip that cites a tool shows plain words, with the tool name in the tooltip. A lead hunt that
+  stopped after one or more steps states the stop and the step count. A lead card and a lead page
+  state one outcome for one hunt.
+
 ### Words
 
 - **The network.** The console, the Config help, the doctor, the command line, the logs, the demo
@@ -302,6 +576,22 @@ All notable changes to this project are documented here. The format is based on
 
 ### Needs you
 
+- **Groups and times.** The Needs you page shows a heading with a count for each group, and each
+  row shows the time of the event. A row states a direction only when the record holds a source
+  and a target. A row of a true positive states the escalate before the acknowledge. The command
+  palette holds one term for the decisions that wait: "Needs you".
+- **A prepared row.** Each row of Needs you states the verdict, the impact, the severity, the
+  machines, the reason that the item waits and the action that waits with what the action
+  writes. A value that soc-ai does not hold reads as unknown.
+- **The order.** The list states the most important decision first: campaigns, true positive
+  investigations, leads, other investigations, then alert groups. Inside a group the impact
+  decides, then the severity, then the newest event.
+- **One list.** The sidebar has a Needs you entry with the count, and the command palette has the
+  entry. Each decision line of the Dashboard tile and of the bell opens Needs you with a type
+  filter.
+- **One rule for an action that waits.** An investigation page states that an action waits only
+  when Needs you lists the investigation. An open Acknowledge of a false positive stays a button
+  and is no waiting work.
 - **One number.** Needs you counts each decision once: the campaigns with no decision, the
   investigations that wait, the leads and the alert groups with no verdict. The top bar, the
   Dashboard tile, the bell and the Needs you page state the same number.

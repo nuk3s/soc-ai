@@ -32,7 +32,7 @@ import {
 } from '../lib/analyticRuns';
 import { entityPath } from '../lib/entityPath';
 import { plural } from '../lib/plural';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import { AnalyticPins } from './AnalyticPins';
 import {
   CHIP_CANDIDATE,
@@ -188,7 +188,7 @@ export function StatusDot({
 export function breachLine(breach: AnalyticBreach): string {
   if (breach.rule === 'fire_budget') {
     const hours = typeof breach.window_hours === 'number' ? breach.window_hours : 24;
-    return `${breach.hits ?? '?'} hits in ${hours} h · budget ${breach.budget ?? '?'} a day`;
+    return `${breach.hits ?? '?'} hits in ${hours} h · daily hit limit ${breach.budget ?? '?'}`;
   }
   if (breach.rule === 'precision_floor') {
     const precision = typeof breach.precision === 'number' ? breach.precision.toFixed(2) : '?';
@@ -245,7 +245,8 @@ export function shadowWeekOpen(record: ShadowRecord | null, now = Date.now()): b
 export function shadowRecordLine(record: ShadowRecord, now = Date.now()): string {
   const head = `Shadow record: ${plural(record.sweeps, 'sweep')}, ${plural(record.hits, 'hit')}.`;
   if (!record.endsAt) return head;
-  const day = record.endsAt.slice(0, 10);
+  // The UTC day, with the zone named (round 3 part 2, P1).
+  const day = `${record.endsAt.slice(0, 10)} UTC`;
   return shadowWeekOpen(record, now)
     ? `${head} The shadow week ends on ${day}.`
     : `${head} The shadow week ended on ${day}.`;
@@ -770,7 +771,7 @@ function Body({
                 >
                   {plural(r.count, 'observation')}
                 </span>
-                <span className="text-[11.5px] text-dim" title={absTime(r.last)}>
+                <span className="text-[11.5px] text-dim" title={timeTitle(r.last)}>
                   · {ago(r.last)}
                 </span>
                 {r.lead_id !== null && (
@@ -798,7 +799,7 @@ function Body({
           <ul data-testid="analytic-versions" className="divide-y divide-border-faint">
             {numberedVersions(detail.versions).map(({ version: v, number }, i) => (
               <li key={`${v.at}-${i}`} className="flex flex-wrap items-center gap-2 py-1.5 text-[12px]">
-                <span className="font-mono text-[11.5px] text-dim" title={absTime(v.at)}>
+                <span className="font-mono text-[11.5px] text-dim" title={timeTitle(v.at)}>
                   {ago(v.at)}
                 </span>
                 <span className="font-mono text-[11.5px] text-faint" title={CHIP_VERSION}>

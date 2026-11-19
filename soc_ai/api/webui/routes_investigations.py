@@ -24,7 +24,7 @@ from soc_ai.api.webui import (
     routes_entity,
     routes_hunts,
 )
-from soc_ai.api.webui._campaign_link import CampaignLinkOut, link_for
+from soc_ai.api.webui._campaign_link import CampaignLinkOut, investigation_link_for, link_for
 from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import (
     _ago,
@@ -52,6 +52,7 @@ from soc_ai.api.webui._timeline import (
     action_tool_names,
 )
 from soc_ai.api.webui.routes_alerts import _es_api_error_http, _grid_unavailable
+from soc_ai.campaigns import finding_names, threat_parts
 from soc_ai.campaigns import service as campaign_svc
 from soc_ai.config import Settings
 from soc_ai.demo.guard import is_demo
@@ -63,6 +64,7 @@ from soc_ai.store import chat as chat_svc
 from soc_ai.store import first_line as first_line_svc
 from soc_ai.store import host_machines
 from soc_ai.store import investigations as inv_svc
+from soc_ai.store.auth import utcnow
 from soc_ai.store.models import Hunt, Investigation
 from soc_ai.triage_models import IMPACT_ORDER, is_pipeline_fallback, stored_impact
 from soc_ai.webui import (
@@ -293,6 +295,14 @@ class InvestigationRowOut(BaseModel):
     headline: str | None = None
     # The active campaign that this run is a member of, or null.
     campaign: CampaignLinkOut | None = None
+    # The reason of the impact guard when it lowered "succeeded": one line
+    # under the headline (AA3). Null when the stored report holds no change
+    # that stands.
+    impactNote: str | None = None
+    # The hosts that the finding of a finding run names, set when the row
+    # holds no source. The list names them with no arrow, as the page does.
+    # A row read "— → <address>" (dogfood 2026-11-17, N5). Null otherwise.
+    findingHosts: list[str] | None = None
 
 
 def authorization_ref(mark: authorized_svc.Mark | None) -> _timeline.AuthorizationRefOut | None:
@@ -330,6 +340,7 @@ def _row(
     is_primary: bool = True,
     latest_run: inv_svc.RunRef | None = None,
     labels: dict[str, first_line_svc.HostLabel] | None = None,
+    finding_hosts: Sequence[str] | None = None,
 ) -> InvestigationRowOut:
     """Map one persisted run to its list row.
 
@@ -343,7 +354,18 @@ def _row(
     ``latest_run`` is the newest run of THIS row's alert (see
     :func:`_latest_runs`); omitting it says this run is its own alert's newest,
     which is what a caller with no group to consult can honestly claim.
+
+    ``finding_hosts`` holds the hosts of the finding of a finding run. Its
+    ends follow the rule of the page (:func:`_anchor_off_finding`).
     """
+    src, dst, host_name = inv.src_ip, inv.dest_ip, inv.host_name
+    if finding_hosts and _anchor_off_finding({}, inv, list(finding_hosts)):
+        src, dst = first_line_svc.finding_ends(None, None, finding_hosts)
+        host_name = None
+    # A finding run with no source names the hosts of its finding, and the
+    # row draws no arrow from nothing.
+    named_hosts = list(dict.fromkeys(str(h).strip() for h in finding_hosts or () if str(h).strip()))
+    row_finding_hosts = named_hosts if named_hosts and not src else None
     # A RunRef carries no verdict, so the verdict half of `_row_status` (a
     # 'complete' run that reached no verdict displays as an error) cannot be
     # applied to a SIBLING run. It does not need to be: `_primary_run_ids`
@@ -366,9 +388,9 @@ def _row(
         subjectType=_subject_type(inv),
         verdict=_verdict(inv.verdict),
         conf=inv.confidence,
-        host=inv.src_ip or "—",
-        dst=inv.dest_ip,
-        hostName=inv.host_name,
+        host=src or "—",
+        dst=dst,
+        hostName=host_name,
         status=_row_status(inv),
         when=_ago(_iso_utc(inv.created_at)),
         # tz-AWARE ISO so the browser localizes correctly (naive → parsed as local).
@@ -395,7 +417,32 @@ def _row(
         impact=None if is_pipeline_fallback(inv.report) else stored_impact(inv.report, inv.verdict),
         firstLine=_first_line(inv, labels),
         headline=_row_headline(inv),
+        impactNote=impact_note(inv.report, inv.verdict),
+        findingHosts=row_finding_hosts,
     )
+
+
+# The line of a row whose impact the guard lowered from succeeded (AA3).
+IMPACT_NOTE = "Impact: {impact}. The report cites no record that proves success."
+
+
+def impact_note(report: Any, verdict: str | None) -> str | None:
+    """The line of a run whose impact the guard lowered from succeeded, or None.
+
+    Three true positives read "Successful LFI read-back" beside the impact
+    "Attempted", and no row said why (dogfood 2026-11-17). The line shows
+    only when the stored report holds the change of the impact guard and the
+    change still stands (:func:`_timeline._impact_change_out`).
+    """
+    from soc_ai.agent.gates import IMPACT_GATE  # noqa: PLC0415 - the agent package is heavy
+
+    held = report if isinstance(report, dict) else {}
+    if is_pipeline_fallback(held):
+        return None
+    change = _timeline._impact_change_out(held, verdict)
+    if change is None or change.gate != IMPACT_GATE or change.fromImpact != "succeeded":
+        return None
+    return IMPACT_NOTE.format(impact=change.toImpact)
 
 
 def _row_headline(inv: Investigation) -> str | None:
@@ -413,17 +460,24 @@ def _row_headline(inv: Investigation) -> str | None:
 
 
 def _first_line(
-    inv: Investigation, labels: dict[str, first_line_svc.HostLabel] | None
+    inv: Investigation, labels: dict[str, first_line_svc.HostLabel] | None, *, now: bool = False
 ) -> str | None:
     """The first line of a run for the API, with any credential scrubbed."""
-    line = first_line_svc.of_run(inv, labels)
+    line = first_line_svc.of_run(inv, labels, now=now)
     return scrub_secrets(line) if line else None
 
 
 async def _detail_first_line(request: Request, settings: Any, inv: Investigation) -> str | None:
-    """The first line of one run for its page, with the Hosts data read when needed."""
+    """The first line of one run for its page, with the names and the roles of now (W6).
+
+    The host chips of the page read the Hosts data of now, so the line reads
+    it too: one machine has one role on the page.
+    """
     async with request.app.state.db_sessionmaker() as db:
-        return _first_line(inv, await _host_labels(db, settings, [inv]))
+        labels = await first_line_svc.labels_for_settings(
+            db, first_line_svc.run_values(inv), settings
+        )
+        return _first_line(inv, labels, now=True)
 
 
 async def _host_labels(
@@ -614,6 +668,139 @@ def _needs_retry(row: InvestigationRowOut) -> bool:
     return (row.fallback or row.noVerdict) and not row.errorDismissed and row.isPrimary
 
 
+class DecidedCampaignOut(BaseModel):
+    """A campaign with a decision in force and its true positives of the filter set."""
+
+    id: int
+    title: str
+    state: str
+    investigations: int
+
+
+class EarlierCampaignOut(BaseModel):
+    """A reopened campaign whose earlier decision covered true positives of the filter set (W2)."""
+
+    id: int
+    title: str
+    investigations: int
+    decision: str | None = None
+    decidedAt: str | None = None
+
+
+class TruePositivePartsOut(BaseModel):
+    """The parts of the true positives of the filter set (round "decide once", DC3).
+
+    ``waiting`` counts the true positives that wait on the analyst
+    (:mod:`soc_ai.campaigns.threat_parts`). ``decided`` counts those that a
+    campaign with a decision in force holds, and ``campaigns`` names those
+    campaigns, the most first. ``authorized`` counts those that an
+    authorization mark holds. ``earlier`` counts those that the earlier
+    decision of a reopened campaign covered, and ``earlierCampaigns`` names
+    those campaigns (W2). ``handled`` counts those on which the analyst
+    decided: a resolution, each action applied or dismissed, or an
+    acknowledge or an escalate of an investigation with no action (round
+    "decide once" part 2, OW1). ``superseded`` counts those that a later run
+    of the same alert or finding replaced, or that a follow-up answered.
+    ``other`` counts the rest whose verdict does not stand: a run that is not
+    complete, or a synthetic run. The parts add up to ``total``.
+    """
+
+    total: int
+    waiting: int = 0
+    decided: int = 0
+    authorized: int = 0
+    superseded: int = 0
+    other: int = 0
+    campaigns: list[DecidedCampaignOut] = Field(default_factory=list)
+    handled: int = 0
+    # Round 3 part 2, W2: the true positives that the earlier decision of a
+    # reopened campaign covered, and those campaigns, the most first.
+    earlier: int = 0
+    earlierCampaigns: list[EarlierCampaignOut] = Field(default_factory=list)
+
+
+def _parts_out(parts: threat_parts.Parts) -> TruePositivePartsOut:
+    counted = threat_parts.counts(parts.parts)
+    held = parts.decided_campaigns()
+    titles = {link.id: link for link in parts.links.values()}
+    covered = parts.earlier_campaigns()
+    return TruePositivePartsOut(
+        earlier=counted[threat_parts.PART_EARLIER],
+        earlierCampaigns=[
+            EarlierCampaignOut(
+                id=cid,
+                title=titles[cid].title,
+                investigations=n,
+                decision=parts.covered[cid].earlier.decision if cid in parts.covered else None,
+                decidedAt=(
+                    _iso_utc(parts.covered[cid].earlier.at)
+                    if cid in parts.covered and parts.covered[cid].earlier.at is not None
+                    else None
+                ),
+            )
+            for cid, n in sorted(covered.items(), key=lambda pair: (-pair[1], pair[0]))
+            if cid in titles
+        ],
+        total=len(parts.parts),
+        waiting=counted[threat_parts.PART_WAITS],
+        decided=counted[threat_parts.PART_DECIDED],
+        authorized=counted[threat_parts.PART_AUTHORIZED],
+        handled=counted[threat_parts.PART_HANDLED],
+        superseded=counted[threat_parts.PART_SUPERSEDED],
+        other=counted[threat_parts.PART_OTHER],
+        campaigns=[
+            DecidedCampaignOut(
+                id=cid,
+                title=titles[cid].title,
+                state=titles[cid].state,
+                investigations=n,
+            )
+            for cid, n in sorted(held.items(), key=lambda pair: (-pair[1], pair[0]))
+            if cid in titles
+        ],
+    )
+
+
+async def _waiting_ids(
+    db: Any,
+    since: datetime | None,
+    until: datetime | None,
+    only: set[str] | None,
+    *,
+    state: Any = None,
+) -> set[str]:
+    """The ids of the true positives that wait in the window (``waits``).
+
+    ``only`` is the id filter of the other filters, or None.
+    """
+    threats = await threat_parts.in_window(
+        db,
+        since=routes_hunts._naive_utc(since) or datetime.min,
+        until=routes_hunts._naive_utc(until) or utcnow(),
+        state=state,
+    )
+    waiting = {inv.id for inv in threats.waiting()}
+    return waiting if only is None else only & waiting
+
+
+async def _tp_parts(
+    db: Any, filters: Mapping[str, Any], verdicts: Sequence[str] | None, *, state: Any = None
+) -> TruePositivePartsOut | None:
+    """The parts of the true positives of the filter set (``tp_parts``), or None.
+
+    None when a verdict filter leaves the true positives out, or when the
+    set holds more true positives than one read takes.
+    """
+    if verdicts and "true_positive" not in verdicts:
+        return None
+    tps = await inv_svc.query_page(
+        db, verdicts=["true_positive"], limit=inv_svc.MAX_PAGE_LIMIT, offset=0, **filters
+    )
+    if tps.total > len(tps.rows):
+        return None
+    return _parts_out(await threat_parts.split(db, [r.id for r in tps.rows], state=state))
+
+
 class InvestigationListOut(BaseModel):
     """One SQL page of the list, with figures counted over the right sets.
 
@@ -654,10 +841,13 @@ class InvestigationListOut(BaseModel):
     # machine of the entity is stored under each of its addresses and names.
     # Null when the request named no entity.
     entityKeys: list[str] | None = None
+    # With ``tp_parts``, the parts of the true positives of the filter set.
+    # Null when the request did not ask, or when the set outgrew one read.
+    truePositiveParts: TruePositivePartsOut | None = None
 
 
 @router.get("/investigations", response_model=InvestigationListOut)
-async def list_investigations(
+async def list_investigations(  # noqa: PLR0915 - one linear read of the filter set
     request: Request,
     status: str | None = None,
     verdict: str | None = None,
@@ -676,6 +866,8 @@ async def list_investigations(
     sort: str | None = None,
     primary_only: bool = False,
     clock: str | None = None,
+    waits: bool = False,
+    tp_parts: bool = False,
 ) -> InvestigationListOut:
     """Investigation rows, newest first — filtered, counted and paged in SQL.
 
@@ -734,9 +926,12 @@ async def list_investigations(
     the filter: a run inside an authorized scope stays in every list.
 
     ``needs_you`` keeps the runs that wait on the analyst: a verdict that
-    needs more info, or a recommended action that waits for a person, inside
-    ``since``/``until``. The rows carry ``pendingActions`` and
-    ``waitingActions`` as under ``pending_action``. ``GET /needs-you`` counts
+    needs more info, or a true positive that waits and that no campaign
+    holds (:func:`routes_meta.needs_you_runs`), inside ``since``/``until``.
+    A true positive with no action that the console can execute waits too,
+    for a decision of the analyst (round "decide once" part 2, OW2). The
+    rows carry ``pendingActions`` and ``waitingActions`` as under
+    ``pending_action``. ``GET /needs-you`` counts
     ``investigations_waiting`` with this query, so the Investigations badge and
     the Needs you view state one number. The badge said 39 (9 runs plus 30
     actions) over a list of 64 other rows (production review 2026-11-12,
@@ -754,6 +949,19 @@ async def list_investigations(
     is refused with 422.
 
     Each row carries ``impact`` and ``firstLine``.
+
+    ``waits`` keeps the true positives that wait on the analyst, by the one
+    rule of :mod:`soc_ai.campaigns.threat_parts`: the verdict stands, no
+    campaign with a decision in force holds the run, and no authorization
+    mark holds it. ``since``/``until`` bound the time of the event. The
+    Dashboard tile counts these runs and links here, so the list opens
+    exactly the counted runs.
+
+    ``tp_parts`` adds ``truePositiveParts``: the true positives of the
+    filter set, split into the parts above. The true positives view and the
+    host page state the parts. The parts are null when the filter set holds
+    more than one read of true positives, or when a verdict filter leaves
+    the true positives out.
     """
     statuses = _csv_filter("status", status, inv_svc.DISPLAY_STATUSES)
     verdicts = _csv_filter("verdict", verdict, _VERDICT_FILTERS)
@@ -789,20 +997,24 @@ async def list_investigations(
         )
     async with request.app.state.db_sessionmaker() as db:
         pending: dict[str, int] | None = None
+        # The true positives that wait and that no campaign holds, with the
+        # count of the waiting actions of each: 0 for a run with none (OW2).
+        waits_runs: dict[str, int] | None = None
         if pending_action or needs_you:
             from soc_ai.api.webui.routes_meta import (  # noqa: PLC0415 - cycle
-                request_pending_action_runs,
+                request_needs_you_runs,
             )
 
             # Once per request: GET /needs-you reads the same scan for its
             # pending_actions part.
-            pending = await request_pending_action_runs(
+            waits_runs = await request_needs_you_runs(
                 request,
                 db,
                 since=routes_hunts._naive_utc(since),
                 until=routes_hunts._naive_utc(until),
                 clock=window_clock,
             )
+            pending = {run_id: n for run_id, n in waits_runs.items() if n > 0}
         entity_keys = (
             await host_machines.entity_expansion(db, wanted_entity) if wanted_entity else None
         )
@@ -810,26 +1022,34 @@ async def list_investigations(
         if authorization is not None:
             matched = set(await authorized_svc.run_ids(db, authorization))
             only_ids = matched if only_ids is None else only_ids & matched
+        if waits:
+            only_ids = await _waiting_ids(db, since, until, only_ids, state=request.app.state)
+        filters: dict[str, Any] = {
+            "since": routes_hunts._naive_utc(since),
+            "until": routes_hunts._naive_utc(until),
+            "statuses": statuses,
+            "q": needle or None,
+            "include_backtest": include_backtest,
+            "ids": None if only_ids is None else sorted(only_ids),
+            "entity_keys": entity_keys,
+            "needs_you_ids": sorted(waits_runs) if needs_you and waits_runs is not None else None,
+            "impacts": impacts or None,
+            "sort": order,
+            "primary_only": primary_only,
+            "clock": window_clock,
+        }
         page = await inv_svc.query_page(
-            db,
-            since=routes_hunts._naive_utc(since),
-            until=routes_hunts._naive_utc(until),
-            verdicts=verdicts,
-            statuses=statuses,
-            q=needle or None,
-            limit=read_limit,
-            offset=read_offset,
-            include_backtest=include_backtest,
-            ids=None if only_ids is None else sorted(only_ids),
-            entity_keys=entity_keys,
-            needs_you_ids=sorted(pending) if needs_you and pending is not None else None,
-            impacts=impacts or None,
-            sort=order,
-            primary_only=primary_only,
-            clock=window_clock,
+            db, verdicts=verdicts, limit=read_limit, offset=read_offset, **filters
+        )
+        parts_out = (
+            await _tp_parts(db, filters, verdicts, state=request.app.state) if tp_parts else None
         )
         marks = await authorized_svc.marks_for(db, [inv.authorization_id for inv in page.rows])
-        labels = await _host_labels(db, request.app.state.settings, page.rows)
+        # The Hosts data labels, and the hosts of the finding of each finding run.
+        labels, finding_hosts = (
+            await _host_labels(db, request.app.state.settings, page.rows),
+            await _finding_hosts_of(db, page.rows),
+        )
         # A row stored with the old "suricata" default shows the type its alert
         # document names (RL5). Corrected once, in place.
         await inv_svc.heal_detection_kinds(db, page.rows)
@@ -871,6 +1091,7 @@ async def list_investigations(
             is_primary=inv.id in primary,
             latest_run=latest.get(_group_key(inv) or inv.id),
             labels=labels,
+            finding_hosts=finding_hosts.get(inv.id),
         )
         for inv in page.rows
     ]
@@ -892,6 +1113,7 @@ async def list_investigations(
             backtestReplays=page.backtest_replays,
             includesBacktest=include_backtest,
             entityKeys=entity_keys,
+            truePositiveParts=parts_out,
         )
     kept = [r for r in rows if _needs_retry(r) == (wanted_state == "live")]
     return InvestigationListOut(
@@ -966,7 +1188,7 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
         # The authorized activity the run matched, and the line of a run
         # that is outside one.
         mark, outside_line = await _authorization_of(db, inv)
-        campaign = link_for(await campaign_svc.links_of(db, [inv.id]), inv.id)
+        campaign = investigation_link_for(await campaign_svc.links_of(db, [inv.id]), inv.id)
 
     # A row stored before the store-side scrub existed can still hold a
     # credential the model quoted. Scrub the model-written text on read too.
@@ -1030,7 +1252,17 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
     for step in timeline:
         step.title = scrub_secrets(step.title)
         step.detail = scrub_secrets(step.detail)
-    nodes, edges, graph_note = _entity_graph(alert_obj, enrichments, inv)
+    # A finding run takes its source and its target from the hosts of its
+    # finding (first_line.finding_pair). An anchor between other machines
+    # gives no pair, so the page draws no flow, names no direction and shows
+    # no host context for it. A row stored before the rule still holds the
+    # flow of its anchor in its columns, and this read covers it.
+    promoted = routes_hunts.promoted_finding_out(inv, hunt)
+    finding_hosts: list[str] = list(promoted["hosts"]) if promoted is not None else []
+    off_finding = bool(finding_hosts) and _anchor_off_finding(alert_obj, inv, finding_hosts)
+    nodes, edges, graph_note = (
+        ([], [], None) if off_finding else _entity_graph(alert_obj, enrichments, inv)
+    )
     # The text of the run. The headline never contradicts the final verdict,
     # and a row of an older release is repaired (B2).
     # A run inside a scope whose authorization holds: each sentence that
@@ -1044,6 +1276,9 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
     src_addr = _str_or_none(alert_obj.get("source_ip")) or _str_or_none(inv.src_ip)
     dst_addr = _str_or_none(alert_obj.get("destination_ip")) or _str_or_none(inv.dest_ip)
     reporter = _str_or_none(alert_obj.get("host_name"))
+    if off_finding:
+        src_addr, dst_addr = first_line_svc.finding_ends(None, None, finding_hosts)
+        reporter = None
     # Each host, address, user and domain the run names, with the page that
     # answers for it. The page renders each one as a link.
     async with request.app.state.db_sessionmaker() as db:
@@ -1052,8 +1287,21 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
             settings,
             src=src_addr,
             dst=dst_addr,
-            reporter=reporter or _str_or_none(inv.host_name),
+            reporter=reporter or (None if off_finding else _str_or_none(inv.host_name)),
             subject=_subject_out(inv, hunt),
+        )
+        # A known machine name in the text of the finding that is no host
+        # of it: the note the campaign page shows for the same finding.
+        name_note = (
+            (await finding_names.notes_for_runs(db, [inv])).get(inv.id)
+            if promoted is not None
+            else None
+        )
+        # An open false positive waits on one decision for its rule (RS6).
+        from soc_ai.api.webui.routes_rule_decisions import rule_decision_ref  # noqa: PLC0415
+
+        rule_ref = await rule_decision_ref(
+            db, inv, alert_acked=alert_acked, threshold=settings.auto_ack_fp_threshold
         )
     # What served the run (B4). The model line names the model that the run
     # asked for, when the run recorded it.
@@ -1118,10 +1366,12 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
         oracle=_build_oracle(events),
         sev=_sev(alert_obj.get("severity_label")) if alert_obj else None,
         alert=_alert_meta(alert_obj, host_profile, inv),
-        hostContext=_host_signals(host_profile),
-        hostContexts=_timeline._host_contexts(enr_p.get("host_alert_profiles")),
+        hostContext=[] if off_finding else _host_signals(host_profile),
+        hostContexts=(
+            [] if off_finding else _timeline._host_contexts(enr_p.get("host_alert_profiles"))
+        ),
         graphNote=graph_note,
-        graphScope=_graph_scope(alert_obj, enrichments, inv),
+        graphScope=None if off_finding else _graph_scope(alert_obj, enrichments, inv),
         hostContextWindowHours=settings.host_risk_window_hours,
         openQuestions=_timeline._open_questions_out(report, events),
         citations=citations,
@@ -1142,7 +1392,7 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
         subject=_subject_out(inv, hunt),
         huntId=inv.hunt_id,
         huntObjective=(hunt.objective if hunt else None),
-        promotedFinding=_with_evidence(routes_hunts.promoted_finding_out(inv, hunt), inv, hunt),
+        promotedFinding=_with_name_note(_with_evidence(promoted, inv, hunt), name_note),
         alertAcked=alert_acked,
         isSynthEval=bool(inv.is_synth_eval),
         supersededBy=superseded_by,
@@ -1166,6 +1416,7 @@ async def get_investigation(  # noqa: PLR0915 - one linear read of the run and i
         outsideAuthorizedScope=outside_line,
         campaign=campaign,
         needsYouCleared=needs_you_clear.cleared_sentence(inv.report),
+        ruleDecision=rule_ref,
     )
 
 
@@ -1289,8 +1540,18 @@ async def _apply_action_rule(
     )
     facts = action_rules.with_campaign(facts, campaign)
     note = action_rules.action_note(facts)
+    # The rule of Needs you decides whether an action waits. The demo blocks
+    # every write, and its count is the count of the deployment it plays.
+    requests = action_rules.run_requests(inv)
+    live = dataclasses.replace(facts, demo=False)
     for action, tool_name in zip(actions, action_tool_names(events, report), strict=False):
         action.blockedReason = action_rules.block_reason(facts, tool_name)
+        action.waits = (
+            requests
+            and not action.applied
+            and not action.dismissed
+            and action_rules.action_waits(live, tool_name)
+        )
         if note is not None and not action.applied and not action.dismissed:
             action.noteCode = note.code
             action.note = note.reason
@@ -1331,6 +1592,24 @@ def _run_class_of(inv: Investigation) -> str | None:
 
 def _str_list(value: Any) -> list[str]:
     return [str(v) for v in value if isinstance(v, str | int)] if isinstance(value, list) else []
+
+
+async def _finding_hosts_of(db: Any, runs: Sequence[Investigation]) -> dict[str, list[str]]:
+    """The hosts of the finding of each finding run on a page, by run id. One read."""
+    findings = await finding_names.findings_of_runs(db, runs)
+    return {run_id: finding_names.hosts_of(finding) for run_id, finding in findings.items()}
+
+
+def _anchor_off_finding(alert: dict[str, Any], inv: Investigation, hosts: list[str]) -> bool:
+    """Whether the anchor of a finding run names an address and no host of its finding."""
+    src = _str_or_none(alert.get("source_ip")) or _str_or_none(inv.src_ip)
+    dst = _str_or_none(alert.get("destination_ip")) or _str_or_none(inv.dest_ip)
+    return bool(src or dst) and first_line_svc.finding_pair(src, dst, hosts) == (None, None)
+
+
+def _with_name_note(finding: dict[str, Any] | None, note: str | None) -> dict[str, Any] | None:
+    """The promoted finding with its name note (``nameNote``), null when it has none."""
+    return None if finding is None else {**finding, "nameNote": note}
 
 
 def _with_evidence(

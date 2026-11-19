@@ -23,13 +23,13 @@ from fastapi.testclient import TestClient
 from soc_ai.config import Settings
 from soc_ai.main import create_app
 from soc_ai.store.auth import utcnow
-from soc_ai.store.models import Campaign, EntityObservation, Hunt, Lead
+from soc_ai.store.models import Campaign, EntityObservation, Hunt, HuntEvent, Lead
 from sqlalchemy import select
 
 from tests.test_campaign_facts import RULE_B, seed_run
 from tests.test_campaign_lead_tags import ACTOR, TARGET, seed_machines
 
-_LINK = {"id", "title", "status", "stage", "differs", "decision"}
+_LINK = {"id", "title", "status", "stage", "differs", "decision", "state"}
 
 
 @pytest.fixture
@@ -204,6 +204,8 @@ def test_the_campaign_lists_its_hunts_newest_first(client: TestClient) -> None:
         "startedAt": hunts[0]["startedAt"],
         "findings": 0,
         "threatFindings": 0,
+        "answer": None,
+        "steps": None,
     }
     assert hunts[1]["id"] == "01HUNT00"
     assert (hunts[1]["starter"], hunts[1]["findings"], hunts[1]["threatFindings"]) == (
@@ -268,3 +270,35 @@ def test_a_withdrawn_campaign_names_no_lead_and_no_hunt(client: TestClient) -> N
     assert all(rows[lead_id]["campaign"] is None for lead_id in seeded["own"])
     hunts = {r["id"]: r for r in client.get("/api/v1/hunts").json()}
     assert hunts["01HUNTW"]["campaign"] is None
+
+
+def test_the_fold_counts_the_steps_of_a_hunt_that_stopped(client: TestClient) -> None:
+    """F5: the fold reads "Stopped with an error after N steps", as the hunt
+    page does. The payload carries the steps of a hunt that stopped."""
+    seeded = _seed(client)
+    campaign_id = seeded["campaign"]
+    now = utcnow()
+
+    async def work(db: Any) -> None:
+        for hunt_id, status in (("01HUNTSTOP", "error"), ("01HUNTDONE", "complete")):
+            db.add(
+                Hunt(
+                    id=hunt_id,
+                    objective=f"[campaign {campaign_id}] x",
+                    kind="campaign",
+                    starter="campaign",
+                    status=status,
+                    campaign_id=campaign_id,
+                    created_at=now,
+                )
+            )
+            await db.flush()
+            for seq, kind in enumerate(("tool_call", "tool_result", "tool_call")):
+                db.add(HuntEvent(hunt_id=hunt_id, sequence=seq, kind=kind, payload={}))
+        await db.commit()
+
+    _do(client, work)
+    hunts = {h["id"]: h for h in client.get(f"/api/v1/campaigns/{campaign_id}").json()["hunts"]}
+    assert hunts["01HUNTSTOP"]["steps"] == 2
+    # Negative control: a complete hunt carries no stop count.
+    assert hunts["01HUNTDONE"]["steps"] is None

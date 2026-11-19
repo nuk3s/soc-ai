@@ -558,6 +558,9 @@ def _rate_departures(
             if stamp is not None and (newest is None or stamp > newest):
                 newest = stamp
         local = peak.at.astimezone(_zone_of(tz))
+        # The label names its zone. A shadow hit read "Tuesday 03:00" beside
+        # "Busiest hours ... UTC" on the host page (round 3 part 2, P1).
+        zone = local.tzname() or "UTC"
         out.append(
             Departure(
                 dimension=test.dimension,
@@ -577,7 +580,7 @@ def _rate_departures(
                 run_hours=len(run),
                 run_start=run[0].at,
                 run_end=run[-1].at + timedelta(hours=1),
-                peak_label=f"{_WEEKDAYS[local.weekday()]} {local.hour:02d}:00",
+                peak_label=f"{_WEEKDAYS[local.weekday()]} {local.hour:02d}:00 {zone}",
             )
         )
     return out

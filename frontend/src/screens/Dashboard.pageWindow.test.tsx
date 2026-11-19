@@ -148,12 +148,12 @@ describe('Needs-you tile scope words', () => {
     expect(scope.className).toContain('whitespace-nowrap');
   });
 
-  it('states the campaigns first, at any age, and opens the campaigns that wait', async () => {
+  it('states the campaigns first, at any age, and opens the Needs you page on the campaigns', async () => {
     vi.mocked(getNeedsYouCount).mockResolvedValue({ ...NEEDS, campaigns: 2, decisions: 11 });
     mount();
     const line = await screen.findByTestId('needs-you-line-campaigns');
     expect(line.textContent).toBe('2 campaigns wait on your decision · at any age');
-    expect(within(line).getByRole('link').getAttribute('href')).toBe('/campaigns?decision=waits');
+    expect(within(line).getByRole('link').getAttribute('href')).toBe('/needs-you?type=campaign');
     const items = within(screen.getByTestId('kpi-needs-you')).getAllByRole('listitem');
     // The order of the lines: campaigns, investigations, leads, alert groups.
     expect(items.map((item) => item.getAttribute('data-testid'))).toEqual([
@@ -176,10 +176,17 @@ describe('Needs-you tile scope words', () => {
     await waitFor(() => expect(screen.getByTestId('needs-you-total').textContent).toBe('12'));
   });
 
-  it('opens the Needs you view of Investigations from the investigations line', async () => {
+  // NY4. Each line of the tile opens the one list with its type filter.
+  it('opens the Needs you page on each type from its line', async () => {
     mount();
     const line = await screen.findByTestId('needs-you-line-investigations');
-    expect(within(line).getByRole('link').getAttribute('href')).toBe('/investigations?view=needs_you&range=all');
+    expect(within(line).getByRole('link').getAttribute('href')).toBe('/needs-you?type=investigation');
+    expect(within(screen.getByTestId('needs-you-line-leads')).getByRole('link').getAttribute('href')).toBe(
+      '/needs-you?type=lead',
+    );
+    expect(within(screen.getByTestId('needs-you-line-alerts')).getByRole('link').getAttribute('href')).toBe(
+      '/needs-you?type=alerts',
+    );
   });
 
   it('labels the total as the sum of the lines, each with its own scope', async () => {

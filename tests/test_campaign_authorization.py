@@ -641,4 +641,19 @@ async def test_a_revoke_clears_each_mark_and_the_decision_and_forms_no_lead(make
         changes = (
             await db.scalars(select(CampaignChange.detail).where(CampaignChange.type == "reopened"))
         ).all()
-        assert changes == [{"cause": "revoked", "by": "morgan"}]
+        # SD1: the change keeps the decision that the revoke ended, with the label.
+        assert changes == [
+            {
+                "cause": "revoked",
+                "by": "morgan",
+                "was": {
+                    "decision": "authorized",
+                    "reason": None,
+                    "note": None,
+                    "by": "casey",
+                    "decidedAt": now.isoformat(),
+                    "basis": {},
+                    "label": row.label,
+                },
+            }
+        ]

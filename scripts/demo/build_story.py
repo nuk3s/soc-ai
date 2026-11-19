@@ -645,7 +645,123 @@ def authored_investigations(recorded: dict[str, dict[str, Any]]) -> list[dict[st
         started_by="r.patel",
     )
     out.append(run)
+    out += rule_decision_runs()
     return out
+
+
+# The open false positives of one rule (round 3, the rule decision). soc-ai
+# reads three backup clients as false positives, and the automatic acknowledge
+# holds each one. Two are confident and one has weak evidence, so the page of
+# the rule shows both groups. The beacon rule above holds the other case: an
+# open false positive (CTL_INV) beside a true positive (BEACON_INV).
+DROPBOX_RULE = "ET POLICY Dropbox.com Offsite File Backup in Use"
+# (machine, confidence, hold reason or None, hours before the anchor)
+_DROPBOX_RUNS: tuple[tuple[str, float, str | None, float], ...] = (
+    ("ws-mkt-01", 0.86, "high_stakes", 7.0),
+    ("ws-hr-01", 0.83, None, 31.0),
+    ("ws-eng-03", 0.55, "below_threshold", 52.0),
+)
+# The rule of the standing decision of the demo: the IP lookups of ws-mkt-01.
+IPIFY_RULE = "ET INFO External IP Lookup Domain (ipify .org) in DNS Lookup"
+
+
+def rule_decision_runs() -> list[dict[str, Any]]:
+    """The three false positives of :data:`DROPBOX_RULE`, each with its hold."""
+    out: list[dict[str, Any]] = []
+    for n, (name, confidence, reason, hours) in enumerate(_DROPBOX_RUNS, start=1):
+        src = st.ip_of(name)
+        alert_id = es_id(f"dropbox-{name}")
+        started = ago(hours=hours)
+        alert = _flat_alert(
+            alert_id,
+            started - timedelta(minutes=3),
+            DROPBOX_RULE,
+            src,
+            st.CLOUD_SYNC,
+            443,
+            sport=51000 + n,
+            flow=community_id(f"dropbox-{name}"),
+            severity=3,
+            classtype="Potential Corporate Privacy Violation",
+        )
+        held = (
+            []
+            if reason is None
+            else [
+                {
+                    "kind": "auto_ack_skipped",
+                    "payload": {
+                        "es_id": alert_id,
+                        "reason": reason,
+                        "confidence": confidence,
+                        "threshold": 0.7,
+                    },
+                }
+            ]
+        )
+        out.append(
+            authored_run(
+                inv_id=demo_id(f"dropbox-{name}"),
+                alert=alert,
+                started=started,
+                minutes=1.8,
+                verdict="false_positive",
+                confidence=confidence,
+                summary=(
+                    f"{name} ({src}) synced files to the backup service at {st.CLOUD_SYNC}. "
+                    "The client of the service runs on the workstations of the team, and the "
+                    "flow matches its normal schedule."
+                ),
+                opening=f"I check whether {name} syncs to this service every day.",
+                steps=[
+                    (
+                        "t_query_events_oql",
+                        {
+                            "query": f"source.ip:{src} AND destination.ip:{st.CLOUD_SYNC}",
+                            "time_range_minutes": 10080,
+                        },
+                        {"total": 7, "summary": "one sync session each day of the week"},
+                    )
+                ],
+                evidence=[
+                    f"{name} syncs to {st.CLOUD_SYNC} each day (tool t_query_events_oql)",
+                ],
+                citations=["tool t_query_events_oql returned 7 hits"],
+                actions=[
+                    {
+                        "tool_name": "ack_alert",
+                        "tool_args": {"alert_id": alert_id},
+                        "rationale": "A known backup client on its normal schedule.",
+                    }
+                ],
+                extra_events=held,
+            )
+        )
+    return out
+
+
+def rule_decision_rows() -> list[dict[str, Any]]:
+    """One standing decision in force: the fold "Standing rule decisions" shows it."""
+    decided = ago(days=6)
+    return [
+        {
+            "id": 1,
+            "rule_name": IPIFY_RULE,
+            "decision": "standing",
+            "include_weak": False,
+            "note": "The IP lookups of the marketing tools. Known.",
+            "decided_by": st.ANALYSTS[0],
+            "decided_at": iso(decided),
+            "state": "done",
+            "alerts": 17,
+            "failed": 0,
+            "investigations": 1,
+            "acknowledged": 4,
+            "finished_at": iso(decided + timedelta(minutes=1)),
+            "ends_at": iso(decided + timedelta(days=30)),
+            "detail": {"selected": 1, "held": 0, "cluster": 16, "already": 0},
+        }
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -3326,6 +3442,7 @@ def build(recorded_path: Path = RECORDED) -> dict[str, Any]:
     tables["alert_escalations"] = escalation_rows(alert_ids)
     tables["alert_assignments"] = assignment_rows()
     tables["runbook"] = runbook_rows()
+    tables["rule_decisions"] = rule_decision_rows()
 
     schedules = schedule_rows()
     hunts = [place_hunt(h) for h in rec.get("hunts") or []]

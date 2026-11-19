@@ -76,13 +76,15 @@ def test_dashboard_tiles_and_panels_hold_data(page: Page, demo_mode_stack: dict)
     assert all(needs[p] > 0 for p in parts if p != "needs_more_info"), needs
     assert needs["needs_more_info"] == 0, needs
     # The tile counts each decision once: a campaign, an investigation that
-    # waits, a lead and an alert group. The waiting actions are detail: one
-    # investigation can hold two. The unread shadow hits are a review count.
+    # waits, a lead, an alert group and a rule with open false positives. The
+    # waiting actions are detail: one investigation can hold two. The unread
+    # shadow hits are a review count.
     decisions = (
         "campaigns",
         "investigations_waiting",
         "leads_needing_decision",
         "untriaged_groups",
+        "rules_waiting",
     )
     assert all(needs[p] > 0 for p in decisions), needs
     assert needs["decisions"] == sum(needs[p] for p in decisions)
@@ -275,11 +277,12 @@ def test_host_page_agrees_with_its_entity_page(page: Page, demo_mode_stack: dict
     assert host_runs["total"] == summary["investigationCount"]
     assert leads["total"] == summary["leadCount"] >= 1
     assert len(seen["observations"]) == summary["observationCount"] >= 1
-    _open(page, base, f"/hosts/{quote(jump['key'], safe='')}")
+    # Every count of the host page reads the window of its 24h and 7d buttons.
+    _open(page, base, f"/hosts/{quote(jump['key'], safe='')}?range=7d")
     _see(page, "jump01")
-    _in_dom(page, re.compile(r"Investigations on this host · all time · [1-9]"))
-    _in_dom(page, "Users · 24h")
-    _in_dom(page, "Peers · 24h")
+    _in_dom(page, re.compile(r"Investigations on this host · 7d · [1-9]"))
+    _in_dom(page, "Users · 7d")
+    _in_dom(page, "Peers · 7d")
     _in_dom(page, re.compile(r"Observations on this host · last 7 days · [1-9]"))
 
 

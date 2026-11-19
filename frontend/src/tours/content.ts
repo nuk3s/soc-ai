@@ -431,9 +431,9 @@ export const HUNT_TOUR: Tour = {
     },
     {
       anchor: 'hunt-rehunt',
-      title: 'Re-hunt',
+      title: 'Hunt again',
       body:
-        'Re-hunt runs the same objective again as a new hunt. ' +
+        'Hunt again starts a new hunt with the same objective. ' +
         'The console then opens the new hunt. ' +
         'When it is complete, the new hunt compares its findings with the last complete run.',
     },

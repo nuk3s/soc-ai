@@ -43,11 +43,15 @@ from soc_ai.api.webui._errors import api_error
 from soc_ai.api.webui._shared import _iso_utc, require_admin_api, router
 from soc_ai.campaigns import authorization as campaign_auth
 from soc_ai.campaigns import case as campaign_case
-from soc_ai.campaigns import decisions, lead_tags
+from soc_ai.campaigns import decisions, finding_names, lead_tags
 from soc_ai.campaigns import service as campaign_svc
-from soc_ai.campaigns.events import CampaignEvents
-from soc_ai.campaigns.types import StageStep
+from soc_ai.campaigns import since_decision as since_svc
+from soc_ai.campaigns.events import SOURCE_GRID, CampaignEvents
+from soc_ai.campaigns.facts import chunked
+from soc_ai.campaigns.ladder import HeldBy, held_by
+from soc_ai.campaigns.types import KIND_FINDING, StageStep
 from soc_ai.config import Settings
+from soc_ai.hunting import campaign_hunt, hunt_answers
 from soc_ai.secret_scrub import scrub_secrets
 from soc_ai.so_client.elastic import ElasticClient
 from soc_ai.store import authorized_activity as authorized_svc
@@ -84,6 +88,168 @@ class CampaignRowCaseOut(BaseModel):
     openedAt: str
 
 
+class SinceMachineOut(BaseModel):
+    """One machine of the new investigations: its key, its name and its first address."""
+
+    machineKey: str
+    name: str | None = None
+    address: str | None = None
+
+
+class EarlierDecisionOut(BaseModel):
+    """The decision that the reopen ended. ``decision`` is ``closed``,
+    ``authorized`` or ``case``. ``label`` is the words of the reason of a
+    close, or the label of an authorization. ``noteKnown`` is false for a
+    decision of a change of an earlier release: its note is unknown."""
+
+    decision: str
+    reason: str | None = None
+    label: str | None = None
+    note: str | None = None
+    noteKnown: bool = True
+    by: str | None = None
+    at: str | None = None
+
+
+class VerdictCountOut(BaseModel):
+    verdict: str
+    count: int
+
+
+class SinceHoldingOut(BaseModel):
+    """One authorization that holds new investigations (W1). ``state`` is
+    ``active``, ``expired`` or ``revoked``."""
+
+    id: int
+    label: str
+    state: str
+    expiresAt: str | None = None
+    investigations: int = 0
+
+
+class SinceHuntOut(BaseModel):
+    """The hunt that the reopen started (W1). ``outcome`` holds the words of
+    the hunt page, for example "1 confirmed · 1 false positive · 0 not judged
+    · of 2 threat findings". It is null while the hunt runs."""
+
+    id: str
+    startedAt: str
+    status: str
+    outcome: str | None = None
+
+
+class SinceDecisionOut(BaseModel):
+    """What is new in a campaign since the decision that a reopen ended (SD2).
+
+    ``cause`` is ``activity``, ``stage``, ``party``, ``analyst`` or
+    ``revoked``. ``boundary`` is the last event of the basis of the earlier
+    decision (``boundarySource`` ``basis``), else the time of the decision
+    (``decision``). ``runIds`` are the investigations of the campaign with an
+    event after the boundary, the oldest first, with any verdict, and
+    ``investigations`` counts them. ``verdicts`` counts them by verdict, the
+    true positives first. ``authorized`` counts those whose authorization
+    mark holds. ``rules`` counts the distinct rules of the new alert
+    investigations. ``stage`` is the highest stage among them, and
+    ``stageBefore`` and ``stageNow`` are the stage of the campaign at the
+    decision and now. ``newMachines`` names each machine that the earlier
+    decision did not hold.
+
+    ``outsideTruePositives`` counts the new true positives that no
+    authorization holds, and ``outsideNames`` holds their rule names.
+    ``authorizations`` lists each authorization that holds new
+    investigations, the most first. ``reopenHunt`` is the hunt that the
+    reopen started, else null (W1).
+    """
+
+    earlier: EarlierDecisionOut
+    cause: str
+    reopenedAt: str
+    reopenedBy: str | None = None
+    boundary: str
+    boundarySource: str
+    runIds: list[str] = Field(default_factory=list)
+    investigations: int = 0
+    verdicts: list[VerdictCountOut] = Field(default_factory=list)
+    authorized: int = 0
+    actors: list[SinceMachineOut] = Field(default_factory=list)
+    targets: list[SinceMachineOut] = Field(default_factory=list)
+    rules: int = 0
+    firstEvent: str | None = None
+    lastEvent: str | None = None
+    stage: str | None = None
+    stageBefore: str | None = None
+    stageNow: str | None = None
+    stageRose: bool = False
+    newMachines: list[str] = Field(default_factory=list)
+    outsideTruePositives: int = 0
+    outsideNames: list[str] = Field(default_factory=list)
+    authorizations: list[SinceHoldingOut] = Field(default_factory=list)
+    reopenHunt: SinceHuntOut | None = None
+    # The alert events of the confirmed rules after the newest investigation
+    # event, or after the boundary when it is later (G2): the count, the
+    # count of the rules and the time of the last. They take the verdict of
+    # an earlier investigation.
+    laterAlerts: int = 0
+    laterRules: int = 0
+    laterLastAt: str | None = None
+
+
+def since_out(since: since_svc.SinceDecision | None) -> SinceDecisionOut | None:
+    """The API form of :func:`since_svc.since_decisions` for one campaign, or None."""
+    if since is None:
+        return None
+    earlier = since.earlier
+
+    def machine(m: since_svc.Machine) -> SinceMachineOut:
+        return SinceMachineOut(machineKey=m.key, name=m.name, address=m.address)
+
+    return SinceDecisionOut(
+        earlier=EarlierDecisionOut(
+            decision=earlier.decision,
+            reason=earlier.reason,
+            label=earlier.label,
+            note=earlier.note,
+            noteKnown=earlier.note_known,
+            by=earlier.by,
+            at=_iso(earlier.at),
+        ),
+        cause=since.cause,
+        reopenedAt=_iso_utc(since.reopened_at),
+        reopenedBy=since.reopened_by,
+        boundary=_iso_utc(since.boundary),
+        boundarySource=since.boundary_source,
+        runIds=list(since.run_ids),
+        investigations=since.investigations,
+        verdicts=[VerdictCountOut(verdict=v, count=n) for v, n in since.verdicts],
+        authorized=since.authorized,
+        actors=[machine(m) for m in since.actors],
+        targets=[machine(m) for m in since.targets],
+        rules=since.rules,
+        firstEvent=_iso(since.first_event),
+        lastEvent=_iso(since.last_event),
+        stage=since.stage,
+        stageBefore=since.stage_before,
+        stageNow=since.stage_now,
+        stageRose=since.stage_rose,
+        newMachines=list(since.new_machines),
+        outsideTruePositives=since.outside,
+        outsideNames=[scrub_secrets(name) for name in since.outside_names],
+        authorizations=[
+            SinceHoldingOut(
+                id=h.id,
+                label=scrub_secrets(h.label),
+                state=h.state,
+                expiresAt=_iso(h.expires_at),
+                investigations=h.investigations,
+            )
+            for h in since.holding
+        ],
+        laterAlerts=since.later_alerts,
+        laterRules=since.later_rules,
+        laterLastAt=_iso(since.later_last_at),
+    )
+
+
 class CampaignRowOut(BaseModel):
     """One campaign of the list. ``targets`` names at most three targets, and
     ``targetsMore`` counts the rest. ``status`` is ``open`` or ``ended``.
@@ -106,12 +272,27 @@ class CampaignRowOut(BaseModel):
     # when the campaign holds a decision.
     decision: str | None = None
     waitsSince: str | None = None
+    # The one state that the console shows: the decision in force, else the
+    # status (``campaign_svc.api_state``).
+    state: str = ""
     # The authorization that the campaign names, or null. ``beyond`` counts
     # the true positive investigations beyond it, and is 0 with none.
     authorization: RowAuthorizationOut | None = None
     beyond: int = 0
     # The case of a campaign with the decision ``case``, else null.
     case: CampaignRowCaseOut | None = None
+    # What is new since the decision that a reopen ended, else null.
+    sinceDecision: SinceDecisionOut | None = None
+    # The time of the grid read of ``alerts``, and true when the content of
+    # the campaign changed after it: the count can be behind, and the console
+    # states the time of the read (SD5).
+    alertsReadAt: str | None = None
+    alertsBehind: bool = False
+    # The last alert event of a confirmed rule of the stored grid read, else
+    # null. ``lastActivity`` is the later of it and ``lastEvent``: each
+    # surface states the span of the campaign to it.
+    lastAlertAt: str | None = None
+    lastActivity: str | None = None
 
 
 class CampaignsOut(BaseModel):
@@ -145,11 +326,20 @@ class StageEvidenceOut(BaseModel):
     at: str | None = None
 
 
+class StageHeldOut(BaseModel):
+    """A stage held by ``at``: the later stage ``stage`` has proof at that time."""
+
+    at: str
+    stage: str
+
+
 class StageStepOut(BaseModel):
     """One stage of the ladder. ``headline`` states what happened, in the
     sentence of the investigation that proves the stage. ``evidence`` is the
     record that proves the stage, or null when that investigation holds no
-    document."""
+    document. ``heldBy`` is set when a later stage that needs this stage has
+    earlier proof: the stage then held by that time, with or without proof
+    of its own (:mod:`soc_ai.campaigns.ladder`)."""
 
     stage: str
     reached: bool
@@ -159,6 +349,7 @@ class StageStepOut(BaseModel):
     proofDocumentId: str | None = None
     headline: str | None = None
     evidence: StageEvidenceOut | None = None
+    heldBy: StageHeldOut | None = None
 
 
 class CampaignPartyOut(BaseModel):
@@ -229,6 +420,9 @@ class CampaignMemberOut(BaseModel):
     # analyst joined it to the campaign.
     authorized: bool = False
     included: bool = False
+    # A finding whose text names a known machine that is no host of the
+    # finding: the note of soc_ai.campaigns.finding_names. Null for no note.
+    nameNote: str | None = None
 
 
 class RelatedRunOut(BaseModel):
@@ -366,6 +560,18 @@ class CampaignEventsOut(BaseModel):
     records: int | None = None
     pairs: list[EventPairOut] = Field(default_factory=list)
     timeline: EventTimelineOut
+    # True for a stored grid read that is older than the content of the
+    # campaign: the grid did not answer since. The page states ``readAt``.
+    behind: bool = False
+    # The last alert event of a confirmed rule of a pair, else null.
+    lastAlertAt: str | None = None
+    # The alert events of the confirmed rules after the newest investigation
+    # event, or after the boundary of a decision when it is later (G6): the
+    # count, the count of the rules and the time of the last. 0 and null
+    # when the stored read holds none or is older than the campaign.
+    laterAlerts: int = 0
+    laterRules: int = 0
+    laterLastAt: str | None = None
 
 
 class CampaignDecisionOut(BaseModel):
@@ -386,8 +592,10 @@ class CampaignChangeOut(BaseModel):
     ``excluded``, ``included``, ``case_intent``, ``case``, ``case_failed`` or
     ``case_comment``. ``detail`` holds its facts: ``stage`` ``{from, to}``,
     ``party`` ``{names}``, ``decided`` ``{decision, reason, by}`` or
-    ``{decision, authorizationId, label, by}``, ``reopened`` ``{cause, by?}``
-    with the cause ``revoked`` for a revoke, ``acknowledged`` ``{alerts,
+    ``{decision, authorizationId, label, by}``, ``reopened`` ``{cause, by?,
+    note?, was?}`` with the cause ``revoked`` for a revoke and ``was`` the
+    decision that the reopen ended ``{decision, reason, note, by, decidedAt,
+    basis, label?}`` (absent on a change of an earlier release), ``acknowledged`` ``{alerts,
     failed}``, ``beyond`` ``{runId, why}``, ``excluded`` and ``included``
     ``{runId, by}``, ``case_intent`` ``{intentId, by, title, alerts}``,
     ``case`` ``{caseId, alerts, by, intentId?, url, link, existing?}``,
@@ -481,7 +689,9 @@ class CampaignLeadOut(BaseModel):
 class CampaignHuntOut(BaseModel):
     """One hunt for the campaign. ``starter`` is ``analyst``, ``schedule``,
     ``lead``, ``campaign`` or ``catalog``. ``findings`` counts the findings of
-    the report, and ``threatFindings`` the threat findings among them."""
+    the report, and ``threatFindings`` the threat findings among them.
+    ``answer`` is the answer of a hunt that read the campaign:
+    ``new_activity``, ``continues`` or ``no_new_event``, else null."""
 
     id: str
     starter: str
@@ -489,13 +699,34 @@ class CampaignHuntOut(BaseModel):
     startedAt: str
     findings: int = 0
     threatFindings: int = 0
+    answer: str | None = None
+    # The steps of a hunt that stopped, so the fold reads "Stopped with an
+    # error after 14 steps" as the hunt page does. Null for any other hunt.
+    steps: int | None = None
+
+
+class HuntAnswerOut(BaseModel):
+    """What one hunt found for the campaign that it read (migration 0074).
+
+    ``outcome`` is ``new_activity``: a threat finding names a machine of the
+    campaign, ``continues``: a finding repeats the known activity of the
+    campaign, or ``no_new_event``. ``findingTitle`` names the finding behind
+    the first two. ``huntAt`` is the time that the hunt started."""
+
+    huntId: str
+    huntAt: str | None = None
+    starter: str
+    outcome: str
+    findingOrdinal: int | None = None
+    findingTitle: str | None = None
 
 
 class CampaignOut(BaseModel):
     """One campaign. A merged or withdrawn campaign has empty sections.
 
-    ``decision`` is null while the campaign waits on the analyst.
-    ``waitsSince`` is the first event, or the time the campaign opened again,
+    ``decision`` is null while the campaign waits on the analyst. ``state``
+    is the one state that the console shows: the decision in force, else the
+    status. ``waitsSince`` is the first event, or the time the campaign opened again,
     and null when it holds a decision. ``changes`` lists at most 50 changes,
     the newest first. ``leads`` lists the leads of the campaign and the
     related leads. ``hunts`` lists the hunts for the campaign.
@@ -504,6 +735,7 @@ class CampaignOut(BaseModel):
     id: int
     title: str
     status: str
+    state: str = ""
     mergedInto: int | None = None
     earlierCampaign: EarlierCampaignOut | None = None
     bottomLine: str
@@ -533,6 +765,14 @@ class CampaignOut(BaseModel):
     hunts: list[CampaignHuntOut] = Field(default_factory=list)
     # The one Security Onion case of the campaign, or null.
     case: CampaignCaseOut | None = None
+    # What the hunts that read the campaign found, the newest hunt first, at
+    # most 20.
+    answers: list[HuntAnswerOut] = Field(default_factory=list)
+    # What is new since the decision that a reopen ended, else null (SD2).
+    sinceDecision: SinceDecisionOut | None = None
+    # The later of ``lastEvent`` and ``events.lastAlertAt``: each surface
+    # states the span of the campaign to it.
+    lastActivity: str | None = None
 
 
 def _iso(at: datetime | None) -> str | None:
@@ -557,6 +797,7 @@ def _row_out(row: campaign_svc.CampaignRow) -> CampaignRowOut:
         members=row.members,
         alerts=row.alerts,
         decision=row.decision,
+        state=row.state,
         waitsSince=_iso(row.waits_since),
         authorization=(
             RowAuthorizationOut(
@@ -572,6 +813,11 @@ def _row_out(row: campaign_svc.CampaignRow) -> CampaignRowOut:
             if row.decision == decisions.DECISION_CASE and row.case_opened_at is not None
             else None
         ),
+        sinceDecision=since_out(row.since_decision),
+        alertsReadAt=_iso(row.alerts_at),
+        alertsBehind=row.alerts_behind,
+        lastAlertAt=_iso(row.last_alert_at),
+        lastActivity=_iso_utc(row.last_activity),
     )
 
 
@@ -636,8 +882,12 @@ def _record_out(view: campaign_svc.CampaignView) -> CampaignRecordOut | None:
     )
 
 
-def _events_out(events: CampaignEvents) -> CampaignEventsOut:
+def _events_out(events: CampaignEvents, *, built_at: datetime | None = None) -> CampaignEventsOut:
     return CampaignEventsOut(
+        behind=events.source == SOURCE_GRID
+        and events.read_at is not None
+        and built_at is not None
+        and events.read_at < built_at,
         source=events.source,
         readAt=_iso(events.read_at),
         alerts=events.alerts,
@@ -679,10 +929,25 @@ def _events_out(events: CampaignEvents) -> CampaignEventsOut:
                 for lane in events.timeline.lanes
             ],
         ),
+        lastAlertAt=_iso(events.last_alert_at),
+        **_later_out(events.later),
     )
 
 
-def _step_out(step: StageStep, headlines: dict[str, str]) -> StageStepOut:
+def _later_out(later: Any) -> dict[str, Any]:
+    """The later alert events of a stored read in the API form, or none."""
+    if later is None or not later.known or later.alerts <= 0:
+        return {}
+    return {
+        "laterAlerts": later.alerts,
+        "laterRules": later.rules,
+        "laterLastAt": _iso(later.last_at),
+    }
+
+
+def _step_out(
+    step: StageStep, headlines: dict[str, str], earlier: HeldBy | None = None
+) -> StageStepOut:
     evidence = None
     if step.proof_document_id is not None and (step.proof_label or step.proof_at is not None):
         evidence = StageEvidenceOut(
@@ -699,6 +964,11 @@ def _step_out(step: StageStep, headlines: dict[str, str]) -> StageStepOut:
         proofDocumentId=step.proof_document_id,
         headline=headlines.get(step.proof_run_id) if step.proof_run_id else None,
         evidence=evidence,
+        heldBy=(
+            StageHeldOut(at=_iso(earlier.at) or "", stage=earlier.stage)
+            if earlier is not None
+            else None
+        ),
     )
 
 
@@ -739,6 +1009,17 @@ def _hunt_out(hunt: Any) -> CampaignHuntOut:
     )
 
 
+def _answer_out(view: hunt_answers.AnswerView) -> HuntAnswerOut:
+    return HuntAnswerOut(
+        huntId=view.hunt_id,
+        huntAt=_iso(view.hunt_at),
+        starter=view.starter,
+        outcome=view.outcome,
+        findingOrdinal=view.finding_ordinal,
+        findingTitle=scrub_secrets(view.finding_title) if view.finding_title else None,
+    )
+
+
 def _campaign_out(
     view: campaign_svc.CampaignView,
     *,
@@ -749,10 +1030,14 @@ def _campaign_out(
 ) -> CampaignOut:
     alerts = _edge_alerts(view)
     held = headlines or {}
+    earlier = held_by({s.stage: s.first_at for s in view.ladder if s.reached})
     return CampaignOut(
         id=view.id,
         title=view.title,
         status=view.status,
+        state=campaign_svc.api_state(
+            view.status, view.decision.type if view.decision is not None else None
+        ),
         mergedInto=view.merged_into,
         earlierCampaign=(
             EarlierCampaignOut(id=view.earlier.id, title=view.earlier.title)
@@ -775,7 +1060,7 @@ def _campaign_out(
             )
             for a in view.authorizations
         ],
-        ladder=[_step_out(s, held) for s in view.ladder],
+        ladder=[_step_out(s, held, earlier.get(s.stage)) for s in view.ladder],
         parties=[
             CampaignPartyOut(
                 machineKey=p.machine_key,
@@ -859,7 +1144,7 @@ def _campaign_out(
                 for e in view.edges
             ]
         ),
-        events=_events_out(view.events),
+        events=_events_out(view.events, built_at=view.built_at),
         decision=_decision_out(view),
         waitsSince=_iso(view.waits_since),
         changes=[
@@ -904,6 +1189,8 @@ def _campaign_out(
             for lead in leads
         ],
         hunts=[_hunt_out(h) for h in hunts],
+        sinceDecision=since_out(view.since_decision),
+        lastActivity=_iso_utc(view.last_activity),
     )
 
 
@@ -911,8 +1198,10 @@ def _campaign_out(
 async def list_campaigns(request: Request) -> CampaignsOut:
     """The active campaigns, the newest last event first.
 
-    ``status`` is ``open`` while the newest member event is inside one
-    horizon, else ``ended``. ``stale`` is true when the rebuild failed.
+    ``status`` is ``open`` while the last activity is inside one horizon,
+    else ``ended``. The last activity is the later of the last investigation
+    event and the last alert event of a confirmed rule. ``stale`` is true
+    when the rebuild failed.
     """
     async with request.app.state.db_sessionmaker() as db:
         fresh = await campaign_svc.ensure_fresh(db, audit=getattr(request.app.state, "audit", None))
@@ -940,6 +1229,50 @@ async def get_campaign(
         return await _read_out(db, campaign_id, fresh=fresh)
 
 
+async def _reopen_hunt(
+    db: AsyncSession, since: since_svc.SinceDecision, hunts: Sequence[Any]
+) -> SinceHuntOut | None:
+    """The hunt that the reopen started, with the outcome words of the hunt page (W1).
+
+    The campaign hunt loop starts one hunt for a reopen by new activity
+    (:mod:`soc_ai.hunting.campaign_hunt`), within the horizon of a change
+    after the reopen. The first such hunt of the campaign is the hunt of the
+    reopen. A reopen by the analyst or by a revoke starts no hunt. Production,
+    2026-11-18: that hunt confirmed 1 and found 1 false positive, and the
+    campaign page named only the newest scheduled hunt, which found nothing.
+    """
+    if since.cause in (decisions.CAUSE_ANALYST, decisions.CAUSE_REVOKED):
+        return None
+    start = since.reopened_at
+    end = start + campaign_hunt.CHANGE_HORIZON
+    started = sorted(
+        (
+            h
+            for h in hunts
+            if str(h.starter or "") == campaign_hunt.STARTER
+            and h.created_at is not None
+            and start <= h.created_at <= end
+        ),
+        key=lambda h: (h.created_at, str(h.id)),
+    )
+    if not started:
+        return None
+    hunt = started[0]
+    from soc_ai.api.webui.routes_hunts import (  # noqa: PLC0415 - routes_hunts reads this module
+        _lead_hunt_state,
+    )
+    from soc_ai.store import hunts as hunt_svc  # noqa: PLC0415 - lazy
+
+    verdicts = (await hunt_svc.finding_verdicts(db, [str(hunt.id)])).get(str(hunt.id))
+    status, outcome = _lead_hunt_state(hunt, verdicts)
+    return SinceHuntOut(
+        id=str(hunt.id),
+        startedAt=_iso_utc(hunt.created_at),
+        status=status or "error",
+        outcome=outcome,
+    )
+
+
 def _not_found() -> Exception:
     return api_error(404, "campaign_not_found", "No campaign has this id. Open the campaign list.")
 
@@ -950,15 +1283,51 @@ async def _read_out(db: AsyncSession, campaign_id: int, *, fresh: bool) -> Campa
     if view is None:
         raise _not_found()
     proofs = [s.proof_run_id for s in view.ladder if s.proof_run_id]
+    hunt_rows = await lead_tags.hunts_of(db, campaign_id)
     out = _campaign_out(
         view,
         stale=not fresh,
         headlines=await _headlines(db, proofs),
         leads=await lead_tags.leads_of(db, campaign_id),
-        hunts=await lead_tags.hunts_of(db, campaign_id),
+        hunts=hunt_rows,
     )
+    if out.sinceDecision is not None and view.since_decision is not None:
+        out.sinceDecision.reopenHunt = await _reopen_hunt(db, view.since_decision, hunt_rows)
     out.case = await _case_out(db, campaign_id)
+    # A merged or a withdrawn campaign has empty sections.
+    if view.status not in (campaign_svc.STATUS_MERGED, campaign_svc.STATUS_WITHDRAWN):
+        family = await campaign_hunt.family(db, campaign_id)
+        views = await hunt_answers.answers_of(db, hunt_answers.SUBJECT_CAMPAIGN, family)
+        out.answers = [_answer_out(v) for v in views]
+        outcomes = {a.huntId: a.outcome for a in out.answers}
+        for hunt in out.hunts:
+            hunt.answer = outcomes.get(hunt.id)
+    # The steps of each hunt that stopped (routes_hunts.STOPPED_STATUSES).
+    from soc_ai.api.webui.routes_hunts import (  # noqa: PLC0415 - routes_hunts reads this module
+        STOPPED_STATUSES,
+        _step_counts,
+    )
+
+    stopped = [h.id for h in out.hunts if h.status in STOPPED_STATUSES]
+    steps = await _step_counts(db, stopped)
+    for hunt in out.hunts:
+        if hunt.id in stopped:
+            hunt.steps = steps.get(hunt.id, 0)
+    await _name_notes(db, out.members)
     return out
+
+
+async def _name_notes(db: AsyncSession, members: list[CampaignMemberOut]) -> None:
+    """Set the name note on each finding member whose finding has one."""
+    ids = sorted({m.runId for m in members if m.kind == KIND_FINDING})
+    runs: list[Investigation] = []
+    for part in chunked(ids):
+        runs.extend(
+            (await db.scalars(select(Investigation).where(Investigation.id.in_(part)))).all()
+        )
+    notes = await finding_names.notes_for_runs(db, runs)
+    for m in members:
+        m.nameNote = notes.get(m.runId)
 
 
 def _detail_of(change: Any) -> dict[str, Any]:
@@ -1054,7 +1423,9 @@ async def campaign_close_scope(
 
     The events of the confirmed rules between the machines of the campaign,
     in its period, that Security Onion has not acknowledged. At most 2,000.
-    A failed grid read gives ``alerts`` null, never 0. An unknown id gives 404.
+    The period of an open campaign ends at the end of the grid read that the
+    page states, and the close records that time in its basis. A failed grid
+    read gives ``alerts`` null, never 0. An unknown id gives 404.
     """
     async with request.app.state.db_sessionmaker() as db:
         scope = await campaign_svc.close_scope(db, campaign_id, elastic, settings)
@@ -1174,7 +1545,9 @@ async def close_campaign(
         if row is None:
             raise _not_found()
         _refuse_closed(row)
-        basis = await decisions.basis_for(db, row)
+        # The close covers what the page states: the later alert events of
+        # the grid read too (G3).
+        basis = await campaign_svc.close_basis(db, row)
         title = row.title
         # End the read snapshot: the write below reads the row again.
         await db.rollback()
@@ -1961,6 +2334,7 @@ __all__ = [
     "PartyBriefOut",
     "ReopenIn",
     "RevokeAuthorizationIn",
+    "SinceDecisionOut",
     "authorize_campaign",
     "campaign_authorize_draft",
     "campaign_close_scope",

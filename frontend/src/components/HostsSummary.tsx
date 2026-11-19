@@ -17,7 +17,8 @@ import { cn } from '../lib/cn';
 import { provenanceTone, roleRail } from '../lib/hostColors';
 import { roleLabel } from '../lib/hostDossier';
 import { plural } from '../lib/plural';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
+import { UtcTime } from './UtcTime';
 import type { MachineSummary } from '../lib/types';
 import { Kpi, UNKNOWN, UNKNOWN_TONE } from './Kpi';
 import { LoadingInline } from './States';
@@ -476,7 +477,7 @@ export function HostsSummary({
           {summary.last_sweep_at == null ? (
             <span title="No sweep has built a machine yet.">Never swept.</span>
           ) : (
-            <span title={absTime(summary.last_sweep_at)}>Last swept {ago(summary.last_sweep_at)}</span>
+            <span title={timeTitle(summary.last_sweep_at)}>Last swept {ago(summary.last_sweep_at)}</span>
           )}
           {scheduleEnabled === false && (
             <>
@@ -499,7 +500,7 @@ export function HostsSummary({
                     title="The Agent and Last seen columns show the state at the last sweep. The machine page shows live activity."
                   >
                     the list shows the state as of{' '}
-                    {absTime(summary.last_sweep_at, { zone: true })}
+                    <UtcTime iso={summary.last_sweep_at} />
                   </span>
                 </>
               )}

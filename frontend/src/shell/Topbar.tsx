@@ -9,7 +9,9 @@ import { HuntOutcomeChip } from '../components/HuntOutcomeChip';
 import { NeedsYouBlock } from '../components/NeedsYouBlock';
 import { LoadingInline } from '../components/States';
 import {
+  ApiError,
   type Health,
+  RequestTimeoutError,
   getHealth,
   getNotifications,
   getWorkspaces,
@@ -44,7 +46,9 @@ import { PALETTE_TRIGGER_ATTR, paletteKeyLabel } from './platform';
 import { UPSTREAM_COLOR, type UpstreamState, upstreamState } from './upstream';
 import { useSession } from './Session';
 import { useShell } from './ShellContext';
+import { TopbarClock } from './TopbarClock';
 import { isMachineKey } from '../lib/hostDossier';
+import { useSecondClock } from '../lib/clock';
 import { HelpMenu } from '../tours/HelpMenu';
 
 const TONE: Record<Notification['tone'], string> = {
@@ -107,6 +111,22 @@ function useBreadcrumb(): Crumb {
   return crumbFor(pathname, search);
 }
 
+/** The wait before the second health read, after a failed first one. */
+export const HEALTH_RETRY_MS = 5_000;
+
+/** The pill after two failed health reads. It names what did not answer:
+ *  the soc-ai API. The upstream components have their own rows. */
+export const HEALTH_FAILED_LABEL = 'soc-ai API unreachable';
+
+/** Why the health read failed, as one sentence for the panel. */
+export function healthFailure(e: unknown): string {
+  if (e instanceof RequestTimeoutError) {
+    return `The soc-ai API did not answer two reads in ${Math.round(e.timeoutMs / 1000)} s.`;
+  }
+  if (e instanceof ApiError) return `The soc-ai API answered two reads with HTTP ${e.status}.`;
+  return 'The browser could not reach the soc-ai API on two reads.';
+}
+
 export function Topbar() {
   const { openPalette, ws, setWs, crumbName } = useShell();
   // Every read below is a protected endpoint. Hold them until /me answers, so
@@ -134,7 +154,9 @@ export function Topbar() {
   const [loadedAt, setLoadedAt] = useState<number | null>(null);
   const loadRef = useRef<() => void>(() => {});
   const [health, setHealth] = useState<Health | null>(null);
-  const [healthFailed, setHealthFailed] = useState(false);
+  // Why the health read failed, as one sentence, after a retry. Null while
+  // the reads answer.
+  const [healthFailed, setHealthFailed] = useState<string | null>(null);
 
   useEffect(() => {
     if (!ready) return;
@@ -220,32 +242,46 @@ export function Topbar() {
   useEffect(() => {
     if (!ready) return;
     let alive = true;
-    const tick = () =>
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    // One failed read showed "unreachable" until the next poll, 60 s later,
+    // while the route answered in under 0.1 s (dogfood 2026-11-17, AB4). A
+    // read can fail for a moment: a client timeout behind a slow page, a
+    // dropped connection, a laptop that woke up. The pill keeps the last
+    // answer and reads once more before it states a failure.
+    const tick = (attempt = 0): Promise<void> =>
       getHealth()
         .then((h) => {
           if (!alive) return;
           setHealth(h);
-          setHealthFailed(false);
+          setHealthFailed(null);
         })
-        .catch(() => {
+        .catch((e: unknown) => {
           if (!alive) return;
+          if (attempt === 0) {
+            clearTimeout(retry);
+            retry = setTimeout(() => {
+              if (alive) void tick(1);
+            }, HEALTH_RETRY_MS);
+            return;
+          }
           setHealth(null);
-          setHealthFailed(true);
+          setHealthFailed(healthFailure(e));
         });
-    tick();
+    void tick();
     // Same hidden-tab guard as the notifications poll above: don't probe
     // upstream health for a parked tab, and refresh once on return to visible.
     const t = setInterval(() => {
       if (document.hidden) return;
-      tick();
+      void tick();
     }, 60_000);
     const onVisible = () => {
-      if (!document.hidden) tick();
+      if (!document.hidden) void tick();
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
       alive = false;
       clearInterval(t);
+      clearTimeout(retry);
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [ready]);
@@ -270,7 +306,7 @@ export function Topbar() {
         ? 'down'
         : 'degraded';
   const healthLabel = healthFailed
-    ? 'unreachable'
+    ? HEALTH_FAILED_LABEL
     : health === null
       ? 'checking'
       : healthOk
@@ -373,9 +409,19 @@ export function Topbar() {
   const needsYouParts = needsYouLines(needsYou.data);
   const showNeedsYouBlock = needsYouParts.length > 0 || needsYouReviewLine(needsYou.data) !== null;
   const more = hasMoreNotifications(received, limit);
+  const secondClockOn = useSecondClock().mode !== 'off';
 
   return (
-    <div className="relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]">
+    // `topbar` makes the bar a container: its parts give way by the room of
+    // the bar (index.css, round 4, C5). `data-second-clock` tells the rules
+    // that the second clock takes room. `data-health-long` tells them that
+    // the health label is longer than "connected": it takes that room.
+    <div
+      data-testid="topbar"
+      data-second-clock={secondClockOn ? 'on' : undefined}
+      data-health-long={healthLabel.length > 'connected'.length ? 'on' : undefined}
+      className="topbar relative z-30 flex h-[52px] flex-none items-center gap-[11px] border-b border-border bg-[rgba(11,14,19,.7)] py-0 pl-4 pr-3.5 backdrop-blur-[8px]"
+    >
       {/* Workspace switcher, only when more than one workspace exists. One
           workspace has nothing to switch to, and the chip showed a bare grid
           address that read as a page name (dogfood 2026-10-06). */}
@@ -454,16 +500,29 @@ export function Topbar() {
       {workspaces.length > 1 && <div className="h-[18px] w-px flex-none bg-border-2" />}
 
       {/* breadcrumb */}
-      <div className="flex min-w-0 items-center gap-[7px] text-[13px] text-dim">
+      {/* The breadcrumb never shrinks under an id: at 1100 px the box gave
+          way and the id ran under the search field (round 3, T1). Only a
+          name may wrap, so only a name lets the box shrink. A shrink of 1
+          took a part of a pixel from the box beside a search field that
+          still had room, and "Campaign 1" wrapped at 1100 px with both
+          clocks (round 4, C5). With 0.001 the search field gives all its
+          room first, and then the name wraps. */}
+      <div
+        data-testid="topbar-breadcrumb"
+        className={`flex items-center gap-[7px] text-[13px] text-dim ${crumb2Name ? 'min-w-0 shrink-[0.001]' : 'flex-none'}`}
+      >
         <span data-testid="topbar-crumb" className="whitespace-nowrap font-semibold text-text">
           {crumb}
         </span>
         {crumb2 && (
           <>
             <span className="text-ghost">/</span>
+            {/* A name wraps and stays whole. An id stays on one line: at
+                1100 px the id of an investigation wrapped onto five lines
+                (dogfood 2026-11-17, N10). The search field gives way. */}
             <span
               data-testid="topbar-crumb2"
-              className={`min-w-0 break-words text-dim ${crumb2Name ? 'text-[12.5px]' : 'font-mono text-[12px]'}`}
+              className={`text-dim ${crumb2Name ? 'min-w-0 break-words text-[12.5px]' : 'flex-none whitespace-nowrap font-mono text-[12px]'}`}
               title={crumb2Name || crumb2Key ? crumb2 : undefined}
             >
               {crumb2Name ?? (crumb2Key ? 'machine' : crumb2)}
@@ -472,23 +531,41 @@ export function Topbar() {
         )}
       </div>
 
-      <div className="flex-1" />
-
-      {/* command palette trigger */}
+      {/* command palette trigger. `ml-auto` pushes it right. A spacer box
+          cost one more gap of the bar at 1100 px. */}
       <button
         onClick={openPalette}
         data-tour="search"
         {...{ [PALETTE_TRIGGER_ATTR]: '' }}
         title={`Search or jump to. The shortcut is ${paletteKeyLabel()}.`}
-        className="flex flex-none cursor-text items-center gap-2 rounded-control border border-border-2 bg-surface-1 px-2.5 py-1.5 text-faint hover:border-border-strong"
+        data-testid="topbar-search"
+        className="topbar-search ml-auto flex min-w-[36px] shrink-[1000] cursor-text items-center gap-2 overflow-hidden rounded-control border border-border-2 bg-surface-1 px-2.5 py-1.5 text-faint hover:border-border-strong"
         style={{ width: 'clamp(170px,22vw,300px)' }}
       >
-        <span className="flex">
+        <span className="flex flex-none">
           <Search size={14} />
         </span>
-        <span className="flex-1 break-words text-left text-[12.5px]">Search or jump to</span>
-        <kbd className="rounded-[4px] border border-border-input px-[5px] py-px font-mono text-[10px] text-dim">{paletteKeyLabel()}</kbd>
+        {/* The field gives way first, and its parts hide whole as it
+            narrows: first the words, then the shortcut (index.css). The
+            title of the button states both. A viewport breakpoint did not
+            see the sidebar or the label of the Ask button (round 3, T1). */}
+        <span
+          data-testid="topbar-search-words"
+          className="topbar-search-words flex-1 whitespace-nowrap text-left text-[12.5px]"
+        >
+          Search or jump to
+        </span>
+        <kbd
+          data-testid="topbar-search-key"
+          className="topbar-search-key flex-none rounded-[4px] border border-border-input px-[5px] py-px font-mono text-[10px] text-dim"
+        >
+          {paletteKeyLabel()}
+        </kbd>
       </button>
+
+      {/* The time now in UTC, the clock of every absolute time on the page.
+          It never shrinks: the search field gives way first. */}
+      <TopbarClock />
 
       {/* upstream health (ES / LLM / PCAP) */}
       <button
@@ -500,7 +577,7 @@ export function Topbar() {
           setWsOpen(false);
           setNotifOpen(false);
         }}
-        title="Upstream health"
+        title={healthFailed ? `Upstream health. ${healthFailed}` : 'Upstream health'}
         data-state={healthState ?? undefined}
         className="flex flex-none items-center gap-1.5 rounded-control border border-border-2 px-[9px] py-1.5 font-mono text-[11.5px] text-dim hover:border-border-strong hover:text-text"
       >
@@ -521,7 +598,9 @@ export function Topbar() {
             Upstream health
           </div>
           {healthFailed && (
-            <div className="px-3.5 py-6 text-center text-[12px] text-warn">The API is unreachable. The console tries again.</div>
+            <div data-testid="health-failed" className="px-3.5 py-6 text-center text-[12px] text-warn">
+              {healthFailed} The console reads it again in 1 minute.
+            </div>
           )}
           {!healthFailed && health === null && (
             <div className="px-3.5 py-6 text-center text-[12px] text-faint"><LoadingInline>Checking</LoadingInline></div>

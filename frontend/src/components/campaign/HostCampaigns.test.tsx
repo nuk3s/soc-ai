@@ -22,7 +22,7 @@ describe('HostCampaigns', () => {
     const [first, second] = lines;
     expect(within(first).getByRole('img')).toHaveAccessibleName('Stage reached: Action on the target, 4 of 5');
     expect(within(first).getByRole('link', { name: 'actor-a against web-1' })).toHaveAttribute('href', '/campaigns/7');
-    expect(within(first).getByTestId('campaign-status').textContent).toBe('Open');
+    expect(within(first).getByTestId('campaign-state').textContent).toBe('Open');
     expect(within(first).getByTestId('host-campaign-role').textContent).toBe('Target');
     expect(within(first).getByTestId('host-campaign-period').textContent).toBe(
       utcWindow(HOST_CAMPAIGNS[0].firstEvent, HOST_CAMPAIGNS[0].lastEvent),
@@ -30,7 +30,7 @@ describe('HostCampaigns', () => {
     expect(within(first).getByTestId('host-campaign-alerts').textContent).toBe('47 alerts');
     // A campaign with no stored events states no alert count.
     expect(within(second).getByRole('img')).toHaveAccessibleName('No proven stage');
-    expect(within(second).getByTestId('campaign-status').textContent).toBe('Ended');
+    expect(within(second).getByTestId('campaign-state').textContent).toBe('Ended');
     expect(within(second).getByTestId('host-campaign-role').textContent).toBe('Actor and target');
     expect(within(second).queryByTestId('host-campaign-alerts')).toBeNull();
     // The title wraps. It is never cut.
@@ -64,30 +64,30 @@ describe('HostCampaigns', () => {
     expect(within(second).queryByTestId('host-campaign-authorized')).toBeNull();
   });
 
-  it('states the decision of each campaign as a chip after its status', () => {
+  it('states one state chip for each campaign: the decision in force, else the status', () => {
     mount(
       <HostCampaigns
         campaigns={[
-          { ...HOST_CAMPAIGNS[0], decision: null, waitsSince: '2026-10-24T00:40:00Z' },
-          { ...HOST_CAMPAIGNS[1], decision: 'closed', waitsSince: null },
+          { ...HOST_CAMPAIGNS[0], decision: null, waitsSince: '2026-10-24T00:40:00Z', state: 'open' },
+          { ...HOST_CAMPAIGNS[1], decision: 'closed', waitsSince: null, state: 'closed' },
         ]}
       />,
     );
     const [waits, closed] = screen.getAllByTestId('host-campaign');
-    const chip = within(waits).getByTestId('campaign-decision-chip');
-    expect(chip.textContent).toBe('Waits on you');
-    expect(chip).toHaveAttribute('data-state', 'waits');
-    // The chip follows the status chip.
-    const status = within(waits).getByTestId('campaign-status');
-    expect(status.nextElementSibling).toBe(chip);
-    expect(within(closed).getByTestId('campaign-decision-chip').textContent).toBe('Closed');
+    const chip = within(waits).getByTestId('campaign-state');
+    expect(chip.textContent).toBe('Open');
+    expect(chip).toHaveAttribute('data-waits', 'true');
+    expect(within(closed).getAllByTestId('campaign-state').map((c) => c.textContent)).toEqual(['Closed']);
+    expect(within(closed).queryByText('Ended')).toBeNull();
   });
 
-  // NEGATIVE CONTROL. A server that sends no decision gets no chip: the
-  // console never claims that a campaign waits.
-  it('states no decision chip for a server that sends no decision', () => {
+  // NEGATIVE CONTROL. A server that sends no decision gets the status with
+  // no wait: the console never claims that a campaign waits.
+  it('claims no wait for a server that sends no decision', () => {
     mount(<HostCampaigns campaigns={HOST_CAMPAIGNS} />);
-    expect(screen.queryByTestId('campaign-decision-chip')).toBeNull();
+    for (const chip of screen.getAllByTestId('campaign-state')) {
+      expect(chip).toHaveAttribute('data-waits', 'false');
+    }
   });
 
   // NEGATIVE CONTROL. A machine in no campaign, and a server of an earlier

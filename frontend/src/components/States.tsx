@@ -1,7 +1,7 @@
 import { AlertTriangle, ArrowLeft, RotateCw, SearchX } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import { absoluteTime, ago } from '../lib/timeRange';
+import { ago, timeTitle, utcStamp } from '../lib/timeRange';
 import { useOptionalShell } from '../shell/ShellContext';
 
 /** Spinner — the 2px ring with a transparent top, as used throughout. */
@@ -230,7 +230,7 @@ export function Freshness({ at, className = '' }: { at: number | null; className
   return (
     <span
       className={`font-mono text-[11px] text-faint ${className}`}
-      title={`Last updated ${absoluteTime(at)}`}
+      title={`Last updated ${timeTitle(at)}`}
     >
       updated {agoLabel(at)}
     </span>
@@ -279,7 +279,9 @@ export function StaleNotice({
    *  the background case is a failing poll loop, which by definition is. */
   retrying?: boolean;
 }) {
-  const t = since ? new Date(since).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '—';
+  // UTC with its zone, the one absolute format (round 3, T3). A clock time
+  // alone named no zone and no day.
+  const t = since ? utcStamp(new Date(since).toISOString()) : '—';
   return (
     <div
       role="status"

@@ -7,7 +7,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import type { GridGap } from '../lib/types';
-import { absoluteTime } from '../lib/timeRange';
+import { utcStamp } from '../lib/timeRange';
 
 vi.mock('../lib/api', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../lib/api')>()),
@@ -91,7 +91,7 @@ describe('the Overview grid gap strip', () => {
   it('names the gap under the page header', async () => {
     mount();
     expect((await screen.findByTestId('grid-gap')).textContent).toBe(
-      `The grid was unreadable from ${absoluteTime('2026-10-15T13:36:00Z')} to ${absoluteTime('2026-10-19T10:15:00Z')} (93 h). Counts in this window are incomplete.`,
+      `The grid was unreadable from ${utcStamp('2026-10-15T13:36:00Z')} to ${utcStamp('2026-10-19T10:15:00Z')} (93 h). Counts in this window are incomplete.`,
     );
   });
 

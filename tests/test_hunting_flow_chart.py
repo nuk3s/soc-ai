@@ -118,3 +118,44 @@ def test_the_chart_uses_no_retired_word() -> None:
     words = " ".join(re.findall(r"<text[^>]*>([^<]*)</text>", _chart()))
     for word in ("run", "runs", "member", "members", "estate", "kind"):
         assert not re.search(rf"\b{word}\b", words, re.IGNORECASE), word
+
+
+def test_the_chart_states_which_hunt_closes_a_lead() -> None:
+    """LH5 (2026-11-17): a clean lead hunt closes its lead. A scheduled hunt
+    closes no lead: it writes its answer on the lead
+    (:mod:`soc_ai.hunting.hunt_answers`). The chart said that a clean hunt
+    closes a lead, any hunt."""
+    chart = _chart()
+    assert "A clean lead hunt closes it." in chart
+    assert "Another hunt writes its answer." in chart
+    # The negative control: the retired claim of any clean hunt.
+    assert "A clean hunt closes it." not in chart
+
+
+def test_the_needs_you_box_states_the_order_of_the_page() -> None:
+    # Dogfood 2026-11-17, N3: the box read "The oldest first." The Needs you
+    # page sorts the most important first (DEFINE_NEEDS_YOU in tooltips.ts).
+    chart = _chart()
+    assert "The most important first." in chart
+    # Negative control: the old order is in no copy.
+    for path in (CONSOLE_COPY, DOCS_COPY):
+        assert "oldest first" not in path.read_text(encoding="utf-8").lower()
+
+
+def test_the_needs_you_box_names_the_rules() -> None:
+    """Dogfood 2026-11-19, D16: the box named no rules. A rule with open false
+    positives is one item of Needs you, with the group title of the page
+    (``NEEDS_YOU_GROUP_LABEL.rule`` in ``needsYouItems.ts``)."""
+    console = (REPO_ROOT / "frontend" / "src" / "lib" / "needsYouItems.ts").read_text("utf-8")
+    assert "rule: 'Rules with open false positives'" in console
+    for path in (CONSOLE_COPY, DOCS_COPY):
+        chart = path.read_text(encoding="utf-8")
+        assert ">Rules with open false positives</text>" in chart
+        # The five parts of the page are in the box, each once.
+        for part in (
+            "Campaigns with no decision",
+            "Investigations that wait",
+            "Leads that need a decision",
+            "Alert groups with no verdict",
+        ):
+            assert chart.count(f">{part}</text>") == 1, part

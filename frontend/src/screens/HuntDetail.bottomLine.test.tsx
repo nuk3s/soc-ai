@@ -105,11 +105,15 @@ describe('the bottom line of the hunt page', () => {
     expect(follows(line, screen.getByTestId('hunt-title'))).toBe(true);
   });
 
-  it('puts the findings before the charts and the timelines', async () => {
+  it('puts the pictures first, then the narrative, the findings and the timelines', async () => {
+    // Dogfood 2026-11-17, AB3: the map and the charts came last, under the
+    // long text. They now lead, and the findings keep their place above the
+    // timelines (review 2026-11-12, L1).
     mount();
     const findings = await screen.findByText('Findings');
+    const pictures = screen.getByText('Visual summary');
+    expect(follows(pictures, screen.getByText('Narrative'))).toBe(true);
     expect(follows(screen.getByText('Narrative'), findings)).toBe(true);
-    expect(follows(findings, screen.getByText('Visual summary'))).toBe(true);
     expect(follows(findings, screen.getByText('Hunt timeline'))).toBe(true);
   });
 

@@ -17,7 +17,9 @@ import { MultiSelect } from '../components/MultiSelect';
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { ErrorState, Freshness, LoadingInline, LoadingState, Spinner } from '../components/States';
 import { groupOutcome, hideOptimisticallyAcked, outcomeOf } from '../lib/alertFilters';
-import { ago } from '../lib/timeRange';
+import { ago, utcStamp, utcTimesInText } from '../lib/timeRange';
+import { RelTime } from '../components/RelTime';
+import { UtcTime } from '../components/UtcTime';
 import { MIN_BUCKET, bucketEvents } from '../lib/alertEventBuckets';
 import {
   type AckGroupResult,
@@ -490,24 +492,19 @@ function StateChip({ state }: { state?: TriageState | null }) {
   );
 }
 
-/** The time of an event row: the date, the 24 h clock time and, unless
- *  `zone` is false, the zone of the browser ("Oct 19, 14:23:05 EDT"). A clock
- *  time alone was ambiguous in a 30 day window, and a run of events read
- *  "08:27:23 PM to 06:20:57 AM" across two days (dogfood 2026-10-19, R2-D17).
- *  The year is in the title. */
+/** The time of an event row in the one absolute format of the console: UTC
+ *  with the date, the 24 h clock time and, unless `zone` is false, the zone
+ *  ("2026-10-19 18:23:05 UTC"). A clock time alone was ambiguous in a 30 day
+ *  window, and a run of events read "08:27:23 PM to 06:20:57 AM" across two
+ *  days (dogfood 2026-10-19, R2-D17). The row showed the local time, beside
+ *  the UTC times of the investigation page (round 3, T3). The title states
+ *  the local time. */
 function eventStamp(iso?: string, zone = true): string {
   if (!iso) return '';
   const d = new Date(iso);
   if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleString(undefined, {
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit',
-    hourCycle: 'h23',
-    ...(zone ? { timeZoneName: 'short' as const } : {}),
-  });
+  const stamp = utcStamp(d.toISOString(), { seconds: true });
+  return zone ? stamp : stamp.replace(/ UTC$/, '');
 }
 
 /** The entity an event-table cell may pivot to, or null when there is nothing
@@ -673,6 +670,42 @@ export function rowReason(g: AlertGroup): string | null {
   return text?.trim() || null;
 }
 
+/** The hosts of a row: the source and the target of the run behind the pill
+ *  (dogfood 2026-11-17, AA4). The row named the flow of the newest alert of
+ *  the group beside the true positive pill of an older run. A row with no run
+ *  ends, and an older server, keep the flow of the newest alert. */
+export function rowFlow(g: AlertGroup): { src: string | null; dst: string | null } {
+  const invId = rowPill(g).invId;
+  const ends =
+    invId && invId === g.windowInvId
+      ? [g.windowSrc, g.windowDst]
+      : invId && invId === g.invId
+        ? [g.verdictSrc, g.verdictDst]
+        : [null, null];
+  if (ends[0] || ends[1]) return { src: ends[0] ?? null, dst: ends[1] ?? null };
+  return { src: g.src ?? null, dst: g.dst ?? null };
+}
+
+/** The run that "Open report" opens: the run behind the pill (AA4). The
+ *  button opened the newest run, a false positive under a true positive pill. */
+export function reportRunId(g: AlertGroup): string | null {
+  return rowPill(g).invId ?? g.invId ?? null;
+}
+
+/** The newest investigation of the group when its verdict differs from the
+ *  verdict on the pill. The pill keeps the worst verdict of the window, and
+ *  the row states the later verdict in one line with a link (AA4). */
+export function laterRun(g: AlertGroup): { invId: string; text: string } | null {
+  if (g.triaging || g.fallback || !g.invId) return null;
+  const pill = rowPill(g);
+  if (!pill.invId || pill.invId === g.invId) return null;
+  if (!g.verdict || g.verdict === 'untriaged' || g.verdict === pill.verdict) return null;
+  return {
+    invId: g.invId,
+    text: `A later investigation reached ${verdictLabel(g.verdict).toLowerCase()}.`,
+  };
+}
+
 /** True when the group counts under a true positive. The row then carries a
  *  shape mark, so the row does not depend on the red of the pill alone. */
 export function isThreatRow(g: AlertGroup): boolean {
@@ -763,20 +796,6 @@ function LastRetryHint({ attempt }: { attempt: NonNullable<AlertGroup['lastAttem
       <span className="break-words">· last retry {label} {attempt.ago} ago</span>
     </span>
   );
-}
-
-/** Format an ISO timestamp as a human-readable absolute time for a tooltip,
- * with the zone of the browser (R2-D17). Falls back to the raw string if it
- * isn't parseable. */
-function absTime(iso?: string): string | undefined {
-  if (!iso) return undefined;
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString(undefined, {
-    year: 'numeric', month: 'short', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', second: '2-digit',
-    timeZoneName: 'short',
-  });
 }
 
 /** Pull a compact "12m ago" fragment out of the enriched inheritedReason
@@ -894,9 +913,9 @@ function EventRow({ ev, g, selEvents, setSelEvents, navigate, openDrawer, huntEv
         />
       </div>
       {/* this alert's OWN timestamp: date, clock time, zone + relative age */}
-      <div className="flex min-w-0 flex-col leading-tight" title={absTime(ev.ts) ?? ev.ts ?? ''}>
-        <span data-testid="event-time" className="break-words text-text-2">{eventStamp(ev.ts) || '—'}</span>
-        {ev.ago && <span className="text-[10px] text-faint">{ev.ago} ago</span>}
+      <div className="flex min-w-0 flex-col leading-tight">
+        <UtcTime testId="event-time" className="break-words text-text-2" iso={ev.ts} />
+        {ev.ago && <RelTime className="text-[10px] text-faint" iso={ev.ts} text={`${ev.ago} ago`} />}
       </div>
       {/* severity */}
       <div><SeverityTag sev={(ev.sev ?? 'unknown') as Severity} /></div>
@@ -1014,17 +1033,10 @@ function windowWords(range: string): string {
   return `${n} ${unit}${n === 1 ? '' : 's'}`;
 }
 
-/** "Oct 19, 14:05 EDT", the local date and time of a read, with the zone
- *  (R2-D17). */
+/** "2026-10-19 18:05 UTC", the time of a read in the one absolute format of
+ *  the console (R2-D17; round 3, T3). */
 function readTime(ms: number): string {
-  return new Date(ms).toLocaleString(undefined, {
-    month: 'short',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hourCycle: 'h23',
-    timeZoneName: 'short',
-  });
+  return utcStamp(new Date(ms).toISOString());
 }
 
 /**
@@ -1244,7 +1256,13 @@ export function Alerts() {
       pauseWhen: () => drawerOpenRef.current || badFilterRef.current,
     }
   );
-  const badFilter = error instanceof ApiError && error.status === 400 && error.reason === 'bad_oql';
+  // A filter that the parser refused, or one that the grid answered and
+  // rejected for the type of a field. Both are the analyst's to correct, and
+  // the same request gets the same 400 until the filter changes.
+  const badFilter =
+    error instanceof ApiError &&
+    error.status === 400 &&
+    (error.reason === 'bad_oql' || error.reason === 'query_rejected');
   badFilterRef.current = badFilter;
 
   // Which window the rows on screen came from. A range change keeps the old
@@ -1657,8 +1675,9 @@ export function Alerts() {
   // For a new hunt the drawer opens IMMEDIATELY in a "starting" state (no list
   // flash), then swaps to the real investigation once it's created.
   const hunt = (g: AlertGroup) => {
-    if (g.invId) {
-      openDrawer(g.invId);
+    const report = reportRunId(g);
+    if (report) {
+      openDrawer(report);
       return;
     }
     setStarting(g);
@@ -1703,7 +1722,7 @@ export function Alerts() {
     setHuntGroupPending((s) => ({ ...s, [gk]: true }));
     getRepresentative(g, alertQuery)
       .then((rep) => {
-        showHuntReason(`The investigation uses the representative event: ${rep.reason}`);
+        showHuntReason(`The investigation uses the representative event: ${utcTimesInText(rep.reason)}`);
         setStarting(g);
         return startHunt(rep.alert_id);
       })
@@ -2343,12 +2362,14 @@ export function Alerts() {
       if (!g) return;
       switch (action.kind) {
         case 'open':
-        case 'investigate':
+        case 'investigate': {
           // Same action as the row's primary button: open an existing report or
           // investigate the representative event.
-          if (g.invId) openDrawer(g.invId);
+          const report = reportRunId(g);
+          if (report) openDrawer(report);
           else huntGroup(g);
           return;
+        }
         case 'ack':
           ackOneGroup(g);
           return;
@@ -2534,6 +2555,12 @@ export function Alerts() {
           <div className="mt-0.5 text-[13px] text-dim" title={truncated ? FLOOR_TITLE : undefined}>
             {num(untriaged)} untriaged · {floorOf(shown, 'detection')} ·{' '}
             {floorOf(totalEvents, 'event')} in window
+            {/* What the counts hold: the Dashboard tile counts acknowledged
+                alerts, and this list hides them by default. One window read
+                9,598 on the tile and 1,877 here (dogfood 2026-11-17, AA6). */}
+            <span data-testid="alerts-acked-scope">
+              {hideAcked ? ' · acknowledged alerts hidden' : ' · acknowledged alerts included'}
+            </span>
             {/* The "+" alone is a mark somebody has to already know how to
                 read. This says what it means, once, on the line it modifies —
                 the numbers stay scannable and the sentence is there for the
@@ -3084,7 +3111,11 @@ export function Alerts() {
             role="alert"
             className="m-3 flex flex-col items-center gap-2 rounded-card border border-[rgba(245,166,35,.35)] bg-[rgba(245,166,35,.06)] px-4 py-6 text-center"
           >
-            <div className="text-[13.5px] font-semibold text-text">The filter is not valid</div>
+            <div className="text-[13.5px] font-semibold text-text">
+              {error instanceof ApiError && error.reason === 'query_rejected'
+                ? 'The grid rejected the filter'
+                : 'The filter is not valid'}
+            </div>
             <div className="max-w-[560px] break-words text-[12.5px] leading-[1.6] text-text-2">{error.message}</div>
             <div className="text-[12px] text-faint">Correct the filter or clear its chip. The list does not refresh until then.</div>
           </div>
@@ -3162,6 +3193,8 @@ export function Alerts() {
           const kbFocused = rowIdx === focusedIndex;
           const threat = isThreatRow(g);
           const reason = rowReason(g);
+          const flow = rowFlow(g);
+          const later = laterRun(g);
           const countChip =
             g.count > 1 ? (
               <span
@@ -3353,14 +3386,33 @@ export function Alerts() {
                         {reason}
                       </div>
                     )}
-                    {/* Who is involved: the flow of the latest alert, how many
+                    {/* A later investigation that disagrees with the pill. */}
+                    {later && (
+                      <div
+                        data-testid="alert-later"
+                        className="min-w-0 break-words text-[11.5px] leading-[1.45] text-dim"
+                      >
+                        {later.text}{' '}
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            openDrawer(later.invId);
+                          }}
+                          className="font-semibold text-accent hover:underline"
+                        >
+                          Open it
+                        </button>
+                      </div>
+                    )}
+                    {/* Who is involved: the flow of the run behind the pill, how many
                         other sources the group holds, and the machine. The row
                         showed none of it until it was expanded (dogfood
                         2026-10-06, W3). A host log has no flow, and says so. */}
-                    {(g.src || g.dst || g.host || (g.siblingCount ?? 0) > 0) && (
+                    {(flow.src || flow.dst || g.host || (g.siblingCount ?? 0) > 0) && (
                       <div data-testid="group-who" className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 font-mono text-[10.5px] text-faint">
-                        {g.src || g.dst ? (
-                          <FlowBadge src={g.src} dst={g.dst} className="text-[10.5px]" />
+                        {flow.src || flow.dst ? (
+                          <FlowBadge src={flow.src ?? undefined} dst={flow.dst ?? undefined} className="text-[10.5px]" />
                         ) : null}
                         {(g.srcCount ?? 0) > 1 && (
                           <span
@@ -3372,7 +3424,7 @@ export function Alerts() {
                         )}
                         {g.host && (
                           <span className="min-w-0 break-all">
-                            {g.src || g.dst ? `· on ${g.host}` : `on ${g.host} · host log`}
+                            {flow.src || flow.dst ? `· on ${g.host}` : `on ${g.host} · host log`}
                           </span>
                         )}
                         {/* The other detections on this flow (R2-I9, R2-D9). */}
@@ -3431,7 +3483,7 @@ export function Alerts() {
                         e.stopPropagation();
                         if (g.invId) openDrawer(g.invId);
                       }}
-                      title="The standing verdict is a pipeline error. Open the investigation and run it again."
+                      title="The investigation of the standing verdict failed. Open the investigation and run it again."
                       className="flex min-w-0 items-center rounded-pill text-left enabled:hover:opacity-90 disabled:cursor-default"
                     >
                       <PipelineErrorChip />
@@ -3518,11 +3570,8 @@ export function Alerts() {
                   })()}
                 </div>
                 {wideTable && ownerCell}
-                <div
-                  className="text-right font-mono text-[12.5px] font-medium text-text-2"
-                  title={absTime(g.latestTs) ?? g.latest}
-                >
-                  {g.latest || '—'}
+                <div className="text-right font-mono text-[12.5px] font-medium text-text-2">
+                  <RelTime testId="alert-last-seen" iso={g.latestTs} text={g.latest || '—'} />
                 </div>
                 {wideTable && tagsCell}
                 {/* flex-wrap keeps the action pills INSIDE this cell: when an
@@ -3608,7 +3657,7 @@ export function Alerts() {
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
-                        openDrawer(g.invId ?? g.id);
+                        openDrawer(reportRunId(g) ?? g.id);
                       }}
                       aria-label="Open investigation"
                       title="Open the investigation report"
@@ -3708,9 +3757,9 @@ export function Alerts() {
                         {/* span of the collapsed run: both ends dated, one zone.
                             A clock time alone hid a run that crossed midnight
                             (R2-D17). */}
-                        <div className="flex min-w-0 flex-col leading-tight" title={`${absTime(b.first) ?? ''} to ${absTime(b.last) ?? ''}`}>
-                          <span data-testid="event-time" className="break-words text-text-2">{eventStamp(b.first, false) || '—'} to {eventStamp(b.last) || '—'}</span>
-                          {b.head.ago && <span className="text-[10px] text-faint">newest {b.head.ago} ago</span>}
+                        <div className="flex min-w-0 flex-col leading-tight">
+                          <UtcTime testId="event-time" className="break-words text-text-2" iso={b.first} to={b.last} />
+                          {b.head.ago && <RelTime className="text-[10px] text-faint" iso={b.last} text={`newest ${b.head.ago} ago`} />}
                         </div>
                         {/* severity */}
                         <div><SeverityTag sev={(b.head.sev ?? 'unknown') as Severity} /></div>

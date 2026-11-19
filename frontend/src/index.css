@@ -128,6 +128,67 @@
   }
 }
 
+/* The search field of the top bar (shell/Topbar.tsx) gives way to the
+   breadcrumb. Its parts hide whole as its own box narrows, first the words and
+   then the shortcut, so no part shows cut. The query reads the box of the
+   field, so it sees the sidebar, the breadcrumb and the Ask button. The
+   widths are the content box: the icon, the gaps and the natural width of
+   each part (181 px with the words, 70 px with the shortcut in Chromium),
+   with a margin for the font. */
+.topbar-search {
+  container-type: inline-size;
+}
+@container (max-width: 195px) {
+  .topbar-search-words {
+    display: none;
+  }
+}
+@container (max-width: 79px) {
+  .topbar-search-key {
+    display: none;
+  }
+}
+
+/* The top bar is a container, so its parts read the room of the bar and not
+   the viewport: the bar sees the sidebar (round 4, C5). The clocks never
+   shrink. When the search field has given all its room, the words "about
+   this investigation" of the Ask button hide whole. The button keeps its full
+   name and its title, and the breadcrumb names the page. A query reads the
+   content box of the bar: the bar less its padding of 30 px. The widths are
+   the room at which the longest breadcrumb, an investigation id, fits beside
+   the full Ask label, the clocks and the shortcut of the search field in
+   Chromium, with a margin for the font: 904 px with the UTC clock alone, and
+   1046 px with the longest second clock, "Fri 01:45 GMT+13:45". */
+.topbar {
+  container: topbar / inline-size;
+}
+@container topbar (max-width: 909px) {
+  .topbar-ask-about {
+    display: none;
+  }
+}
+@container topbar (max-width: 1049px) {
+  .topbar[data-second-clock='on'] .topbar-ask-about {
+    display: none;
+  }
+}
+/* A long health label, "soc-ai API unreachable" or "2 down, 1 degraded",
+   takes the room of the second clock. Then the second clock shows in its
+   panel only, and the UTC clock stays in the bar. */
+@container topbar (max-width: 1049px) {
+  .topbar[data-health-long='on'] .topbar-clock-second {
+    display: none;
+  }
+}
+/* 858 px is the room of the bar at the smallest supported width: a window
+   of 1100 px beside the open sidebar. Below it the second clock shows in its
+   panel only, and the UTC clock stays in the bar. */
+@container topbar (max-width: 857px) {
+  .topbar-clock-second {
+    display: none;
+  }
+}
+
 /* Dashboard grid (components/DashboardGrid.tsx). The gap under a panel lives
    inside its cell, so a grid row is exactly 4 px and a cell is exactly as tall
    as its rows. Outside edit mode nothing animates: a panel that grows as its

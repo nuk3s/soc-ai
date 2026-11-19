@@ -42,6 +42,7 @@ from soc_ai.hunting.leads import (
     read_hit,
 )
 from soc_ai.hunting.ledger import HIT_SOURCES, Ledger, analytic_ledger
+from soc_ai.hunting.self_heal import hold_words
 from soc_ai.hunting.spec import CATALOG_DIR, PRIOR_SWEEP_EVALUATORS, HuntSpec
 from soc_ai.hunting.weight import live_weight
 from soc_ai.hunting.wording import reword_legacy_summary
@@ -526,7 +527,7 @@ async def list_analytics(request: Request) -> AnalyticsListOut:
             cat,
             ledgers[spec_id],
             pinned.get(spec_id),
-            holds[spec_id].why if spec_id in holds else None,
+            hold_words(holds[spec_id].why) if spec_id in holds else None,
         )
         for spec_id, spec in cat.listed.items()
     ]
@@ -599,7 +600,11 @@ async def get_analytic(request: Request, analytic_id: str) -> AnalyticDetailOut:
     # The newest row is the hold when a system demotion is the last word on
     # the analytic. An approval or a retirement after it ends the hold.
     newest = versions[-1] if versions else None
-    held = newest.why if newest is not None and analytics_store.is_system_demotion(newest) else None
+    held = (
+        hold_words(newest.why)
+        if newest is not None and analytics_store.is_system_demotion(newest)
+        else None
+    )
     return AnalyticDetailOut(
         **_row(
             analytic_id,
@@ -722,7 +727,7 @@ def _version_why(why: str | None) -> str | None:
     """
     m = _DRAFTED_FROM_RE.match(why or "")
     if m is None:
-        return why
+        return hold_words(why)
     return f"Drafted from finding F{int(m.group('ordinal')) + 1} of hunt {m.group('hunt')}."
 
 
@@ -1650,6 +1655,9 @@ DECISION_PARTS: tuple[str, ...] = (
     "investigations_waiting",
     "leads_needing_decision",
     "untriaged_groups",
+    # The rules with open false positives: the analyst decides once on each
+    # rule (round 3, RS3).
+    "rules_waiting",
 )
 REVIEW_PART = "unread_shadow_hits"
 

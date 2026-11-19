@@ -540,6 +540,8 @@ class HostActivityOut(BaseModel):
     volume: list[VolumePointOut] = Field(default_factory=list)
     users: list[UserSeenOut] | None = None
     alerts_7d: int = 0
+    # The alerts of the chosen range: the count the Alerts card shows.
+    alerts: int = 0
     latest_investigation: LatestInvestigationOut | None = None
     # Set by the query layer's fold from the PRE-cut lengths, so the page's
     # "the N busiest…" footnotes state a cut that happened rather than
@@ -809,7 +811,7 @@ def _blind_reason(
     if reporting or labels:
         return f"this host ships no {noun}. It ships {_join_words(labels or ['host logs'])}."
     if shipped is None and reporting_unknown:
-        when = f" on {swept_on}" if swept_on else ""
+        when = f" on {swept_on} UTC" if swept_on else ""
         return f"the last profile sweep{when} found no {noun} for this host"
     return "no host log in the window"
 
@@ -1646,6 +1648,7 @@ async def get_dossier_activity(
             else [UserSeenOut(**asdict(user)) for user in activity.users]
         ),
         alerts_7d=activity.alerts_7d,
+        alerts=activity.alerts,
         latest_investigation=(
             LatestInvestigationOut(**asdict(activity.latest_investigation))
             if activity.latest_investigation is not None

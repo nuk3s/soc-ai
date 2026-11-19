@@ -28,6 +28,7 @@ finding.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -107,9 +108,59 @@ def authorized_sentence(label: str) -> str:
 CAMPAIGN_CASE = "Open the case on the campaign."
 
 
-def campaign_sentence(title: str) -> str:
-    """The note of an action of an investigation that a campaign holds."""
+def campaign_sentence(title: str, decided: str | None = None) -> str:
+    """The note of an action of an investigation that a campaign holds.
+
+    ``decided`` is :func:`campaign_decided_sentence` when a decision is in
+    force on the campaign: the campaign then asks for nothing.
+    """
+    if decided:
+        return f"Part of the campaign {title}. {decided}"
     return f"Part of the campaign {title}. Decide on the campaign."
+
+
+# The words of a decision in force, by its type (round "decide once" part 2,
+# OW4). The words of the lead page (leadCampaignDecisionSentence in the
+# console) are the same.
+_DECIDED_WORDS = {
+    "closed": "The analyst closed the campaign",
+    "authorized": "The analyst authorized the activity of the campaign",
+    "case": "The analyst opened a case for the campaign",
+}
+NO_ACTION_WAITS = "No action waits."
+
+
+def campaign_decided_sentence(decision: str | None, decided_at: Any = None) -> str | None:
+    """ "The analyst closed the campaign on {date}. No action waits.", or None.
+
+    None when no decision is in force. An investigation of a decided
+    campaign showed "Open the case on the campaign." and a next step that
+    asked for an escalate (dogfood 2026-11-17, N12). ``decided_at`` is a
+    naive UTC datetime or an ISO string. The time reads in UTC, the form of
+    the investigation page.
+    """
+    head = _DECIDED_WORDS.get(decision or "")
+    if head is None:
+        return None
+    when = _utc_words(decided_at)
+    return f"{head}{f' on {when}' if when else ''}. {NO_ACTION_WAITS}"
+
+
+def _utc_words(at: Any) -> str | None:
+    """A time as "2026-11-15 14:02 UTC", or None."""
+    from datetime import UTC, datetime  # noqa: PLC0415 - light import
+
+    value = at
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is not None:
+        value = value.astimezone(UTC).replace(tzinfo=None)
+    return value.strftime("%Y-%m-%d %H:%M UTC")
 
 
 @dataclass(frozen=True)
@@ -147,6 +198,9 @@ class ActionFacts:
     demo: bool = False
     campaign_id: int | None = None
     campaign_title: str | None = None
+    # The decision in force on that campaign and its time, else None (OW4).
+    campaign_decision: str | None = None
+    campaign_decided_at: Any = None
 
 
 def with_campaign(facts: ActionFacts, link: Any) -> ActionFacts:
@@ -159,7 +213,14 @@ def with_campaign(facts: ActionFacts, link: Any) -> ActionFacts:
     """
     if link is None or bool(getattr(link, "differs", True)) or bool(getattr(link, "beyond", False)):
         return facts
-    return replace(facts, campaign_id=int(link.id), campaign_title=str(link.title))
+    decision = getattr(link, "decision", None)
+    return replace(
+        facts,
+        campaign_id=int(link.id),
+        campaign_title=str(link.title),
+        campaign_decision=decision if isinstance(decision, str) and decision else None,
+        campaign_decided_at=getattr(link, "decided_at", None) or getattr(link, "decidedAt", None),
+    )
 
 
 @dataclass(frozen=True)
@@ -213,8 +274,10 @@ def action_block(facts: ActionFacts, tool_name: str | None) -> ActionBlock | Non
         return ActionBlock(CODE_AUTHORIZED, authorized_sentence(facts.authorized))
     if facts.campaign_id is not None and tool_name == "escalate_to_case":
         # One campaign gets one case. An investigation beyond an
-        # authorization and one in no campaign carry no campaign here.
-        return ActionBlock(CODE_CAMPAIGN, CAMPAIGN_CASE)
+        # authorization and one in no campaign carry no campaign here. A
+        # campaign with a decision in force asks for nothing.
+        decided = campaign_decided_sentence(facts.campaign_decision, facts.campaign_decided_at)
+        return ActionBlock(CODE_CAMPAIGN, decided or CAMPAIGN_CASE)
     if tool_name is not None:
         needs_alert = tool_name in ("ack_alert", "escalate_to_case") and not finding_case
         if needs_alert and not facts.alert_id:
@@ -261,6 +324,93 @@ def block_reason(facts: ActionFacts, tool_name: str | None) -> str | None:
     return block.reason if block is not None else None
 
 
+# The investigation event of an acknowledge or an escalate that the analyst
+# made from the card "No automatic action" of the run page (round "decide
+# once" part 2, OW1). The card writes through the group routes of the Alerts
+# console, and before this record nothing in the store tied the press to the
+# investigation. The payload holds ``action`` ("ack" or "escalate"), ``by``,
+# ``at`` and ``alerts``: the alerts that Security Onion holds acknowledged or
+# on a case after the press.
+SETTLED_EVENT = "analyst_settled"
+
+# The verdict whose recommended actions can wait for a person. A false
+# positive recommends an acknowledgement, and that housekeeping would drown
+# Needs you. A needs-more-info verdict recommends nothing.
+WAITING_VERDICT = "true_positive"
+
+
+def run_requests(run: object) -> bool:
+    """Whether the actions of a run can wait for a person: the run half of the rule.
+
+    A complete true positive that is no pipeline fallback, no synthetic run
+    and no backtest replay. The needs-you count reads the same facts in SQL
+    (:func:`soc_ai.api.webui.routes_meta.needs_you_runs`), and the hunt page
+    reads them for the investigation of each finding. The action half is
+    :func:`action_waits`. The run page stated "1 action waits for you" on a
+    false positive with an open acknowledge, and Needs you held none of them:
+    10 of 19 open detections at 24 hours (macro review 2026-11-17, m14).
+    """
+    from soc_ai.store import investigations as inv_svc  # noqa: PLC0415 - light import
+
+    return (
+        getattr(run, "status", None) == "complete"
+        and getattr(run, "verdict", None) == WAITING_VERDICT
+        and getattr(run, "is_fallback", None) is not True
+        and getattr(run, "is_synth_eval", None) is not True
+        and not inv_svc.is_backtest(run)
+    )
+
+
+def analyst_decided(
+    run: object,
+    actions: Sequence[tuple[Any, str]],
+    facts: ActionFacts,
+    *,
+    settled: bool,
+) -> bool:
+    """Whether the analyst decided on the investigation itself: the part ``handled``.
+
+    Round "decide once" part 2 (OW1). A run with an open action that the
+    console can execute is no decision: the write waits for a person. Else
+    each of three facts gives a decision:
+
+    * the report holds an analyst resolution (a chat resolve or an override);
+    * the run has one or more recommended actions that the console can
+      execute, and the analyst applied or dismissed each of them;
+    * the run has no such action, and the analyst acknowledged or escalated
+      its alert (``settled``: the record of the card "No automatic action",
+      or a row of the escalation ledger).
+
+    ``actions`` holds each recommended action with its tool name: an object
+    with ``applied`` and ``dismissed``. An action that the console can execute
+    is a write whose rule lets it run now (:func:`action_block`, the demo
+    aside), or a write that is already applied or dismissed. A blocked write
+    and a text-only action are none: the analyst cannot press them, so they
+    decide nothing. Production on 2026-11-17 held a true positive with a
+    resolution and three text-only actions, and the tile said that it waited.
+
+    A resolution does not close an open write. A chat resolve can write the
+    actions of its proposal, and an analyst who sets a true positive has not
+    yet decided on the escalate that the verdict recommends.
+    """
+    from soc_ai.store import investigations as inv_svc  # noqa: PLC0415 - light import
+
+    live = replace(facts, demo=False)
+    can_execute = [
+        action
+        for action, tool_name in actions
+        if tool_name in WRITE_TOOLS and (_closed(action) or action_block(live, tool_name) is None)
+    ]
+    if not all(_closed(action) for action in can_execute):
+        return False
+    return inv_svc.analyst_resolution(run) is not None or bool(can_execute) or settled
+
+
+def _closed(action: Any) -> bool:
+    """True when the analyst or soc-ai applied the action, or the analyst dismissed it."""
+    return bool(getattr(action, "applied", False)) or bool(getattr(action, "dismissed", False))
+
+
 def action_waits(facts: ActionFacts, tool_name: str | None) -> bool:
     """Whether an open action waits for a person: the needs-you rule.
 
@@ -284,4 +434,5 @@ def action_note(facts: ActionFacts) -> ActionBlock | None:
     """
     if facts.campaign_id is None:
         return None
-    return ActionBlock(CODE_CAMPAIGN, campaign_sentence(facts.campaign_title or ""))
+    decided = campaign_decided_sentence(facts.campaign_decision, facts.campaign_decided_at)
+    return ActionBlock(CODE_CAMPAIGN, campaign_sentence(facts.campaign_title or "", decided))

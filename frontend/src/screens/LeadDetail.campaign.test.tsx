@@ -127,3 +127,57 @@ describe('the page of a lead of a campaign', () => {
     expect(screen.getByTestId('flow-step-hunt')).toHaveTextContent('queued');
   });
 });
+
+// Round 3 part 2 (W4). Lead 73 read "Its campaign is closed" and "reason: An
+// analyst closed the campaign" beside the chip "Campaign 2 · Open". The words
+// follow the state of the campaign at read time, and the lead stays closed.
+describe('LeadDetail of a lead that closed with a campaign that opened again', () => {
+  const CLOSED = {
+    ...LEAD,
+    status: 'dismissed',
+    dismissed_reason: 'campaign_closed',
+    dismissed_by: 'campaign',
+    dismissed_at: '2026-11-17T14:29:00Z',
+    campaign: { ...LINK, decision: null, state: 'open' },
+    campaign_context: {
+      id: 2,
+      title: 'actor-a against web-1',
+      decision: null,
+      decided_at: null,
+      decided_by: null,
+      closed_with_campaign: true,
+      closed_at: '2026-11-17T14:29:00Z',
+      closed_by_decision: 'closed',
+      closed_by: 'admin',
+      reopened_at: '2026-11-18T13:02:28Z',
+    },
+  };
+
+  it('states the close of the lead and the reopen of the campaign', async () => {
+    vi.mocked(getLead).mockResolvedValue(CLOSED as never);
+    mount();
+    const line = await screen.findByTestId('lead-context-closed-with');
+    expect(line).toHaveTextContent(
+      'soc-ai closed this lead on 2026-11-17 14:29 UTC, when admin closed its campaign. The campaign opened again on 2026-11-18 13:02 UTC.',
+    );
+    expect(screen.getByTestId('lead-closed-reason')).toHaveTextContent(
+      'reason: An analyst closed the campaign. The campaign opened again',
+    );
+    expect(screen.getByTestId('lead-state-sentence')).toHaveTextContent('The lead stays closed.');
+    expect(screen.getByTestId('lead-context')).not.toHaveTextContent('Its campaign is closed');
+    expect(forbiddenWords(screen.getByTestId('lead-context'))).toEqual([]);
+  });
+
+  it('control: a campaign that stays closed keeps the words of the close', async () => {
+    vi.mocked(getLead).mockResolvedValue({
+      ...CLOSED,
+      campaign: { ...LINK, decision: 'closed', state: 'closed' },
+      campaign_context: { ...CLOSED.campaign_context, decision: 'closed', decided_by: 'admin', reopened_at: null },
+    } as never);
+    mount();
+    const line = await screen.findByTestId('lead-context-closed-with');
+    expect(line).toHaveTextContent('soc-ai closed this lead on 2026-11-17 14:29 UTC, when admin closed its campaign.');
+    expect(line).not.toHaveTextContent('opened again');
+    expect(screen.getByTestId('lead-closed-reason')).toHaveTextContent(/^reason: An analyst closed the campaign$/);
+  });
+});

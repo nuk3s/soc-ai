@@ -850,3 +850,21 @@ def test_the_refs_sentence_names_the_records_for_the_analyst() -> None:
         "hunt H-1; hunt H-2."
     )
     assert earlier.refs_sentence({}) == ""
+
+
+def test_the_dedupe_key_reads_the_old_dash_title_and_the_colon_title_as_one() -> None:
+    """Round 3 part 2, P5: a spec finding title joins its parts with a colon.
+    A title stored before joined them with an em dash, and the earlier
+    conclusions of a hunt dedupe findings by title."""
+    from soc_ai.hunting.earlier import _title_key
+
+    old = {"title": "Directory replication by a non-machine account — localuser"}
+    new = {"title": "Directory replication by a non-machine account: localuser"}
+    assert _title_key(old) == _title_key(new)
+    assert _title_key({"title": "Spec – web-1"}) == _title_key({"title": "Spec: web-1"})
+    # Negative controls: another entity is another finding, and a hyphen in
+    # a name is no join.
+    other = {"title": "Directory replication by a non-machine account: ws-1"}
+    assert _title_key(new) != _title_key(other)
+    assert _title_key({"title": "Spec: web-1"}) != _title_key({"title": "Spec: web 1"})
+    assert _title_key({"title": "Spec - web-1"}) != _title_key({"title": "Spec: web-1"})

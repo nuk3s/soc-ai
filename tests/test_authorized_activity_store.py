@@ -78,7 +78,7 @@ async def test_the_migration_adds_the_table_and_the_run_column(settings_kratos: 
             lambda sc: {c["name"]: c for c in inspect(sc).get_columns("authorized_activity")}
         )
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert head.scalar_one() == "0073"
+        assert head.scalar_one() == "0076"
     await engine.dispose()
     assert "authorized_activity" in tables
     assert "authorization_id" in columns

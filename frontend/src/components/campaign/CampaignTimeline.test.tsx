@@ -67,6 +67,37 @@ describe('CampaignTimeline', () => {
     expect(flags.some((f) => f.getAttribute('data-stage') === 'access')).toBe(false);
   });
 
+  // N11: the Access mark sat at the first proof of the stage itself, and the
+  // ladder stated an earlier "by" time from a later stage. The hover of the
+  // mark states both.
+  it('states the earlier "by" time of a held stage in the hover of its mark', () => {
+    const ladder = CAMPAIGN.ladder.map((s) =>
+      s.stage === 'reconnaissance'
+        ? { ...s, heldBy: { at: '2026-10-24T00:10:00Z', stage: 'attempt' as const } }
+        : s,
+    );
+    render(
+      <CampaignTimeline
+        events={EVENTS}
+        members={CAMPAIGN.members}
+        parties={CAMPAIGN.parties}
+        ladder={ladder}
+        selection={null}
+        onSelect={() => {}}
+      />,
+    );
+    const flags = screen.getAllByTestId('timeline-flag');
+    const held = flags.find((f) => f.getAttribute('data-stage') === 'reconnaissance')!;
+    expect(held).toHaveAccessibleName(
+      'Reconnaissance by 2026-10-24 00:10:00 UTC. Attempt needs this stage and has proof at this time. ' +
+        'First proof of this stage itself: 2026-10-24 00:40:00 UTC.',
+    );
+    expect(held.querySelector('title')?.textContent).toBe(held.getAttribute('aria-label'));
+    // Negative control: a stage with no earlier hold states its own time only.
+    const own = flags.find((f) => f.getAttribute('data-stage') === 'attempt')!;
+    expect(own).toHaveAccessibleName('Attempt: 2026-10-24 01:11:05 UTC.');
+  });
+
   it('states the alert sum of a mark and joins the buckets of one evening', () => {
     mount();
     // The buckets of 00:40 and 01:10 are one mark of 12 + 31 alerts. The bucket four days later is its own.

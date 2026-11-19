@@ -157,7 +157,7 @@ describe('C8: the reasons sit in plain view', () => {
     } as never);
     mount();
     expect((await screen.findByTestId('observation-retired-1')).textContent).toBe(
-      'analytic retired on 2026-10-06',
+      'analytic retired on 2026-10-06 UTC',
     );
     expect(within(screen.getByTestId('observation-1')).queryByText('shadow')).toBeNull();
   });

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -237,3 +238,49 @@ def test_entity_kind_classifies_ip_vs_host(client: TestClient) -> None:
     host_resp = client.get("/api/v1/entity/web-server-01")
     assert host_resp.status_code == 200
     assert host_resp.json()["kind"] == "host"
+
+
+def test_entity_timeline_dates_an_investigation_by_its_event(client: TestClient) -> None:
+    """An investigation item carries the time of its event (AB2, dogfood 2026-11-17).
+
+    The entity page dated a run by the time soc-ai investigated it, and the
+    Investigations list dated the same run by its event. A run of today on an
+    event of 17 days ago now sorts below a run on an event of yesterday.
+    """
+    host = "evt-ws-017"
+    now = datetime.now(UTC).replace(tzinfo=None, microsecond=0)
+
+    async def _seed() -> tuple[str, str, str]:
+        maker = client.app.state.db_sessionmaker
+        async with maker() as db:
+            late = await inv_svc.create(
+                db, alert_es_id="ev-late", started_by="t", src_ip=host, dest_ip="198.51.100.4"
+            )
+            await inv_svc.finalize(db, late.id, status="complete", verdict="true_positive")
+            early = await inv_svc.create(
+                db, alert_es_id="ev-early", started_by="t", src_ip=host, dest_ip="198.51.100.5"
+            )
+            await inv_svc.finalize(db, early.id, status="complete", verdict="false_positive")
+            # NEGATIVE CONTROL: a row with no event time older than its
+            # creation keeps its creation time.
+            plain = await inv_svc.create(
+                db, alert_es_id="ev-plain", started_by="t", src_ip=host, dest_ip="198.51.100.6"
+            )
+            await inv_svc.finalize(db, plain.id, status="complete", verdict="false_positive")
+            late.created_at = now - timedelta(hours=1)
+            late.event_at = now - timedelta(days=17)
+            early.created_at = now - timedelta(days=2)
+            early.event_at = now - timedelta(days=1)
+            plain.created_at = now - timedelta(days=5)
+            plain.event_at = plain.created_at
+            await db.commit()
+            return late.id, early.id, plain.id
+
+    late_id, early_id, plain_id = asyncio.run(_seed())
+    body = client.get(f"/api/v1/entity/{host}").json()
+    items = [i for i in body["timeline"] if i["kind"] == "investigation"]
+    order = [i["link"].rsplit("/", 1)[-1] for i in items]
+    assert order == [early_id, plain_id, late_id]
+    by_id = {i["link"].rsplit("/", 1)[-1]: i["ts"] for i in items}
+    assert by_id[late_id].startswith((now - timedelta(days=17)).date().isoformat())
+    assert by_id[plain_id].startswith((now - timedelta(days=5)).date().isoformat())

@@ -186,10 +186,17 @@ async def _investigations(
     an entity's history.
     """
     match = inv_svc.entity_match_sql(keys)
+    # Newest EVENT first, the order of the Investigations list: a run of today
+    # on an event of 17 days ago sorts with the events of 17 days ago
+    # (dogfood 2026-11-17, AB2). ``created_at`` stands in for a row with no
+    # event time.
     rows = await db.scalars(
         select(Investigation)
         .where(match)
-        .order_by(Investigation.created_at.desc(), Investigation.id.desc())
+        .order_by(
+            func.coalesce(Investigation.event_at, Investigation.created_at).desc(),
+            Investigation.id.desc(),
+        )
         .limit(_INV_LIMIT)
     )
     total, true_positives = (
@@ -452,7 +459,9 @@ async def get_entity(
     for inv in investigations:
         items.append(
             EntityTimelineItem(
-                ts=_iso_utc(inv.created_at),
+                # The time of the event that the investigation judges, the
+                # time the Investigations list shows (AB2).
+                ts=_iso_utc(inv.event_at or inv.created_at),
                 kind="investigation",
                 title=inv.rule_name or inv.summary or "Investigation",
                 verdict=_verdict(inv.verdict),

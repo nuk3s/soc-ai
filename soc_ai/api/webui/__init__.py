@@ -418,6 +418,13 @@ from soc_ai.api.webui.routes_campaign_case import (  # noqa: F401 - registers th
 )
 
 # isort: split
+# The rule decisions. They read the selection of the open false positives.
+from soc_ai.api.webui.routes_rule_decisions import (  # noqa: F401 - registers the rule routes
+    RuleDecisionOut,
+    RulePageOut,
+)
+
+# isort: split
 from soc_ai.api.webui.routes_quality import (
     QualityEvalStatusOut,
     QualityPointOut,

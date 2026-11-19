@@ -67,7 +67,7 @@ describe('approve and the shadow week', () => {
     mount(analytic);
     approveWith('looks right');
     const line = screen.getByTestId('approve-shadow-record').textContent ?? '';
-    expect(line).toMatch(/^Shadow record: 0 sweeps, 0 hits\. The shadow week ends on \d{4}-\d{2}-\d{2}\.$/);
+    expect(line).toMatch(/^Shadow record: 0 sweeps, 0 hits\. The shadow week ends on \d{4}-\d{2}-\d{2} UTC\.$/);
     expect(line).toContain(analytic.shadow_ends_at!.slice(0, 10));
     fireEvent.click(screen.getByRole('button', { name: 'Confirm' }));
     expect(setAnalyticStatus).not.toHaveBeenCalled();
@@ -101,7 +101,7 @@ describe('approve and the shadow week', () => {
   it('states the hits and the sweeps in words', () => {
     expect(
       shadowRecordLine({ sweeps: 1, hits: 2, endsAt: '2026-10-12T08:00:00Z' }, Date.parse('2026-10-06T00:00:00Z')),
-    ).toBe('Shadow record: 1 sweep, 2 hits. The shadow week ends on 2026-10-12.');
+    ).toBe('Shadow record: 1 sweep, 2 hits. The shadow week ends on 2026-10-12 UTC.');
     expect(shadowRecordLine({ sweeps: 3, hits: 0, endsAt: null })).toBe(
       'Shadow record: 3 sweeps, 0 hits.',
     );
@@ -141,7 +141,7 @@ describe('approve and the shadow week', () => {
       </MemoryRouter>,
     );
     expect((await screen.findByTestId('analytic-shadow-week')).textContent).toContain(
-      `The shadow week ends on ${detail.shadow_ends_at!.slice(0, 10)}.`,
+      `The shadow week ends on ${detail.shadow_ends_at!.slice(0, 10)} UTC.`,
     );
   });
 });

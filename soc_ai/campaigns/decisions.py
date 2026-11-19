@@ -10,7 +10,8 @@ A close covers only the past. The row stores what the decision covered in
 the parties. :func:`reopen_cause` compares a rebuilt campaign with that
 basis. A later last event, a higher stage or a machine that the decision did
 not cover opens the campaign again: the rebuild clears the decision and
-writes one ``reopened`` change with the cause.
+writes one ``reopened`` change with the cause. Each ``reopened`` change holds
+the decision that it ended in ``was`` (:func:`was_of`).
 
 This module holds the rules and the store reads of the changes. It reads no
 grid. :mod:`soc_ai.campaigns.service` calls it inside a rebuild, and the
@@ -170,6 +171,43 @@ def clear_decision(row: Campaign) -> None:
     row.decision_basis = None
 
 
+def was_of(row: Campaign, *, label: str | None = None) -> dict[str, Any]:
+    """The decision that a reopen ends, as the ``was`` of its ``reopened`` change.
+
+    Read it before :func:`clear_decision`. The rebuild, the route "Open
+    again" and the revoke each write it, so the campaign page and Needs you
+    can state the earlier decision and what is new since it
+    (:mod:`soc_ai.campaigns.since_decision`). ``label`` is the label of the
+    authorization of an ``authorized`` decision: the revoke has the record at
+    hand, and the row holds no label.
+    """
+    basis = row.decision_basis
+    was: dict[str, Any] = {
+        "decision": row.decision,
+        "reason": row.close_reason,
+        "note": row.decision_note,
+        "by": row.decided_by,
+        "decidedAt": row.decided_at.isoformat() if row.decided_at is not None else None,
+        "basis": dict(basis) if isinstance(basis, Mapping) else None,
+    }
+    if label:
+        was["label"] = label
+    return was
+
+
+def reopen(row: Campaign, cause: str, now: datetime, **extra: Any) -> CampaignChange:
+    """Clear the decision of a campaign and give its ``reopened`` change.
+
+    The change holds the cause, the decision that it ended in ``was``, and
+    ``extra`` (the analyst and the note of an "Open again"). The caller adds
+    the change to the session and commits.
+    """
+    label = extra.pop("label", None)
+    detail: dict[str, Any] = {"cause": cause, **extra, "was": was_of(row, label=label)}
+    clear_decision(row)
+    return change(row.id, CHANGE_REOPENED, detail, now)
+
+
 def change(campaign_id: int, type_: str, detail: Mapping[str, Any], at: datetime) -> CampaignChange:
     """One change row. The caller adds it to the session."""
     return CampaignChange(campaign_id=campaign_id, type=type_, detail=dict(detail), created_at=at)
@@ -204,6 +242,19 @@ async def last_reopened(db: AsyncSession, campaign_ids: Sequence[int]) -> dict[i
     return out
 
 
+def in_force(decision: str | None) -> bool:
+    """True when a decision of the analyst is in force on a campaign.
+
+    The one rule of "decision in force". An active campaign with a decision
+    in force is no item of Needs you (:func:`waits_since` and the SQL of
+    ``soc_ai.campaigns.service.waiting_count``). Each other page reads this
+    rule too: the state of a campaign, the confirmed threats that wait and
+    the parts of the true positives. A decision stays in force until a
+    rebuild, an "Open again" or a revoke clears it.
+    """
+    return decision is not None
+
+
 def waits_since(
     decision: str | None, first_event: datetime, reopened_at: datetime | None
 ) -> datetime | None:
@@ -211,7 +262,7 @@ def waits_since(
 
     The time of the last ``reopened`` change, else the first event.
     """
-    if decision is not None:
+    if in_force(decision):
         return None
     return reopened_at or first_event
 
@@ -317,23 +368,23 @@ def write_case(
     db.add(change(row.id, CHANGE_CASE, detail, now))
 
 
-def write_revoked(db: AsyncSession, row: Campaign, *, by: str, now: datetime) -> None:
+def write_revoked(
+    db: AsyncSession, row: Campaign, *, by: str, now: datetime, label: str | None = None
+) -> None:
     """Clear the decision of a campaign and add one ``reopened`` change with the cause ``revoked``.
 
     The campaign keeps ``authorization_id``, so its page names the revoked
-    record. The caller commits.
+    record. ``label`` is the label of the revoked record. The caller commits.
     """
-    clear_decision(row)
-    db.add(change(row.id, CHANGE_REOPENED, {"cause": CAUSE_REVOKED, "by": by}, now))
+    db.add(reopen(row, CAUSE_REVOKED, now, by=by, label=label))
 
 
 def write_reopen(db: AsyncSession, row: Campaign, *, by: str, note: str, now: datetime) -> None:
     """Clear the decision of a campaign and add one ``reopened`` change. The caller commits."""
-    clear_decision(row)
-    detail: dict[str, Any] = {"cause": CAUSE_ANALYST, "by": by}
+    extra: dict[str, Any] = {"by": by}
     if note:
-        detail["note"] = note
-    db.add(change(row.id, CHANGE_REOPENED, detail, now))
+        extra["note"] = note
+    db.add(reopen(row, CAUSE_ANALYST, now, **extra))
 
 
 @dataclass(frozen=True)
@@ -393,10 +444,13 @@ __all__ = [
     "changes_of",
     "clear_decision",
     "decision_of",
+    "in_force",
     "last_reopened",
+    "reopen",
     "reopen_cause",
     "stage_rank",
     "waits_since",
+    "was_of",
     "write_authorize",
     "write_case",
     "write_close",

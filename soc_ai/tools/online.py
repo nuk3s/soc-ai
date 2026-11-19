@@ -55,8 +55,8 @@ def online_unavailable(
             "available": False,
             "reason": "online_enrichment_disabled",
             "hint": (
-                "online enrichment is off (preserves zero-egress default) — set "
-                "ALLOW_ONLINE_ENRICHMENT=true to enable these tools"
+                "Online enrichment is off. This keeps the default of zero egress. "
+                "Set ALLOW_ONLINE_ENRICHMENT=true to enable these tools."
             ),
         }
     if requires_key is not None:

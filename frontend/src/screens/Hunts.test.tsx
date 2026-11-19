@@ -272,7 +272,7 @@ describe('Hunts selection does not cost the only filter', () => {
     const boxes = screen.getAllByRole('checkbox');
     fireEvent.click(boxes[boxes.length - 1]);
     const strip = await screen.findByTestId('list-toolbar-selection');
-    expect(within(strip).getByText(/Re-hunt selected \(1\)/)).toBeTruthy();
+    expect(within(strip).getByText(/Hunt again \(1 selected\)/)).toBeTruthy();
     // The presets are still there and still clickable — and NOT inside the strip.
     expect(screen.getByText('24h')).toBeTruthy();
     expect(screen.getByText('7d')).toBeTruthy();
@@ -739,7 +739,19 @@ describe('Hunts header names the kinds under All', () => {
     ]);
     renderHunts();
     const line = await screen.findByTestId('hunt-stats-line');
-    await waitFor(() => expect(line.textContent).toContain('1 hunt (1 manual)'));
+    await waitFor(() => expect(line.textContent).toContain('1 hunt in the last 7 days (1 manual)'));
+  });
+
+  // N15: the header count follows the window chips far below it. The header
+  // states the window, and it follows the chip.
+  it('states the window of its count', async () => {
+    vi.mocked(getHunts).mockResolvedValue([kindRow({ id: 'h-m1', objective: 'typed by an analyst', kind: 'chat' })]);
+    renderHunts();
+    const line = await screen.findByTestId('hunt-stats-line');
+    await waitFor(() => expect(line.textContent).toContain('in the last 7 days'));
+    fireEvent.click(screen.getByRole('button', { name: '24h' }));
+    await waitFor(() => expect(line.textContent).toContain('in the last 24 hours'));
+    expect(line.textContent).not.toContain('7 days');
   });
 
   it('drops the breakdown under a kind chip, which already names the kind', async () => {
@@ -1136,6 +1148,15 @@ describe('Hunts list status word', () => {
     expect(stopped.textContent).toBe('Could not run');
     expect(stopped.getAttribute('data-tone')).toBe('muted');
     expect(stopped.getAttribute('title')).toBe('An error stopped the hunt before it finished.');
+  });
+
+  // F5: the list read "Could not run" and the lead page read "Stopped with an
+  // error after 14 steps" for one hunt. One function gives both.
+  it('states the steps of a hunt that stopped after it ran steps', async () => {
+    await show({ ...base, status: 'error', outcome: 'could_not_run', outcome_label: 'Could not run', steps: 14 });
+    const stopped = await screen.findByTestId('hunt-status');
+    expect(stopped.textContent).toBe('Stopped with an error after 14 steps');
+    expect(stopped.getAttribute('data-tone')).toBe('muted');
   });
 });
 

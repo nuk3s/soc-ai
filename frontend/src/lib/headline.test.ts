@@ -34,6 +34,27 @@ describe('plainHeadline', () => {
 // The headline is one sentence and the body never repeats it (review
 // 2026-11-13, post wave 1). Run 01M6WEC0CG156GP1YX38YEAKV5 printed its whole
 // summary in the headline type and then the same paragraph as the body.
+describe('splitHeadline: no stray stop under the headline (AB5)', () => {
+  // Dogfood 2026-11-17: a stored headline with no full stop left the stop of
+  // the summary behind, and the body read ". At 2026-10-31T20:15:42Z blue ran".
+  const HEAD = 'Blue ran a read-only collection of guest files, and no record shows an authorization';
+  const SUM = `${HEAD}. At 2026-10-31T20:15:42Z blue ran qm config 137. The pair is common.`;
+
+  it('drops the stop of the summary with the copy of the headline', () => {
+    expect(splitHeadline(HEAD, SUM)).toEqual({
+      headline: HEAD,
+      body: 'At 2026-10-31T20:15:42Z blue ran qm config 137. The pair is common.',
+    });
+  });
+
+  it('keeps the whole summary when the headline stops inside its first sentence', () => {
+    // NEGATIVE CONTROL: "Blue ran" is a prefix of the summary, and the body
+    // must not start with ", and no record".
+    const short = 'Blue ran a read-only collection of guest files';
+    expect(splitHeadline(short, SUM).body).toBe(SUM);
+  });
+});
+
 describe('splitHeadline', () => {
   const SUMMARY =
     'Host ws-1 (10.20.30.5) opened a TLS session to shop.example.test at 2026-11-08T01:51:30Z. ' +

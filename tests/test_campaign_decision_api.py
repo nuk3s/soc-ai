@@ -264,10 +264,13 @@ def test_reopen_clears_the_decision_records_the_analyst_and_writes_its_record(
     assert res.status_code == 200, res.text
     row = _row(client, campaign_id)
     assert (row.decision, row.close_reason, row.decision_basis) == (None, None, None)
-    assert _changes(client, campaign_id)[-1] == (
-        "reopened",
-        {"cause": "analyst", "by": "anonymous", "note": "A new upload."},
-    )
+    kind, detail = _changes(client, campaign_id)[-1]
+    assert kind == "reopened"
+    was = detail.pop("was")
+    assert detail == {"cause": "analyst", "by": "anonymous", "note": "A new upload."}
+    # SD1: the change keeps the close that the analyst ended.
+    assert (was["decision"], was["reason"], was["by"]) == ("closed", "test_over", "anonymous")
+    assert was["decidedAt"] and was["basis"]["last_event"]
     assert _kinds(client) == ["campaign_closed", "campaign_reopened"]
     # The campaign takes a new close.
     assert _close(client, campaign_id).status_code == 200

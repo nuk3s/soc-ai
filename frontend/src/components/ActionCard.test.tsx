@@ -469,6 +469,27 @@ describe('ActionCard case on the campaign', () => {
     expect(text).not.toMatch(/\b(runs?|members?|kinds?)\b/i);
   });
 
+  it('reads the decision of a closed campaign with the link, and asks for nothing (OW4)', () => {
+    const closed = { ...held, decision: 'closed' as const, decidedAt: '2026-11-15T14:02:00Z', waitsSince: null };
+    routed(blocked, closed);
+    const line = screen.getByTestId('action-campaign-case');
+    expect(line).toHaveTextContent(
+      'Part of the campaign actor-a against web-1. The analyst closed the campaign on 2026-11-15 14:02 UTC. No action waits.',
+    );
+    expect(line).not.toHaveTextContent('Open the case on the campaign.');
+    expect(within(line).getByRole('link', { name: 'Open the campaign' })).toHaveAttribute('href', '/campaigns/7');
+    expect(screen.queryByRole('button', { name: /Escalate to case/ })).toBeNull();
+  });
+
+  it('reads the decision on the note of another action of a decided campaign', () => {
+    getActionScope.mockResolvedValue(GROUP_SCOPE);
+    const decided = { ...held, decision: 'case' as const, decidedAt: '2026-11-15T14:02:00Z', waitsSince: null };
+    routed(ack, decided);
+    expect(screen.getByTestId('action-campaign')).toHaveTextContent(
+      'Part of the campaign actor-a against web-1. The analyst opened a case for the campaign on 2026-11-15 14:02 UTC. No action waits.',
+    );
+  });
+
   it('uses the link of the server when the card has no campaign link', () => {
     const { decision: _d, waitsSince: _w, ...older } = held;
     routed(blocked, older);

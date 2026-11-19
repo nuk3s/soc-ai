@@ -64,6 +64,7 @@ __all__ = [
     "count_hits",
     "event_window",
     "find_breaches",
+    "hold_words",
     "lead_outcomes",
     "run_self_heal",
 ]
@@ -310,6 +311,19 @@ async def lead_outcomes(
         elif lead.status == "dismissed" and lead.dismissed_reason == HUNT_CLEAN_REASON:
             clean.append(lead_id)
     return LeadOutcomes(reached=tuple(reached), closed_clean=tuple(clean))
+
+
+# The sentence an older build stored on a hold of the daily hit limit. The
+# notifications read "Its fire budget is 3 a day." beside "Its daily hit limit
+# is 3." for one setting (dogfood 2026-11-17, N16).
+_OLD_FIRE_SENTENCE = re.compile(r"\bIts fire budget is (\d+) a day\.")
+
+
+def hold_words(why: str | None) -> str | None:
+    """The reason of a hold in the words of the console. The store keeps its row."""
+    if not why:
+        return why
+    return _OLD_FIRE_SENTENCE.sub(r"Its daily hit limit is \1.", why)
 
 
 def _fire_breach(hits: int, budget: int, *, start: datetime, now: datetime) -> Breach | None:

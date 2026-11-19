@@ -212,8 +212,8 @@ describe('the When and confidence cells', () => {
     const when = await screen.findByTestId('when-A');
     expect(when.textContent).toBe('4d ago');
     // A row with no event time: the time of the investigation stands in, in UTC.
-    expect(when.getAttribute('title')).toMatch(
-      /^Event \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Investigated \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\.$/,
+    expect(when.querySelector('[data-time="relative"]')?.getAttribute('title')).toMatch(
+      /^Event \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/,
     );
     expect(screen.getByText('0.70')).toBeTruthy();
   });

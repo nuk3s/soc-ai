@@ -27,12 +27,15 @@ import type {
   CampaignParty,
   CampaignRelatedSession,
   CampaignRole,
+  CampaignSinceDecision,
   CampaignStage,
+  CampaignState,
   CampaignStatus,
   CampaignTier,
   HostCampaignRole,
   InvestigationCampaign,
 } from './api';
+import { campaignState } from './campaignDecision';
 import { plural } from './plural';
 import { formatDuration, utcStamp, utcWindow } from './timeRange';
 
@@ -142,41 +145,104 @@ export function partyName(p: {
   return p.name?.trim() || p.address || p.addresses?.[0] || p.machineKey;
 }
 
-/** Why the investigation is part of the campaign, in one or two sentences.
- *  `names` maps a machine key to the name of its machine, for evidence that
- *  names no machine. `labels` maps a run id to the label of that
- *  investigation: the sentence then names the other investigation by its
- *  label. An id tells the analyst nothing. */
+/** The other investigation of a link sentence: the words, and the run id
+ *  that the console puts behind a link with the id in its hover. */
+export interface LinkOther {
+  runId: string | null;
+  words: string;
+}
+
+/** The pieces of the link sentence (W5): the words before and after the
+ *  other investigation, the other investigation, and the hover of the
+ *  sentence. The table puts the id of the other investigation behind a link
+ *  and the id of a connection in the hover. The link column read
+ *  "investigation 01M7BH..." and "connection 1:NI0d..." (dogfood
+ *  2026-11-19, D13). */
+export interface LinkPieces {
+  before: string;
+  other: LinkOther | null;
+  after: string;
+  title?: string;
+}
+
+const ARTIFACT_WORDS: Record<string, string> = { rule: 'the rule', cve: 'the vulnerability', http: 'the web request' };
+
+/** A shared artifact in words: "rule: X" reads "the rule X". */
+export function artifactWords(artifact: string | null | undefined): string {
+  const value = artifact?.trim();
+  if (!value) return UNKNOWN;
+  const m = /^(rule|cve|http):\s*(.+)$/i.exec(value);
+  if (m) return `${ARTIFACT_WORDS[m[1].toLowerCase()]} ${m[2].trim()}`;
+  return value;
+}
+
+/** Why the investigation is part of the campaign, in pieces (W5). `names`
+ *  maps a machine key to the name of its machine, for evidence that names
+ *  no machine. `labels` maps a run id to the label of that investigation:
+ *  the sentence then names the other investigation by its label, else
+ *  "another investigation of the campaign". An id tells the analyst
+ *  nothing. */
+export function linkPieces(
+  member: Pick<CampaignMember, 'link' | 'evidence'>,
+  names: Readonly<Record<string, string>> = {},
+  labels: Readonly<Record<string, string>> = {},
+): LinkPieces {
+  const e = member.evidence;
+  const label = e.memberRunId ? labels[e.memberRunId]?.trim() : '';
+  const runId = e.memberRunId || null;
+  const other = (start: boolean): LinkOther => ({
+    runId,
+    words: label
+      ? `${start ? 'The' : 'the'} investigation "${label}"`
+      : `${start ? 'Another' : 'another'} investigation of the campaign`,
+  });
+  const machine =
+    e.machineName?.trim() || (e.machineKey ? (names[e.machineKey] ?? e.machineKey) : UNKNOWN);
+  const one = (text: string): LinkPieces => ({ before: text, other: null, after: '' });
+  switch (member.link) {
+    case 'seed':
+      return one('This investigation is the first confirmed attack. It started the campaign.');
+    case 'session':
+      return {
+        before: 'This investigation shares a connection with ',
+        other: other(false),
+        after: '.',
+        title: e.communityId ? `Connection ${e.communityId}` : undefined,
+      };
+    case 'actor':
+      return {
+        before: `The attacking machine ${machine} is the source of this investigation and of `,
+        other: other(false),
+        after: '.',
+      };
+    case 'artifact':
+      return { before: `This investigation shares ${artifactWords(e.artifact)} with `, other: other(false), after: '.' };
+    case 'documents':
+      return one('Each record that this investigation cites is between machines of the campaign.');
+    case 'target_source':
+      return one(`${machine} is a target of the campaign. Then ${machine} acted as the source of this investigation.`);
+    case 'named_pair':
+      return {
+        before: `The finding names ${machine} and the target, and it cites no single record. `,
+        other: other(true),
+        after: ` proves an attack of ${machine} on that target.`,
+      };
+    case 'included':
+      return { before: 'An analyst included this investigation in the campaign of ', other: other(false), after: '.' };
+    default:
+      return one('');
+  }
+}
+
+/** Why the investigation is part of the campaign, in one or two sentences:
+ *  the pieces of `linkPieces` as one text. */
 export function linkSentence(
   member: Pick<CampaignMember, 'link' | 'evidence'>,
   names: Readonly<Record<string, string>> = {},
   labels: Readonly<Record<string, string>> = {},
 ): string {
-  const e = member.evidence;
-  const label = e.memberRunId ? labels[e.memberRunId]?.trim() : '';
-  const other = label ? `"${label}"` : e.memberRunId || UNKNOWN;
-  const machine =
-    e.machineName?.trim() || (e.machineKey ? (names[e.machineKey] ?? e.machineKey) : UNKNOWN);
-  switch (member.link) {
-    case 'seed':
-      return 'This investigation is the first confirmed attack. It started the campaign.';
-    case 'session':
-      return `This investigation shares the connection ${e.communityId || UNKNOWN} with the investigation ${other}.`;
-    case 'actor':
-      return `The attacking machine ${machine} is the source of this investigation and of the investigation ${other}.`;
-    case 'artifact':
-      return `This investigation shares ${e.artifact || UNKNOWN} with the investigation ${other}.`;
-    case 'documents':
-      return 'Each record that this investigation cites is between machines of the campaign.';
-    case 'target_source':
-      return `${machine} is a target of the campaign. Then ${machine} acted as the source of this investigation.`;
-    case 'named_pair':
-      return `The finding names ${machine} and the target, and it cites no single record. The investigation ${other} proves an attack of ${machine} on that target.`;
-    case 'included':
-      return `An analyst included this investigation in the campaign of the investigation ${other}.`;
-    default:
-      return '';
-  }
+  const p = linkPieces(member, names, labels);
+  return `${p.before}${p.other?.words ?? ''}${p.after}`;
 }
 
 /** What soc-ai can read on the machine. */
@@ -195,13 +261,28 @@ export function detectionSentence(row: Pick<CampaignDetection, 'tier' | 'seconds
 }
 
 /** One authorization line under the bottom line of a campaign. `total` is
- *  the count of the investigations of the campaign. */
-export function authorizationSentence(a: CampaignAuthorization, total: number): string {
+ *  the count of the investigations of the campaign.
+ *
+ *  `own` is the authorization on the campaign, which the decision bar
+ *  states. With one in force, a stored record with a rule list is an earlier
+ *  record, and the line says so. On production the two records had one name,
+ *  and the page read "53 investigations inside" until 12-01 beside "covers 24
+ *  of the 54 investigations" until 11-20 as two statements of one
+ *  authorization (2026-11-19). */
+export function authorizationSentence(
+  a: CampaignAuthorization,
+  total: number,
+  own?: Pick<CampaignAuthorizationRecord, 'label' | 'state'> | null,
+): string {
   if (a.state !== 'active') return `The authorization ${a.label} is ${a.state}.`;
-  return (
-    `The authorization ${a.label} covers ${a.memberRuns.toLocaleString()} of the ` +
-    `${plural(total, 'investigation')}. It expires ${utcStamp(a.expiresAt)}.`
-  );
+  const covers = `covers ${a.memberRuns.toLocaleString()} of the ${plural(total, 'investigation')}`;
+  const expires = `It expires ${utcStamp(a.expiresAt)}.`;
+  if (own?.state === 'active') {
+    return own.label === a.label
+      ? `An earlier authorization has the same name, ${a.label}. It lists rules and ${covers}. ${expires}`
+      : `The earlier authorization ${a.label} lists rules and ${covers}. ${expires}`;
+  }
+  return `The authorization ${a.label} ${covers}. ${expires}`;
 }
 
 /** The words of one session line after the two machine names, which the page
@@ -245,6 +326,43 @@ export function recordsSentence(n: number): string {
   return `${plural(n, 'grid record')} between the two machines.`;
 }
 
+/** " at the grid read of 2026-11-18 12:40 UTC" for a stored count that can
+ *  be behind its campaign, else empty (SD5). Each surface that shows the
+ *  stored count states it the same way. */
+export function gridReadWords(c: { alertsBehind?: boolean; alertsReadAt?: string | null }): string {
+  return c.alertsBehind && c.alertsReadAt ? ` at the grid read of ${utcStamp(c.alertsReadAt)}` : '';
+}
+
+/** The two counts of the alert events between the machines of a campaign
+ *  (G5). The confirmed rules are the rules of its true positive
+ *  investigations, and the header counts their alerts. The other rules are
+ *  each rule that soc-ai judged otherwise or did not judge. The fold
+ *  "Alerts" lists both, so it names both counts. */
+export function alertCounts(events: Pick<CampaignEvents, 'alerts' | 'rules' | 'pairs'> | null | undefined): {
+  confirmedAlerts: number;
+  confirmedRules: number;
+  otherAlerts: number;
+  otherRules: number;
+} {
+  const pairs = events?.pairs ?? [];
+  const other = new Set(
+    pairs.flatMap((p) => (p.rules ?? []).filter((r) => r.verdict !== 'true_positive').map((r) => r.name)),
+  );
+  return {
+    confirmedAlerts: events?.alerts ?? 0,
+    confirmedRules: events?.rules ?? 0,
+    otherAlerts: pairs.reduce((n, p) => n + (p.otherAlerts ?? 0), 0),
+    otherRules: other.size,
+  };
+}
+
+/** The words of the fold "Alerts": "3 confirmed rules, 2 other rules". */
+export function alertsFoldDetail(events: Pick<CampaignEvents, 'alerts' | 'rules' | 'pairs'> | null | undefined): string {
+  const c = alertCounts(events);
+  const confirmed = plural(c.confirmedRules, 'confirmed rule');
+  return c.otherRules > 0 ? `${confirmed}, ${plural(c.otherRules, 'other rule')}` : confirmed;
+}
+
 /** The line of facts under the bottom line. Empty when the campaign holds no events. */
 export function eventsFacts(events: CampaignEvents | null | undefined): string {
   if (!events) return '';
@@ -254,7 +372,14 @@ export function eventsFacts(events: CampaignEvents | null | undefined): string {
       typeof events.records === 'number'
         ? ` ${plural(events.records, 'grid record')} between the machines.`
         : '';
-    return `${alertsOfRules(events.alerts ?? 0, events.rules ?? 0)}. ${findings}${records}`;
+    const read = gridReadWords({ alertsBehind: events.behind, alertsReadAt: events.readAt });
+    const c = alertCounts(events);
+    const confirmed = `${alertsWords(c.confirmedAlerts)} of ${plural(c.confirmedRules, 'confirmed rule')}`;
+    const other =
+      c.otherAlerts > 0 && c.otherRules > 0
+        ? ` soc-ai did not confirm ${alertsWords(c.otherAlerts)} of ${plural(c.otherRules, 'other rule')}.`
+        : '';
+    return `${confirmed}${read}.${other} ${findings}${records}`;
   }
   if (events.source === 'stored') {
     return `${plural(events.alerts ?? 0, 'alert event')} that the investigations hold. ${findings}`;
@@ -272,6 +397,26 @@ export function timelineNote(source: CampaignEventsSource | null | undefined): s
   return '';
 }
 
+/** The end of the span of a campaign: the later of its last investigation
+ *  event and the last alert event of a confirmed rule (G1). A later alert
+ *  of a rule of the campaign gets no investigation of its own. An earlier
+ *  server sends no `lastActivity`, and the span ends at the last event. */
+export function lastActivityOf(c: { lastEvent: string; lastActivity?: string | null }): string {
+  return c.lastActivity ?? c.lastEvent;
+}
+
+/** The investigations that a campaign holds: each member whose verdict does
+ *  not differ (G5). The fold "Investigations" counts them, and each line
+ *  that states "of the N investigations" reads the same count. */
+export function heldInvestigations(members: readonly { verdictDiffers: boolean }[]): number {
+  return members.filter((m) => !m.verdictDiffers).length;
+}
+
+/** The span of a campaign in UTC, from the first event to the last activity. */
+export function campaignSpan(c: { firstEvent: string; lastEvent: string; lastActivity?: string | null }): string {
+  return utcWindow(c.firstEvent, lastActivityOf(c));
+}
+
 /** The highest stage that a finding inside a mark proves. */
 export function provedWords(stage: CampaignStage): string {
   return `soc-ai proved: ${stageLabel(stage)}`;
@@ -280,6 +425,28 @@ export function provedWords(stage: CampaignStage): string {
 export const RELATED_EMPTY = 'soc-ai found no related investigation, session or host.';
 export const VERDICT_STANDS = 'This investigation is on a session of the campaign. Its verdict stands.';
 export const NOT_SEEN = 'Not seen';
+/** A stage with no proof of its own that a later stage needs. */
+export const NO_OWN_PROOF = 'No investigation proves this stage itself.';
+/** Why a stage holds an earlier time than its own first proof. */
+export function heldByWords(later: CampaignStage): string {
+  return `${stageLabel(later)} needs this stage and has proof at this time.`;
+}
+/** The first proof of the stage itself, when a later stage proves it earlier. */
+export function ownProofWords(stamp: string): string {
+  return `First proof of this stage itself: ${stamp}.`;
+}
+/** The hover of the mark of a stage on the timeline. The mark sits at the
+ *  first proof of the stage itself. A stage that a later stage holds states
+ *  the earlier "by" time of the ladder too (dogfood 2026-11-17, N11). */
+export function stageFlagWords(
+  stage: CampaignStage,
+  firstAt: string,
+  heldBy: { at: string; stage: CampaignStage } | null,
+): string {
+  const own = utcStamp(firstAt, { seconds: true });
+  if (!heldBy) return `${stageLabel(stage)}: ${own}.`;
+  return `${stageLabel(stage)} by ${utcStamp(heldBy.at, { seconds: true })}. ${heldByWords(heldBy.stage)} ${ownProofWords(own)}`;
+}
 export const BEYOND_MARK = 'Beyond the first target';
 /** The link from a finding to the hunt that found it. */
 export const VIEW_HUNT = 'View hunt';
@@ -306,10 +473,23 @@ export const CAMPAIGN_CHIP_WORD = 'Campaign';
 /** The hover text of a row whose verdict differs from its campaign. */
 export const CHIP_DIFFERS = 'Same session as this campaign. The verdict differs.';
 
+/** The visible words of the campaign chip of a row: "Campaign 2 · Closed".
+ *  The state is the decision in force, else the activity status (DC4). */
+export function campaignChipLabel(
+  c: Pick<InvestigationCampaign, 'id' | 'status' | 'decision' | 'state'>,
+): { head: string; state: string } {
+  return { head: `${CAMPAIGN_CHIP_WORD} ${c.id}`, state: `· ${stateLabel(campaignState(c))}` };
+}
+
 /** The accessible name and the hover text of the campaign chip of a row: the
- *  title and the stage, and the differs sentence when the verdict differs. */
-export function campaignChipWords(c: Pick<InvestigationCampaign, 'title' | 'stage' | 'differs'>): string {
-  const head = `Campaign: ${c.title.trim()}. ${stageMeterWords(c.stage)}.`;
+ *  visible words, the title and the stage, and the differs sentence when the
+ *  verdict differs. "Campaign 2 · Closed: actor-a against web-1. Stage
+ *  reached: Access, 3 of 5." */
+export function campaignChipWords(
+  c: Pick<InvestigationCampaign, 'id' | 'title' | 'stage' | 'differs' | 'status' | 'decision' | 'state'>,
+): string {
+  const label = campaignChipLabel(c);
+  const head = `${label.head} ${label.state}: ${c.title.trim()}. ${stageMeterWords(c.stage)}.`;
   return c.differs ? `${head} ${CHIP_DIFFERS}` : head;
 }
 
@@ -857,38 +1037,78 @@ export function changeMarkWords(c: Pick<CampaignChange, 'type' | 'detail' | 'at'
   return `${utcStamp(c.at)}: ${changeSentence(c)}`;
 }
 
-/** The chip of the decision state on a list row. */
-export const DECISION_CHIP_LABEL = {
-  waits: 'Waits on you',
+/** The word of the one state chip of a campaign (DC1, round "decide once").
+ *  The state is the decision in force, else the activity status. */
+export const STATE_LABEL: Record<CampaignState, string> = {
+  open: 'Open',
+  ended: 'Ended',
   closed: 'Closed',
   authorized: 'Authorized',
   case: 'Case',
-} as const;
+  merged: 'Merged',
+  withdrawn: 'Withdrawn',
+};
 
-/** The day of a time in UTC: "2026-11-22". */
-function utcDay(iso: string): string {
-  const t = new Date(iso);
-  return Number.isNaN(t.getTime()) ? iso : t.toISOString().slice(0, 10);
-}
+export const stateLabel = (s: CampaignState) => label(STATE_LABEL, s);
 
-/** The word of the decision chip of an authorized campaign with its expiry:
- *  "Authorized, expires 2026-11-22" or "Authorization expired 2026-11-22".
- *  A revoked record clears the decision, so it reads as the plain word. */
-export function authorizedChipLabel(
-  a: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'>,
+/** The activity rule of an open and of an ended campaign, with no stop. */
+const OPEN_RULE =
+  'This campaign has an investigation event or an alert of a confirmed rule in the last 207 hours';
+const ENDED_RULE =
+  'This campaign has no investigation event and no alert of a confirmed rule in the last 207 hours';
+
+/** The one-sentence hover text of the state chip. `waits` is true when the
+ *  payload states that no decision is in force. An older server states no
+ *  decision, and the sentence then claims no wait. Open and Ended state the
+ *  end rule of the server (round 4, E1): a campaign ends one horizon, 207
+ *  hours, after its last activity. The last activity is the later of the
+ *  last investigation event and the last alert of a confirmed rule. */
+export function stateChipTitle(
+  c: {
+    state: CampaignState;
+    waits: boolean;
+    authorization?: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'> | null;
+    caseOpenedAt?: string | null;
+    /** The campaign ended: its last activity is more than one horizon old. */
+    ended?: boolean;
+  },
   now: number = Date.now(),
 ): string {
-  if (a.state === 'revoked') return DECISION_CHIP_LABEL.authorized;
-  return authorizationExpired(a, now)
-    ? `Authorization expired ${utcDay(a.expiresAt)}`
-    : `Authorized, expires ${utcDay(a.expiresAt)}`;
-}
-
-/** The hover text of an authorized chip with its expiry. */
-export function authorizedChipTitle(a: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'>, now: number = Date.now()): string {
-  return authorizationExpired(a, now)
-    ? `The authorization of this campaign expired ${utcStamp(a.expiresAt)}. A later event is beyond it.`
-    : `An authorization covers this campaign until ${utcStamp(a.expiresAt)}. An investigation beyond it keeps normal handling.`;
+  switch (c.state) {
+    case 'open':
+      return c.waits
+        ? `${OPEN_RULE}, and it waits on your decision.`
+        : `${OPEN_RULE}.`;
+    case 'ended':
+      return c.waits
+        ? `${ENDED_RULE}, and it waits on your decision.`
+        : `${ENDED_RULE}.`;
+    case 'closed':
+      // An ended campaign reads no grid and takes no new investigation, so
+      // no activity opens it again (production 2026-11-19, campaigns 1 and 3).
+      return c.ended
+        ? `An analyst closed this campaign, and it ended. ${ENDED_RULE}. New activity starts a new campaign.`
+        : 'An analyst closed this campaign, and new activity opens it again.';
+    case 'authorized': {
+      const a = c.authorization;
+      if (!a || a.state === 'revoked') {
+        return 'An authorization covers this campaign, and an investigation beyond it waits on you.';
+      }
+      return authorizationExpired(a, now)
+        ? `The authorization of this campaign expired ${utcStamp(a.expiresAt)}, and a later event waits on you.`
+        : `An authorization covers this campaign until ${utcStamp(a.expiresAt)}, and an investigation beyond it waits on you.`;
+    }
+    case 'case':
+      return c.caseOpenedAt
+        ? `A Security Onion case holds this campaign since ${utcStamp(c.caseOpenedAt)}.`
+        : 'A Security Onion case holds this campaign.';
+    case 'merged':
+      return 'Another campaign took in this campaign.';
+    case 'withdrawn':
+      return 'soc-ai withdrew this campaign.';
+    default:
+      return '';
+  }
 }
 
 /** The alarm of a list row: "2 beyond the authorization". */
@@ -903,31 +1123,17 @@ export function beyondCountTitle(n: number): string {
     : `${plural(n, 'investigation')} are beyond the authorization. Each one keeps normal handling and waits on you.`;
 }
 
-/** The hover text of the decision chip. */
-export const DECISION_CHIP_TITLE = {
-  waits: 'This campaign waits on your decision. Open the campaign to decide.',
-  closed: 'An analyst closed this campaign. New activity opens it again.',
-  authorized: 'An authorization covers this campaign. An investigation beyond it keeps normal handling.',
-  case: 'A Security Onion case is open for this campaign.',
-} as const;
-
-/** The word of the decision chip of a campaign with a case: "Case since
- *  2026-11-15". With no time, the plain word. */
-export function caseChipLabel(openedAt: string | null | undefined): string {
-  return openedAt ? `${DECISION_CHIP_LABEL.case} since ${utcDay(openedAt)}` : DECISION_CHIP_LABEL.case;
-}
-
-/** The hover text of the decision chip of a campaign with a case. */
-export function caseChipTitle(openedAt: string | null | undefined): string {
-  return openedAt
-    ? `A Security Onion case is open for this campaign since ${utcStamp(openedAt)}.`
-    : DECISION_CHIP_TITLE.case;
-}
-
 /** The filter of the Campaigns list. */
 export const FILTER_WAITS = 'Waits on you';
 export const FILTER_ALL = 'All';
 export const CAMPAIGNS_NONE_WAIT = 'No campaign waits on your decision.';
+export const FILTER_DECIDED = 'Decided';
+export const FILTER_DECIDED_TITLE = 'The campaigns with a decision in force: closed, authorized or with a case.';
+export const CAMPAIGNS_NONE_DECIDED = 'No campaign holds a decision.';
+/** The line of the list with the filter of the decided campaigns. The
+ *  Decided line of the Confirmed threats panel counts a window, and this
+ *  list has none (dogfood 2026-11-17, N15). */
+export const CAMPAIGNS_DECIDED_ALL = 'The list shows every decided campaign, from any time.';
 
 /** The note on an action card of an investigation that a campaign holds,
  *  around the title: "Part of the campaign {title}. Decide on the campaign." */
@@ -957,7 +1163,10 @@ export const LEADS_HEADING = 'Leads';
 export const HUNTS_HEADING = 'Hunts';
 export const HUNTS_LANE = 'Hunts';
 export const CHANGES_LANE = 'Changes';
-export const HUNT_MARKS_LABEL = 'The hunts of the campaign and the changes that can start a hunt, over time';
+export const HUNT_MARKS_LABEL =
+  'The hunts and the changes of the campaign, over time. A filled change mark can start a hunt.';
+/** The hover line of a change mark for a change that starts no hunt. */
+export const CHANGE_STARTS_NO_HUNT = 'This change starts no hunt.';
 
 /** The line under a list of hunts that reached the cap of the server. */
 export function huntsCapSentence(cap: number): string {
@@ -1013,3 +1222,387 @@ export const HELD_FINDING_OPEN_TITLE =
 /** The line of the header of a hunt of a campaign, around the title of the campaign. */
 export const HUNT_ON_CHANGE = { before: 'soc-ai started this hunt on a change of the campaign ', after: '.' } as const;
 export const HUNT_IN_CAMPAIGN = { before: 'This hunt is part of the campaign ', after: '.' } as const;
+
+// ── The answer of a hunt that read a campaign or a lead (LH2, LH3) ──────────
+
+/** The words of the answer of a hunt for a campaign or a lead that it read:
+ *  the sentence of the page, the word of a list and the label of the mark on
+ *  the timeline. The outcome comes from stored facts: the server reads the
+ *  findings, their campaign links and the machines of the subject.
+ *
+ *  One function gives all three (SD4). The answer `no_new_event` states its
+ *  baseline: the hunt found no activity that the campaign or the lead does
+ *  not hold. "found no new event" read as a contradiction beside a campaign
+ *  that opened again for new activity on the same day (2026-11-18). */
+export function huntAnswerWords(
+  subject: 'campaign' | 'lead',
+  a: { outcome: string; huntAt?: string | null; findingTitle?: string | null },
+): { sentence: string; word: string; mark: string } {
+  const read = `The hunt of ${utcStamp(a.huntAt ?? null)} read this ${subject}`;
+  const title = (a.findingTitle ?? '').trim().replace(/\.$/, '');
+  const named = title ? `: ${title}` : '';
+  if (a.outcome === 'new_activity') {
+    return {
+      sentence:
+        subject === 'campaign'
+          ? `${read} and found new activity${named}.`
+          : `${read} and found a threat on a machine of this lead${named}.`,
+      word: 'Found new activity',
+      mark: 'Hunt: new activity',
+    };
+  }
+  if (a.outcome === 'continues' && subject === 'campaign') {
+    return {
+      sentence: `${read} and found the known activity of this campaign again.`,
+      word: 'Found the known activity again',
+      mark: 'Hunt: known activity',
+    };
+  }
+  const held = `no activity that the ${subject} does not hold`;
+  return {
+    sentence:
+      subject === 'campaign'
+        ? `${read}. It found ${held}.`
+        : `${read}. It found no activity on its machines that the lead does not hold.`,
+    word: `Found ${held}`,
+    mark: `Hunt: ${held}`,
+  };
+}
+
+/** The one sentence of the answer of a hunt for a campaign or a lead. */
+export function huntAnswerSentence(
+  subject: 'campaign' | 'lead',
+  a: { outcome: string; huntAt: string | null; findingTitle: string | null },
+): string {
+  return huntAnswerWords(subject, a).sentence;
+}
+
+/** The hover of the answer line and of the answer mark on the timeline. */
+export const HUNT_ANSWER_TITLE =
+  'soc-ai records one answer for each campaign and each open lead that a complete hunt read. ' +
+  'The answer comes from the findings of the hunt and the machines of the campaign or the lead. ' +
+  'It does not come from the text of the model.';
+
+/** The word of an answer in a list: the fold "Leads and hunts" and the
+ *  other hunts of a lead. */
+export function huntAnswerWord(subject: 'campaign' | 'lead', outcome: string): string {
+  return huntAnswerWords(subject, { outcome }).word;
+}
+
+/** The short word of the answer mark on the timeline of the campaign. */
+export function huntAnswerMarkLabel(outcome: string): string {
+  return huntAnswerWords('campaign', { outcome }).mark;
+}
+
+// ── The campaign of a lead on the lead page (LH4) ───────────────────────────
+
+/** "This lead is part of campaign 2: {title}." The words around the link. */
+export function leadCampaignParts(c: { id: number; title: string }): { before: string; link: string; after: string } {
+  return { before: `This lead is part of campaign ${c.id}: `, link: c.title.trim().replace(/\.$/, ''), after: '.' };
+}
+
+/** The decision of the campaign of a lead, in one sentence. */
+export function leadCampaignDecisionSentence(c: { decision: string | null; decided_at: string | null }): string {
+  const on = c.decided_at ? ` on ${utcStamp(c.decided_at)}` : '';
+  if (c.decision === 'closed') return `The analyst closed the campaign${on}.`;
+  if (c.decision === 'authorized') return `The analyst authorized the activity of the campaign${on}.`;
+  if (c.decision === 'case') return `The analyst opened a case for the campaign${on}.`;
+  return 'The campaign waits for a decision of the analyst.';
+}
+
+/** The line of a lead that soc-ai closed with its campaign. The lead closes
+ *  when it joins a decided campaign, which can be days after the decision,
+ *  so the line states the time of the close of the lead (dogfood N4).
+ *
+ *  The words follow the state of the campaign at read time (W4): "soc-ai
+ *  closed this lead on {time}, when admin closed its campaign. The campaign
+ *  opened again on {time}." Lead 73 read "Its campaign is closed" beside the
+ *  chip "Campaign 2 · Open". The lead stays closed. */
+export function closedWithCampaignSentence(c: {
+  decision: string | null;
+  closed_at?: string | null;
+  closed_by_decision?: string | null;
+  closed_by?: string | null;
+  reopened_at?: string | null;
+}): string {
+  const on = c.closed_at ? ` on ${utcStamp(c.closed_at)}` : '';
+  const who = c.closed_by?.trim() || 'the analyst';
+  const which = c.closed_by_decision ?? c.decision;
+  const act = which === 'authorized' ? `${who} authorized the activity of its campaign` : `${who} closed its campaign`;
+  const again = c.reopened_at ? ` The campaign opened again on ${utcStamp(c.reopened_at)}.` : '';
+  return `soc-ai closed this lead${on}, when ${act}.${again}`;
+}
+
+/** The reason of a lead that soc-ai closed with its campaign, beside its
+ *  status (W4): "An analyst closed the campaign. The campaign opened
+ *  again" when the campaign opened again after the close. */
+export function campaignCloseReasonWords(label: string, c: { reopened_at?: string | null } | null | undefined): string {
+  return c?.reopened_at ? `${label.replace(/\.$/, '')}. The campaign opened again` : label;
+}
+
+/** "3 observations of this lead are authorized activity: {label}." */
+export function authorizedPartSentence(p: { label: string; observations: number }): string {
+  const verb = p.observations === 1 ? 'is' : 'are';
+  return `${plural(p.observations, 'observation')} of this lead ${verb} authorized activity: ${p.label.trim().replace(/\.$/, '')}.`;
+}
+
+// ── An investigation of a decided campaign (OW4) ────────────────────────────
+
+/** "The analyst closed the campaign on 2026-11-15 14:02 UTC. No action
+ *  waits." for an investigation that a campaign with a decision in force
+ *  holds, else null. The card and the step strip of the investigation page
+ *  read it. They asked for an escalate under a campaign that the analyst had
+ *  closed (dogfood 2026-11-17, N12). */
+export function campaignDecidedNoWait(
+  c: { decision?: string | null; decidedAt?: string | null } | null | undefined,
+): string | null {
+  const d = c?.decision;
+  if (d !== 'closed' && d !== 'authorized' && d !== 'case') return null;
+  return `${leadCampaignDecisionSentence({ decision: d, decided_at: c?.decidedAt ?? null })} No action waits.`;
+}
+
+// ── What is new since the earlier decision (SD3) ────────────────────────────
+//
+// A campaign that opened again states the earlier decision and what is new
+// since it, so the analyst decides on the difference. The server reads the
+// facts once (soc_ai/campaigns/since_decision.py). The server states the same
+// facts with the same words in the Needs you row and the bell line.
+
+/** The day of a time in UTC: "2026-11-15". */
+function utcDay(iso: string | null | undefined): string {
+  return utcStamp(iso).split(' ')[0];
+}
+
+const SINCE_CAUSE_WORDS: Record<string, string> = {
+  activity: 'new activity',
+  stage: 'a higher stage',
+  party: 'a new machine',
+  revoked: 'a revoke of the authorization',
+};
+
+const SINCE_DECISION_NOUN: Record<string, string> = {
+  closed: 'close',
+  authorized: 'authorization',
+  case: 'case',
+};
+
+/** "Opened again on 2026-11-18 13:02 UTC by new activity." The words follow the cause. */
+export function sinceReopenSentence(s: Pick<CampaignSinceDecision, 'cause' | 'reopenedAt' | 'reopenedBy'>): string {
+  const at = utcStamp(s.reopenedAt);
+  if (s.cause === 'analyst') return `Opened again on ${at} by ${s.reopenedBy?.trim() || 'an analyst'}.`;
+  return `Opened again on ${at} by ${SINCE_CAUSE_WORDS[s.cause] ?? 'new activity'}.`;
+}
+
+/** "casey closed it on 2026-11-15: Test that is over." The words follow the decision. */
+export function sinceEarlierSentence(s: Pick<CampaignSinceDecision, 'earlier'>): string {
+  const e = s.earlier;
+  const who = e.by?.trim() || 'The analyst';
+  const on = e.at ? ` on ${utcDay(e.at)}` : '';
+  const reason = e.label?.trim() ? `: ${e.label.trim()}.` : '.';
+  if (e.decision === 'authorized') return `${who} authorized it${on}${reason}`;
+  if (e.decision === 'case') return `${who} opened a case for it${on}.`;
+  return `${who} closed it${on}${reason}`;
+}
+
+/** The note of the earlier decision, or null. A note that soc-ai does not
+ *  know states nothing. */
+export function sinceNoteSentence(s: Pick<CampaignSinceDecision, 'earlier'>): string | null {
+  const note = s.earlier.noteKnown ? s.earlier.note?.trim() : '';
+  return note ? `Note of the decision: ${note.replace(/\.$/, '')}.` : null;
+}
+
+const SINCE_FIRST: Record<string, [string, string]> = {
+  true_positive: ['true positive investigation', 'true positive investigations'],
+  false_positive: ['false positive investigation', 'false positive investigations'],
+  needs_more_info: ['investigation that needs more info', 'investigations that need more info'],
+  inconclusive: ['inconclusive investigation', 'inconclusive investigations'],
+};
+const SINCE_REST: Record<string, [string, string]> = {
+  true_positive: ['true positive', 'true positives'],
+  false_positive: ['false positive', 'false positives'],
+  needs_more_info: ['that needs more info', 'that need more info'],
+  inconclusive: ['inconclusive', 'inconclusive'],
+};
+
+function joinWords(words: string[]): string {
+  if (words.length <= 1) return words.join('');
+  return `${words.slice(0, -1).join(', ')} and ${words[words.length - 1]}`;
+}
+
+function sinceMachine(m: { name: string | null; address: string | null; machineKey: string }): string {
+  return m.name?.trim() || m.address || m.machineKey;
+}
+
+/** "New: 5 true positive investigations and 1 false positive from actor-a,
+ *  2026-11-18 12:55 to 13:12 UTC. An authorization holds 3." With no new
+ *  investigation the line states the boundary. */
+export function sinceNewSentence(
+  s: Pick<CampaignSinceDecision, 'investigations' | 'verdicts' | 'actors' | 'firstEvent' | 'lastEvent' | 'authorized' | 'boundary' | 'earlier'> &
+    Partial<Pick<CampaignSinceDecision, 'outsideTruePositives' | 'outsideNames' | 'authorizations'>>,
+): string {
+  if (s.investigations === 0) {
+    return `No investigation of the campaign has an event after ${utcStamp(s.boundary)}.`;
+  }
+  const parts = s.verdicts.map(({ verdict, count }, i) => {
+    const [one, many] = (i === 0 ? SINCE_FIRST : SINCE_REST)[verdict] ??
+      (i === 0 ? ['investigation with no verdict', 'investigations with no verdict'] : ['with no verdict', 'with no verdict']);
+    return plural(count, one, many);
+  });
+  const counted = parts.length ? joinWords(parts) : plural(s.investigations, 'investigation with no verdict', 'investigations with no verdict');
+  const actors = s.actors.map(sinceMachine);
+  const source = actors.length ? ` from ${joinWords(actors)}` : '';
+  const span = s.firstEvent && s.lastEvent ? `, ${utcWindow(s.firstEvent, s.lastEvent)}` : '';
+  const held = sinceAuthorizationSentence(s);
+  return `New: ${counted}${source}${span}.${held ? ` ${held}` : ''}`;
+}
+
+/** The most rule names that one sentence lists. A count states the rest. */
+const SINCE_NAMES_MAX = 5;
+
+function sinceNames(names: readonly string[]): string {
+  if (names.length <= SINCE_NAMES_MAX) return joinWords([...names]);
+  return joinWords([...names.slice(0, SINCE_NAMES_MAX), `${(names.length - SINCE_NAMES_MAX).toLocaleString()} more`]);
+}
+
+/** What the authorizations hold of the new investigations, and what they do
+ *  not hold (W1): "An authorization holds 3. It does not hold 2 true
+ *  positives: rule-a and rule-b." After a close, each authorization in force
+ *  states its name and its end. Empty when no authorization holds a new
+ *  investigation. The server states the same words
+ *  (soc_ai/campaigns/since_decision.py authorization_sentence). */
+export function sinceAuthorizationSentence(
+  s: Pick<CampaignSinceDecision, 'authorized' | 'earlier'> &
+    Partial<Pick<CampaignSinceDecision, 'outsideTruePositives' | 'outsideNames' | 'authorizations'>>,
+): string {
+  if (s.authorized <= 0) return '';
+  const holding = s.authorizations ?? [];
+  const named = s.earlier.decision === 'closed' && holding.length > 0 && holding.every((h) => h.state === 'active');
+  const parts = named
+    ? holding.map(
+        (h) =>
+          `The authorization ${h.label.trim().replace(/\.$/, '')} holds ${h.investigations.toLocaleString()}.` +
+          (h.expiresAt ? ` It expires ${utcStamp(h.expiresAt)}.` : ''),
+      )
+    : [`An authorization holds ${s.authorized.toLocaleString()}.`];
+  const outside = s.outsideTruePositives ?? 0;
+  if (outside > 0) {
+    const names = s.outsideNames ?? [];
+    const who = holding.length <= 1 ? 'It does not hold' : 'No authorization holds';
+    parts.push(`${who} ${plural(outside, 'true positive')}${names.length ? `: ${sinceNames(names)}.` : '.'}`);
+  }
+  return parts.join(' ');
+}
+
+/** The line of the hunt that the reopen started, with the words of the hunt
+ *  page (W1): "The reopen started the hunt of 2026-11-18 13:05 UTC: 1
+ *  confirmed · 1 false positive · 0 not judged · of 2 threat findings." */
+export function sinceReopenHuntSentence(h: { startedAt: string; status: string; outcome: string | null }): string {
+  const head = `The reopen started the hunt of ${utcStamp(h.startedAt)}`;
+  if (h.outcome?.trim()) return `${head}: ${h.outcome.trim().replace(/\.$/, '')}.`;
+  if (h.status === 'running' || h.status === 'investigating') return `${head}. The hunt runs.`;
+  return `${head}.`;
+}
+
+/** "The stage did not change." or "The stage rose from Attempt to Access." */
+export function sinceStageSentence(s: Pick<CampaignSinceDecision, 'stageRose' | 'stageBefore' | 'stageNow'>): string {
+  if (!s.stageRose || !s.stageNow) return 'The stage did not change.';
+  const now = stageLabel(s.stageNow);
+  return s.stageBefore ? `The stage rose from ${stageLabel(s.stageBefore)} to ${now}.` : `The stage rose to ${now}.`;
+}
+
+/** "New machine: web-2." or null when the earlier decision held each machine. */
+export function sinceMachinesSentence(s: Pick<CampaignSinceDecision, 'newMachines'>): string | null {
+  if (s.newMachines.length === 0) return null;
+  return `${s.newMachines.length === 1 ? 'New machine' : 'New machines'}: ${joinWords(s.newMachines)}.`;
+}
+
+/** "6 new investigations since the close of 2026-11-15." */
+export function sinceCountWords(s: Pick<CampaignSinceDecision, 'investigations' | 'earlier'>): string {
+  const noun = SINCE_DECISION_NOUN[s.earlier.decision] ?? 'decision';
+  const on = s.earlier.at ? ` of ${utcDay(s.earlier.at)}` : '';
+  return `${plural(s.investigations, 'new investigation')} since the ${noun}${on}.`;
+}
+
+/** "5 true positives and 1 false positive": the verdicts of the new
+ *  investigations (W3). */
+export function sinceSplitWords(s: Pick<CampaignSinceDecision, 'verdicts'>): string {
+  return joinWords(
+    s.verdicts.map(({ verdict, count }) => {
+      const [one, many] = SINCE_REST[verdict] ?? ['with no verdict', 'with no verdict'];
+      return plural(count, one, many);
+    }),
+  );
+}
+
+type SinceCountFacts = Pick<CampaignSinceDecision, 'investigations' | 'earlier' | 'verdicts' | 'authorized'> &
+  Partial<Pick<CampaignSinceDecision, 'outsideTruePositives' | 'outsideNames' | 'authorizations'>>;
+
+/** The count of the new investigations with their split (W3): "6 new
+ *  investigations since the close of 2026-11-15: 5 true positives and 1
+ *  false positive. An authorization holds 3." The server states the same
+ *  words in the bell (since_decision.py count_split_words). */
+export function sinceCountSplitWords(s: SinceCountFacts): string {
+  const count = sinceCountWords(s);
+  const split = sinceSplitWords(s);
+  const line = s.investigations > 0 && split ? `${count.slice(0, -1)}: ${split}.` : count;
+  const held = sinceAuthorizationSentence(s);
+  return held ? `${line} ${held}` : line;
+}
+
+/** The one line of a Confirmed threats row: "Opened again on 2026-11-18. 6
+ *  new investigations since the close of 2026-11-15: 5 true positives and 1
+ *  false positive. An authorization holds 3." */
+export function sinceThreatLine(s: SinceCountFacts & Pick<CampaignSinceDecision, 'reopenedAt'>): string {
+  return `Opened again on ${utcDay(s.reopenedAt)}. ${sinceCountSplitWords(s)}`;
+}
+
+/** The chip of the banner of a reopened campaign. */
+export const SINCE_CHIP = 'Opened again';
+export const SINCE_CHIP_TITLE =
+  'An analyst made a decision on this campaign, and the campaign opened again. The lines state the earlier decision and what is new since it.';
+/** The control that shows only the new investigations of the campaign. */
+export const SHOW_NEW_ACTION = 'Show the new investigations';
+/** The chip of a new investigation in the table of the campaign. */
+export const NEW_CHIP = 'New';
+export const NEW_CHIP_TITLE = 'The event of this investigation is after the earlier decision.';
+
+/** The line over the table that shows only the new investigations. */
+export function showingNewWords(s: Pick<CampaignSinceDecision, 'investigations' | 'earlier'>): string {
+  return `Showing the ${sinceCountWords(s)}`;
+}
+
+/** The hover of the band on the timeline after the earlier decision. */
+export function sinceBandWords(s: Pick<CampaignSinceDecision, 'boundary' | 'earlier'>): string {
+  const noun = SINCE_DECISION_NOUN[s.earlier.decision] ?? 'decision';
+  return `After ${utcStamp(s.boundary)}: the activity that the earlier ${noun} does not cover.`;
+}
+
+/** "The grid holds 20 later alert events of 2 rules until 2026-11-19 15:08
+ *  UTC. They take the verdict of these investigations." Null with no later
+ *  alert event. The server states the same line in Needs you (G2). */
+export function sinceLaterSentence(
+  s: Pick<CampaignSinceDecision, 'investigations' | 'laterAlerts' | 'laterRules' | 'laterLastAt'>,
+): string | null {
+  return laterWords(s, s.investigations > 0 ? 'these investigations' : 'the investigations of the campaign');
+}
+
+function laterWords(
+  s: { laterAlerts?: number; laterRules?: number; laterLastAt?: string | null },
+  whose: string,
+): string | null {
+  const n = s.laterAlerts ?? 0;
+  if (n <= 0) return null;
+  const rules = plural(Math.max(1, s.laterRules ?? 0), 'rule');
+  const until = s.laterLastAt ? ` until ${utcStamp(s.laterLastAt)}` : '';
+  return `The grid holds ${plural(n, 'later alert event')} of ${rules}${until}. ${n === 1 ? 'It takes' : 'They take'} the verdict of ${whose}.`;
+}
+
+/** The later alert events beside the answer of a hunt for a campaign (G6).
+ *  "It found no activity that the campaign does not hold" states what the
+ *  hunt read. A later alert of a rule of the campaign gets no investigation,
+ *  so the line states them from the stored grid read. Null with none. */
+export function campaignLaterSentence(
+  e: { laterAlerts?: number; laterRules?: number; laterLastAt?: string | null } | null | undefined,
+): string | null {
+  return e ? laterWords(e, 'the investigations of the campaign') : null;
+}

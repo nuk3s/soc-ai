@@ -7,6 +7,7 @@ the period and the stage. The model writes neither.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from datetime import datetime
 
 from soc_ai.campaigns.types import ROLE_ACTOR, ROLE_TARGET, CampaignDraft, Party
 
@@ -72,11 +73,16 @@ def title(draft: CampaignDraft) -> str:
     return f"{actors} against {targets}"
 
 
+def period(first: datetime, last: datetime) -> str:
+    """``on 2026-11-18`` or ``from 2026-10-24 to 2026-11-18``."""
+    a, b = first.date().isoformat(), last.date().isoformat()
+    return f"on {a}" if a == b else f"from {a} to {b}"
+
+
 def bottom_line(draft: CampaignDraft) -> str:
     """The bottom line: who acted on what and when, the stage, and the movement."""
     actors, targets = _sides(draft)
-    first, last = draft.first_event.date().isoformat(), draft.last_event.date().isoformat()
-    period = f"on {first}" if first == last else f"from {first} to {last}"
+    period_words = period(draft.first_event, draft.last_event)
     stage = stage_sentence(draft.stage)
     beyond = draft.beyond_runs
     if beyond == 0:
@@ -84,4 +90,21 @@ def bottom_line(draft: CampaignDraft) -> str:
     else:
         noun = "investigation" if beyond == 1 else "investigations"
         moved = f"Activity beyond the target: {beyond} {noun}."
-    return f"{actors} acted against {targets} {period}. {stage} {moved}"
+    return f"{actors} acted against {targets} {period_words}. {stage} {moved}"
+
+
+def with_last_activity(
+    line: str, first_event: datetime, last_event: datetime, last_alert_at: datetime | None
+) -> str:
+    """The stored bottom line with its period to the last activity of the campaign.
+
+    The rebuild writes the period to the last investigation event. A later
+    alert event of a confirmed rule between the machines extends it. A line
+    that holds no such period stays as it is.
+    """
+    if last_alert_at is None or last_alert_at <= last_event:
+        return line
+    old, new = period(first_event, last_event), period(first_event, last_alert_at)
+    if old == new:
+        return line
+    return line.replace(f" {old}. ", f" {new}. ", 1)

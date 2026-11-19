@@ -31,6 +31,7 @@ import {
   type ChatScopeKind,
   type PendingAsk,
   askLabel,
+  askLabelParts,
   scopeKey,
   useChat,
 } from '../lib/chatScope';
@@ -192,6 +193,7 @@ export function AskSocAiButton() {
   const chat = useChat();
   if (!chat || !chat.available(chat.pageScope)) return null;
   const label = askLabel(chat.pageScope.kind);
+  const { head, about } = askLabelParts(chat.pageScope.kind);
   const onPage = scopeKey(chat.activeScope) === scopeKey(chat.pageScope);
   return (
     <button
@@ -200,12 +202,18 @@ export function AskSocAiButton() {
       {...{ [ASK_BUTTON_ATTR]: '' }}
       aria-expanded={chat.open && onPage}
       aria-keyshortcuts={ASK_SHORTCUT}
+      aria-label={label}
       title={`${label}. The shortcut is ${ASK_SHORTCUT.toUpperCase()}.`}
       onClick={() => (chat.open && onPage ? chat.closeChat() : chat.openChat())}
       className="flex flex-none items-center gap-1.5 rounded-control border border-accent-deep bg-[rgba(75,139,245,.14)] px-[11px] py-1.5 text-[12.5px] font-semibold text-[#cfe0ff] hover:border-accent hover:bg-[rgba(75,139,245,.22)]"
     >
       <MessageSquare size={14} />
-      <span className="whitespace-nowrap">{label}</span>
+      {/* The top bar hides the words "about this host" whole when it has no
+          room (index.css). The name and the title keep the full label. */}
+      <span className="whitespace-nowrap">
+        {head}
+        {about && <span className="topbar-ask-about">{about}</span>}
+      </span>
     </button>
   );
 }

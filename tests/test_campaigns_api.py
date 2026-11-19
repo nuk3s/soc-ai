@@ -51,9 +51,15 @@ ROW_KEYS = {
     "alerts",
     "decision",
     "waitsSince",
+    "state",
     "authorization",
     "beyond",
     "case",
+    "sinceDecision",
+    "alertsReadAt",
+    "alertsBehind",
+    "lastAlertAt",
+    "lastActivity",
 }
 BRIEF_KEYS = {"machineKey", "name", "address"}
 CAMPAIGN_KEYS = {
@@ -79,6 +85,7 @@ CAMPAIGN_KEYS = {
     "events",
     "decision",
     "waitsSince",
+    "state",
     "changes",
     "authorization",
     "beyond",
@@ -86,6 +93,9 @@ CAMPAIGN_KEYS = {
     "leads",
     "hunts",
     "case",
+    "answers",
+    "sinceDecision",
+    "lastActivity",
 }
 STEP_KEYS = {
     "stage",
@@ -96,6 +106,7 @@ STEP_KEYS = {
     "proofDocumentId",
     "headline",
     "evidence",
+    "heldBy",
 }
 STEP_EVIDENCE_KEYS = {"documentId", "label", "at"}
 PARTY_KEYS = {
@@ -131,6 +142,7 @@ MEMBER_KEYS = {
     "targetKey",
     "authorized",
     "included",
+    "nameNote",
 }
 EVIDENCE_KEYS = {
     "memberRunId",
@@ -162,6 +174,11 @@ EVENTS_KEYS = {
     "records",
     "pairs",
     "timeline",
+    "behind",
+    "lastAlertAt",
+    "laterAlerts",
+    "laterRules",
+    "laterLastAt",
 }
 PAIR_KEYS = {
     "source",
@@ -547,6 +564,11 @@ def test_a_merged_campaign_gives_its_status_and_empty_sections(client: TestClien
         "records": None,
         "pairs": [],
         "timeline": {"bucketSeconds": 60, "lanes": []},
+        "behind": False,
+        "lastAlertAt": None,
+        "laterAlerts": 0,
+        "laterRules": 0,
+        "laterLastAt": None,
     }
 
 

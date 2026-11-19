@@ -48,7 +48,7 @@ def _downgrade_to(connection: Connection, revision: str) -> None:
     command.downgrade(cfg, revision)
 
 
-async def test_the_head_is_0073_and_holds_the_campaign_tables(settings_kratos: Settings) -> None:
+async def test_the_head_is_0076_and_holds_the_campaign_tables(settings_kratos: Settings) -> None:
     engine = make_engine(settings_kratos)
     await run_migrations(engine)
     async with engine.connect() as conn:
@@ -57,7 +57,7 @@ async def test_the_head_is_0073_and_holds_the_campaign_tables(settings_kratos: S
             lambda sc: {ix["name"]: ix for ix in inspect(sc).get_indexes("campaign_members")}
         )
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert head.scalar_one() == "0073"
+        assert head.scalar_one() == "0076"
     await engine.dispose()
     assert tables >= TABLES
     assert members["ux_campaign_members_run"]["unique"]
@@ -74,7 +74,7 @@ async def test_a_downgrade_removes_the_tables_and_an_upgrade_adds_them_again(
         await conn.run_sync(_upgrade_to, "head")
         after_up = await conn.run_sync(lambda sc: set(inspect(sc).get_table_names()))
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert head.scalar_one() == "0073"
+        assert head.scalar_one() == "0076"
     await engine.dispose()
     assert after_down.isdisjoint(TABLES)
     # A negative control: the downgrade removes the campaign tables only.

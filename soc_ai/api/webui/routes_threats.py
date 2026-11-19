@@ -32,6 +32,13 @@ the attacked host listed three false positives first.
   leaves ``rows`` and ``authorized``, and the campaign counts it. ``total``
   still counts it. With ``host``, a campaign is listed when the machine of
   the host is a party.
+* A run that a campaign with a decision in force holds waits on nothing
+  (round "decide once", DC2). It leaves ``rows``, ``authorized`` and
+  ``campaigns``, and ``decided`` counts it with its campaign. A decided
+  campaign stays in ``campaigns`` only with a run that waits: one beyond its
+  authorization. ``waiting`` counts the runs that wait
+  (:mod:`soc_ai.campaigns.threat_parts`), and ``waitingHosts`` counts their
+  affected machines, the machines of a campaign included.
 
 The work is bounded. One read takes the runs. The labels, the marks, the
 event times and the waiting actions each take a fixed number of reads for
@@ -57,6 +64,7 @@ from soc_ai.api.webui._shared import _iso_utc, router
 from soc_ai.api.webui.routes_campaigns import CampaignRowOut
 from soc_ai.api.webui.routes_campaigns import _row_out as _campaign_row_out
 from soc_ai.campaigns import service as campaign_svc
+from soc_ai.campaigns import threat_parts
 from soc_ai.campaigns.types import STAGES
 from soc_ai.secret_scrub import scrub_secrets
 from soc_ai.store import authorized_activity as authorized_svc
@@ -206,6 +214,27 @@ class ThreatCampaignOut(CampaignRowOut):
     authorized: int = 0
 
 
+class ThreatDecidedOut(BaseModel):
+    """The true positives of the window that a campaign with a decision in force holds."""
+
+    campaigns: int = 0
+    investigations: int = 0
+
+
+class ThreatEarlierOut(BaseModel):
+    """The true positives of the window that the earlier decision of a reopened campaign covered.
+
+    Round 3 part 2, W2 (:data:`soc_ai.campaigns.threat_parts.PART_EARLIER`).
+    ``decision`` and ``decidedAt`` name the earlier decision when one
+    campaign holds them all, else they are null.
+    """
+
+    campaigns: int = 0
+    investigations: int = 0
+    decision: str | None = None
+    decidedAt: str | None = None
+
+
 class ThreatsOut(BaseModel):
     window: ThreatWindowOut
     # The runs in no listed campaign, merged by affected machine.
@@ -215,9 +244,27 @@ class ThreatsOut(BaseModel):
     # ``host`` filter, the runs that name that host. A run of a campaign
     # counts here too.
     total: int = 0
-    # The active campaigns with a true positive run in the window, the worst
-    # stage first, then the newest last event.
+    # The active campaigns with a true positive run in the window that waits,
+    # the worst stage first, then the newest last event.
     campaigns: list[ThreatCampaignOut] = Field(default_factory=list)
+    # The true positives of the window that wait on the analyst
+    # (:mod:`soc_ai.campaigns.threat_parts`), and their affected machines.
+    # The Dashboard tile and the panel header state this count.
+    waiting: int = 0
+    waitingHosts: int = 0
+    # The Investigations list of exactly those runs.
+    waitingHref: str = ""
+    # The runs of ``waiting`` that a campaign with no decision holds, and the
+    # count of those campaigns (round "decide once" part 2, OW2): "6 true
+    # positives wait: 4 on their own, 2 in 1 campaign." The analyst decides
+    # each of those on its campaign.
+    waitingInCampaigns: int = 0
+    waitingCampaigns: int = 0
+    # The runs of the window that a campaign with a decision in force holds.
+    decided: ThreatDecidedOut = Field(default_factory=ThreatDecidedOut)
+    # The runs of the window that the earlier decision of a reopened campaign
+    # covered (W2). They wait on nothing, and their campaign stays listed.
+    earlier: ThreatEarlierOut = Field(default_factory=ThreatEarlierOut)
 
 
 @dataclass
@@ -391,6 +438,19 @@ def _investigations_href(target: ThreatHostOut, value: str | None, window: Threa
     return f"/investigations?{urlencode(params)}"
 
 
+def waiting_href(window: ThreatWindowOut, host: str = "") -> str:
+    """The console link to the true positives of the window that wait.
+
+    The Investigations list reads the same rule with ``waits``, so the link
+    opens exactly the counted runs. With ``host``, the runs that name it.
+    """
+    params: dict[str, str] = {"verdict": "true_positive", "waits": "true"}
+    if host:
+        params["entity"] = host
+    params.update({"range": "custom", "from": window.since, "to": window.until})
+    return f"/investigations?{urlencode(params)}"
+
+
 def _window(since: datetime | None, until: datetime | None) -> tuple[datetime, datetime]:
     """The window as naive UTC. The default is the 24 hours before the upper bound."""
     end = routes_hunts._naive_utc(until) or utcnow()
@@ -439,6 +499,18 @@ class _Read:
     waiting: dict[str, int]
     total: int
     campaigns: list[_CampaignCounts] = field(default_factory=list)
+    # The runs that wait (:mod:`soc_ai.campaigns.threat_parts`) and the
+    # keys of their affected machines.
+    waiting_runs: int = 0
+    waiting_hosts: int = 0
+    # The decided runs and the count of their campaigns.
+    decided_runs: int = 0
+    decided_campaigns: int = 0
+    # The waiting runs that a campaign holds, and the count of those campaigns.
+    waiting_in_campaigns: int = 0
+    waiting_campaigns: int = 0
+    # The runs that the earlier decision of a reopened campaign covered (W2).
+    earlier: ThreatEarlierOut = field(default_factory=ThreatEarlierOut)
 
 
 async def _party_campaigns(db: Any, host_key: str) -> set[int]:
@@ -492,14 +564,19 @@ async def _read(request: Request, start: datetime, end: datetime, host: str) -> 
     """The runs of the window in their groups, with the labels and the waiting actions."""
     settings = request.app.state.settings
     async with request.app.state.db_sessionmaker() as db:
-        found, total = await inv_svc.standing_true_positives(db, since=start, until=end)
+        # The one read of the true positives that stand and the part of each.
+        threats = await threat_parts.in_window(db, since=start, until=end, state=request.app.state)
+        found, total = threats.runs, threats.total
+        parts, links, marks = threats.parts.parts, threats.parts.links, threats.parts.marks
         ends = {inv.id: first_line_svc.run_ends(inv) for inv in found}
         labels = await first_line_svc.labels_for_settings(
             db, [value for pair in ends.values() for value in pair], settings
         )
-        marks = await authorized_svc.marks_for(db, [inv.authorization_id for inv in found])
         host_key = await _host_group_key(db, host, settings) if host else None
         groups: dict[str, _Group] = {}
+        decided: list[str] = []
+        covered: list[str] = []
+        named = 0
         for inv in found:  # newest first
             source, target = ends[inv.id]
             target = target or source
@@ -511,6 +588,18 @@ async def _read(request: Request, start: datetime, end: datetime, host: str) -> 
                 _group_key(other, labels.get(other) if other else None, inv.id),
             ):
                 # The run names the host at neither end.
+                continue
+            named += 1
+            if parts.get(inv.id) == threat_parts.PART_DECIDED:
+                # A campaign with a decision in force holds the run: it waits
+                # on nothing and leaves every list. ``decided`` counts it.
+                decided.append(inv.id)
+                continue
+            if parts.get(inv.id) == threat_parts.PART_EARLIER:
+                # The earlier decision of a reopened campaign covered the run
+                # (W2): it waits on nothing and is no row. Its campaign stays
+                # listed, because the campaign waits on a decision.
+                covered.append(inv.id)
                 continue
             key = f"{direction}|{host_part}"
             groups.setdefault(key, _Group(key=key, direction=direction)).runs.append(
@@ -529,11 +618,13 @@ async def _read(request: Request, start: datetime, end: datetime, host: str) -> 
         # The campaigns of the window. A run of a listed campaign leaves the
         # rows. With the host filter, a campaign is listed when the machine
         # of the host is a party, and a run of another campaign stays a row.
-        links = await campaign_svc.links_of(db, [inv.id for inv in found])
-        listed = {link.id for link in links.values()}
+        # A decided run lists no campaign: a decided campaign stays listed
+        # only with a run that waits.
+        undecided = [inv for inv in found if parts.get(inv.id) != threat_parts.PART_DECIDED]
+        listed = {links[inv.id].id for inv in undecided if inv.id in links}
         if host_key is not None:
             listed &= await _party_campaigns(db, host_key)
-        in_campaign = [inv for inv in found if inv.id in links and links[inv.id].id in listed]
+        in_campaign = [inv for inv in undecided if inv.id in links and links[inv.id].id in listed]
         moved = {inv.id for inv in in_campaign}
         # The waiting actions, by the needs-you rule. One call for all runs.
         unmarked = {run.inv.id: run.inv for run in kept if not run.authorized}
@@ -544,7 +635,23 @@ async def _read(request: Request, start: datetime, end: datetime, host: str) -> 
             db, list(unmarked.values()), state=request.app.state
         )
         rows = await campaign_svc.list_campaigns(db, ids=listed) if listed else []
-    counted = len(kept) if host_key is not None else total
+    counted = named if host_key is not None else total
+    # The machines of the runs that wait, the machines of a campaign
+    # included: the key of a group without its direction.
+    waiting_hosts = {
+        group.key.split("|", 1)[1]
+        for group in groups.values()
+        for run in group.runs
+        if parts.get(run.inv.id) == threat_parts.PART_WAITS
+    }
+    waiting_runs = sum(1 for run in kept if parts.get(run.inv.id) == threat_parts.PART_WAITS)
+    # The runs that wait on a campaign: a campaign with no decision holds them.
+    on_campaign = [
+        links[run.inv.id].id
+        for run in kept
+        if parts.get(run.inv.id) == threat_parts.PART_WAITS
+        and campaign_svc.held(links.get(run.inv.id))
+    ]
     for key in list(groups):
         groups[key].runs = [run for run in groups[key].runs if run.inv.id not in moved]
         if not groups[key].runs:
@@ -555,6 +662,29 @@ async def _read(request: Request, start: datetime, end: datetime, host: str) -> 
         waiting=waiting,
         total=counted,
         campaigns=_campaign_counts(rows, in_campaign, links, marks, waiting),
+        waiting_runs=waiting_runs,
+        waiting_hosts=len(waiting_hosts),
+        decided_runs=len(decided),
+        decided_campaigns=len({links[run_id].id for run_id in decided if run_id in links}),
+        waiting_in_campaigns=len(on_campaign),
+        waiting_campaigns=len(set(on_campaign)),
+        earlier=_earlier_out(covered, links, threats.parts.covered),
+    )
+
+
+def _earlier_out(
+    run_ids: list[str],
+    links: dict[str, campaign_svc.CampaignLink],
+    covered: dict[int, Any],
+) -> ThreatEarlierOut:
+    """The count of the runs of the part ``earlier`` and their campaigns (W2)."""
+    campaigns = {links[run_id].id for run_id in run_ids if run_id in links}
+    only = covered.get(next(iter(campaigns))) if len(campaigns) == 1 else None
+    return ThreatEarlierOut(
+        campaigns=len(campaigns),
+        investigations=len(run_ids),
+        decision=only.earlier.decision if only is not None else None,
+        decidedAt=_iso_utc(only.earlier.at) if only is not None and only.earlier.at else None,
     )
 
 
@@ -661,6 +791,20 @@ async def list_threats(
     ``investigations``, ``waiting`` and ``authorized``. The runs of a listed
     campaign are in no row and in no ``authorized`` entry. With ``host``, a
     campaign is listed when the machine of the host is a party.
+
+    A run that a campaign with a decision in force holds is in no list.
+    ``decided`` counts those runs and their campaigns. A decided campaign is
+    in ``campaigns`` only with a run of the window that waits, for example a
+    run beyond its authorization. ``waiting`` counts the runs that wait
+    (:mod:`soc_ai.campaigns.threat_parts`): a run whose verdict stands, that
+    no decided campaign holds and that no authorization mark holds.
+    ``waitingHosts`` counts their affected machines, and ``waitingHref``
+    opens the Investigations list of exactly those runs.
+    ``waitingInCampaigns`` counts the runs of ``waiting`` that a campaign
+    with no decision holds, and ``waitingCampaigns`` counts those campaigns.
+    A run on which the analyst decided waits no more (``handled``).
+    ``earlier`` counts the runs that the earlier decision of a reopened
+    campaign covered (W2). They wait on nothing and are in no row.
     """
     start, end = _window(since, until)
     window = ThreatWindowOut(since=_iso_utc(start), until=_iso_utc(end))
@@ -686,6 +830,15 @@ async def list_threats(
         rows=[row for _order, row in ranked[:MAX_ROWS]],
         authorized=[entry for _seen, entry in authorized],
         total=read.total,
+        waiting=read.waiting_runs,
+        waitingHosts=read.waiting_hosts,
+        waitingHref=waiting_href(window, (host or "").strip()),
+        waitingInCampaigns=read.waiting_in_campaigns,
+        waitingCampaigns=read.waiting_campaigns,
+        decided=ThreatDecidedOut(
+            campaigns=read.decided_campaigns, investigations=read.decided_runs
+        ),
+        earlier=read.earlier,
         campaigns=[
             ThreatCampaignOut(
                 **_campaign_row_out(c.row).model_dump(),
@@ -737,6 +890,7 @@ __all__ = [
     "MAX_ROWS",
     "AuthorizedThreatOut",
     "ThreatCampaignOut",
+    "ThreatDecidedOut",
     "ThreatHostOut",
     "ThreatRowAuthorizationOut",
     "ThreatRowOut",
@@ -744,4 +898,5 @@ __all__ = [
     "ThreatWindowOut",
     "ThreatsOut",
     "list_threats",
+    "waiting_href",
 ]

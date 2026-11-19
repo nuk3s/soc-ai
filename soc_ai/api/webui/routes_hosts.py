@@ -238,9 +238,12 @@ class MachineSummaryOut(BaseModel):
 
 
 class MachineResolveOut(BaseModel):
-    key: str
-    primary_ip: str
-    matched: _AsMatched
+    """The machine a value names. All three are null only on a request with
+    ``empty=true`` for a value that names no machine."""
+
+    key: str | None = None
+    primary_ip: str | None = None
+    matched: _AsMatched | None = None
 
 
 class HostNameOut(BaseModel):
@@ -1097,18 +1100,26 @@ _NO_HOST_HINT = "No machine holds this value. Run a sweep, or search the Hosts l
 
 @router.get("/hosts/resolve", response_model=MachineResolveOut)
 async def resolve_machine(
-    request: Request, value: str = Query("", max_length=253)
+    request: Request,
+    value: str = Query("", max_length=253),
+    empty: bool = Query(False),
 ) -> MachineResolveOut:
     """An address, a name, a MAC or an agent id to a machine key. 404 when none.
 
     A name two machines share resolves to neither. The console sends an address
     in a ``/hosts/<address>`` link here and opens the machine it names.
+
+    ``empty=true`` answers a value that names no machine with 200 and three
+    nulls. The entity page of an external address asks with it, so the page
+    makes no request that it expects to fail (dogfood 2026-11-17, N17).
     """
     if not value.strip():
         raise api_error(422, "value_required", "Send the address, name, MAC or agent id.")
     async with request.app.state.db_sessionmaker() as db:
         held = await host_machines.resolve_membership(db, value)
     if held is None or not held.primary_ip:
+        if empty:
+            return MachineResolveOut()
         raise api_error(404, "no_host", _NO_HOST_HINT)
     matched: _AsMatched = (
         _KEY_MATCH.get(held.key.split(":", 1)[0], "agent")

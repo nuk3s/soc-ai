@@ -3,7 +3,17 @@ import type { CampaignDetail } from '../../lib/api';
 import { useSession } from '../../shell/Session';
 import { AttackGraph } from './AttackGraph';
 import { AuthorizeCampaignDialog } from './AuthorizeCampaignDialog';
-import { BEYOND_TITLE, EXCLUDED_TITLE, LEADS_HUNTS_TITLE, leadsHuntsDetail } from '../../lib/campaignWords';
+import {
+  BEYOND_TITLE,
+  EXCLUDED_TITLE,
+  LEADS_HUNTS_TITLE,
+  alertsFoldDetail,
+  heldInvestigations,
+  lastActivityOf,
+  leadsHuntsDetail,
+  showingNewWords,
+  sinceBandWords,
+} from '../../lib/campaignWords';
 import { CampaignAlerts, distinctRules } from './CampaignAlerts';
 import { CampaignBeyond } from './CampaignBeyond';
 import { CampaignChanges } from './CampaignChanges';
@@ -66,6 +76,9 @@ export function CampaignView({
   const canAuthorize = !me || me.role === 'admin';
   const [selection, setSelection] = useState<CampaignSelection | null>(null);
   const [target, setTarget] = useState<FoldName | null>(null);
+  // True while the table shows only the investigations that are new since
+  // the earlier decision (SD3).
+  const [newOnly, setNewOnly] = useState(false);
   // The fold of the investigations beyond the authorization is the one alarm
   // of an authorized campaign, so it starts open.
   const [open, setOpen] = useState<Record<FoldName, boolean>>({
@@ -95,6 +108,7 @@ export function CampaignView({
   const select = (next: CampaignSelection | null) => {
     setSelection(next);
     if (!next) return;
+    setNewOnly(false);
     const fold: FoldName = next.kind !== 'runs' && rules > 0 ? 'alerts' : 'investigations';
     setTarget(fold);
     setOpen((o) => (o[fold] ? o : { ...o, [fold]: true }));
@@ -108,8 +122,15 @@ export function CampaignView({
       el.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
   }, [selection, target]);
+  // The control "Show the new investigations" opens the fold; the effect runs
+  // after the render that opened it, so the scroll reaches the table.
+  useEffect(() => {
+    if (!newOnly) return;
+    const el = investigationsRef.current;
+    if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }, [newOnly]);
 
-  const memberRows = d.members.filter((m) => !m.verdictDiffers).length;
+  const memberRows = heldInvestigations(d.members);
   const differ = d.members.length - memberRows;
   const { needsMoreInfo, sessions, named, falsePositiveFromTargets } = d.related;
   // The false positive line is a count of alerts that are no candidates, so
@@ -131,6 +152,15 @@ export function CampaignView({
   const labels = Object.fromEntries(
     [...d.members, ...beyond, ...excluded, ...d.related.needsMoreInfo].map((r) => [r.runId, r.label]),
   );
+  // The investigations that are new since the earlier decision, from the
+  // one reader of the server. The control opens exactly these rows.
+  const since = d.sinceDecision ?? null;
+  const fresh = new Set(since?.runIds ?? []);
+  const showNew = () => {
+    setSelection(null);
+    setNewOnly(true);
+    setOpen((o) => (o.investigations ? o : { ...o, investigations: true }));
+  };
   const showBeyond = () => {
     setOpen((o) => (o.beyond ? o : { ...o, beyond: true }));
     const el = beyondRef.current;
@@ -147,6 +177,7 @@ export function CampaignView({
         onCaseRequest={() => setCasing(true)}
         canAuthorize={canAuthorize}
         onShowBeyond={beyond.length > 0 ? showBeyond : undefined}
+        onShowNew={fresh.size > 0 ? showNew : undefined}
       />
       <CloseCampaignDialog campaign={d} open={closing} onClose={() => setClosing(false)} onClosed={onDecided} />
       <AuthorizeCampaignDialog
@@ -179,6 +210,8 @@ export function CampaignView({
             authorization={d.authorization}
             selection={selection}
             onSelect={select}
+            answer={d.answers?.[0] ?? null}
+            since={since ? { boundary: since.boundary, words: sinceBandWords(since) } : null}
           />
           {beyond.length > 0 && (
             <Fold
@@ -196,7 +229,8 @@ export function CampaignView({
           {rules > 0 && (
             <Fold
               title="Alerts"
-              count={rules}
+              count={null}
+              detail={alertsFoldDetail(d.events)}
               open={open.alerts}
               onToggle={() => toggle('alerts')}
               testId="fold-alerts"
@@ -230,7 +264,7 @@ export function CampaignView({
                 hunts={hunts}
                 changes={d.changes ?? []}
                 firstEvent={d.firstEvent}
-                lastEvent={d.lastEvent}
+                lastEvent={lastActivityOf(d)}
               />
             </Fold>
           )}
@@ -279,7 +313,7 @@ export function CampaignView({
               <DetectionRecord detection={d.detection} embedded />
             </Fold>
           )}
-          {memberRows > 0 && (
+          {(memberRows > 0 || (newOnly && fresh.size > 0)) && (
             <Fold
               title="Investigations"
               count={memberRows}
@@ -295,6 +329,10 @@ export function CampaignView({
                 onClearSelection={clear}
                 embedded
                 writes={writes ? { ...writes, outside: outsideIds } : undefined}
+                fresh={fresh}
+                newOnly={newOnly && fresh.size > 0}
+                newWords={since ? showingNewWords(since) : undefined}
+                onShowAll={() => setNewOnly(false)}
               />
             </Fold>
           )}

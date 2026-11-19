@@ -31,6 +31,8 @@ import { EmptyState, ErrorState, Freshness, LoadingState, StaleNotice } from '..
 import { TimeRangeFilter, type CustomRange } from '../components/TimeRangeFilter';
 import { demoBlocked, useDemo } from '../lib/demo';
 import { rangeToSinceUntil } from '../lib/timeRange';
+import { RelTime } from '../components/RelTime';
+import { UtcTime } from '../components/UtcTime';
 import {
   ApiError,
   bulkDeleteHunts,
@@ -47,7 +49,7 @@ import {
   updateHuntSchedule,
 } from '../lib/api';
 import type { HuntKindTotals, HuntSchedule, HuntScheduleList, Lead } from '../lib/api';
-import { huntOutcome, huntOutcomeText, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
+import { huntOutcome, huntOutcomeText, huntStopLabel, outcomeLabel, outcomeMeta, statusDetail, statusMeta } from '../lib/labels';
 import { HUNT_KIND } from '../lib/tokens';
 import {
   STATUS_COMPLETE,
@@ -235,7 +237,7 @@ const rowTitle = (h: Pick<HuntRow, 'objective' | 'title'>): string => h.title ||
 const REHUNT_SKIP_REASONS: Record<string, string> = {
   not_found: 'not found',
   running: 'still running',
-  queued: 'queued. Re-hunt a smaller batch.',
+  queued: 'queued. Hunt a smaller batch again.',
   could_not_start: 'could not start',
 };
 const rehuntSkipReason = (code: string): string => REHUNT_SKIP_REASONS[code] ?? code;
@@ -288,7 +290,7 @@ function findingsCellTitle(h: HuntRow): string | undefined {
     const reason = h.outcome_headline ? ` ${h.outcome_headline}` : '';
     const n = h.findingCount ?? 0;
     const where = n > 0 ? ` The hunt page lists its ${n} finding${n === 1 ? '' : 's'}.` : '';
-    return `${outcomeLabel(outcome)}.${reason}${where}`;
+    return `${huntStopLabel(h) ?? outcomeLabel(outcome)}.${reason}${where}`;
   }
   const threats = h.threatFindingCount ?? h.findingCount;
   const other = h.findingCount - threats;
@@ -331,10 +333,12 @@ function StatusDot({
   // the client word disagreed with the hunt page beside it.
   // An investigating hunt also carries its count, "Investigating 2 of 3
   // findings", which the client word cannot state.
+  // A hunt that stopped reads the words of the hunt page, the lead page and
+  // the campaign fold: "Stopped with an error after 14 steps" (F5).
   const label =
     status === 'complete' || status === 'investigating'
       ? serverLabel || (row ? huntOutcomeText({ ...row, outcome_label: null }) : null) || m.label
-      : m.label;
+      : (huntStopLabel({ status, steps: row?.steps }) ?? m.label);
   return (
     <span
       className="flex items-start gap-1.5 text-[12px] leading-[1.35]"
@@ -562,10 +566,10 @@ function ScheduledHunts() {
                             to={`/hunts/${encodeURIComponent(lastHuntOf(s) ?? '')}`}
                             className="underline hover:text-accent"
                           >
-                            {new Date(s.lastRunAt).toLocaleString()}
+                            <UtcTime iso={s.lastRunAt} />
                           </Link>
                         ) : (
-                          new Date(s.lastRunAt).toLocaleString()
+                          <UtcTime iso={s.lastRunAt} />
                         )}
                       </>
                     ) : (
@@ -981,12 +985,14 @@ export function Hunts() {
         label: 'Hunts',
         value: scopedTotals ? String(scopedTotals.hunts) : mark(rows.length),
         sub: 'in window',
-        detail: kinds ? `(${kinds})` : '',
+        // The count follows the window chips far below it, so the header
+        // states the window (dogfood 2026-11-17, N15).
+        detail: `in ${windowWords(range)}${kinds ? ` (${kinds})` : ''}`,
       },
       { label: 'Findings', value: mark(findings), sub: `${mark(threats)} threat`, detail: '' },
       { label: 'In progress', value: mark(running), sub: 'running or investigating', detail: '' },
     ];
-  }, [visible, kind, windowTotals, byKind, scopedTotals, pageFloor]);
+  }, [visible, kind, windowTotals, byKind, scopedTotals, pageFloor, range]);
 
   // A hunt started elsewhere won't appear while this list is idle — force one
   // refetch when the tab regains focus.
@@ -1043,7 +1049,7 @@ export function Hunts() {
     startHuntConsole(h.objective)
       .then((r) => navigate(`/hunts/${r.hunt_id}`))
       .catch((e: unknown) => {
-        setBulkMsg(`Re-hunt failed: ${e instanceof Error ? e.message : String(e)}`);
+        setBulkMsg(`Hunt again failed: ${e instanceof Error ? e.message : String(e)}`);
         setRehuntingId(null);
       });
   };
@@ -1082,7 +1088,7 @@ export function Hunts() {
       sel.clear();
       setReloadKey((k) => k + 1);
     } catch (err) {
-      setBulkMsg(`Re-hunt failed: ${err instanceof Error ? err.message : String(err)}`);
+      setBulkMsg(`Hunt again failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
       setRehunting(false);
     }
@@ -1277,7 +1283,7 @@ export function Hunts() {
                 style={{ background: 'rgba(75,139,245,.14)', borderColor: 'rgba(75,139,245,.4)' }}
               >
                 <RefreshCw size={12} className={rehunting ? 'animate-spin' : ''} />
-                {rehunting ? 'Starting' : `Re-hunt selected (${selCount})`}
+                {rehunting ? 'Starting' : `Hunt again (${selCount} selected)`}
               </button>
               {confirmDelete ? (
                 <>
@@ -1341,7 +1347,7 @@ export function Hunts() {
                 className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
               >
                 <span className="min-w-0 break-words font-semibold text-text-2">
-                  Started {started.length} re-hunt{started.length !== 1 ? 's' : ''}
+                  Started {started.length} new hunt{started.length !== 1 ? 's' : ''}
                   {skipped.length > 0 ? ` · ${skipped.length} skipped` : ''}
                 </span>
                 {total > 0 && (
@@ -1512,7 +1518,9 @@ export function Hunts() {
                   <HuntDegradedChip note={h.degradedNote} testId={`hunt-degraded-${h.id}`} />
                 )}
               </div>
-              <div className="text-[12px] text-dim" title={h.ts}>{h.when}</div>
+              <div className="text-[12px] text-dim">
+                <RelTime testId={`hunt-when-${h.id}`} iso={h.ts} text={h.when} />
+              </div>
               {/* The tags, in the one order of every list. Scheduled and
                   catalog-recorded hunts carry a kind chip. A manual hunt is
                   the default and carries none. The synthetic mark keeps a
@@ -1534,7 +1542,7 @@ export function Hunts() {
                   <button
                     onClick={() => rehuntOne(h)}
                     disabled={rehuntingId === h.id}
-                    title="Re-run this objective as a fresh hunt"
+                    title="Hunt again: start a new hunt with this objective."
                     className={
                       h.status === 'error' || h.status === 'interrupted'
                         ? 'flex text-accent transition-opacity hover:opacity-80 disabled:opacity-50'

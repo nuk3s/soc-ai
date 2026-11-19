@@ -231,9 +231,13 @@ def stamp(at: datetime | None) -> str:
 
 @dataclass(frozen=True)
 class StageLine:
+    """One reached stage of the case text. ``by`` is true when ``at`` is the
+    time of a later stage that needs this one: the stage held by that time."""
+
     stage: str
     at: datetime | None
     what: str
+    by: bool = False
 
 
 @dataclass(frozen=True)
@@ -269,7 +273,8 @@ def case_description(
         for step in stages:
             words = stage_words(step.stage) or step.stage
             what = scrub_secrets(step.what.strip())
-            lines.append(f"- {words}, {stamp(step.at)}." + (f" {what}" if what else ""))
+            when = f"by {stamp(step.at)}" if step.by else stamp(step.at)
+            lines.append(f"- {words}, {when}." + (f" {what}" if what else ""))
         lines.append("")
     if machines:
         lines.append("Machines:")

@@ -27,6 +27,8 @@ vi.mock('react-router-dom', async (importOriginal) => ({
 }));
 
 import {
+  ApiError,
+  RequestTimeoutError,
   emitNeedsYouChanged,
   getHealth,
   getNeedsYouCount,
@@ -34,8 +36,9 @@ import {
   getWorkspaces,
   type NeedsYouCount,
 } from '../lib/api';
+import { SECOND_CLOCK_OFF, reloadSecondClock, setSecondClock } from '../lib/clock';
 import { ShellProvider, useShell } from './ShellContext';
-import { Topbar, notificationSummary } from './Topbar';
+import { HEALTH_FAILED_LABEL, HEALTH_RETRY_MS, Topbar, healthFailure, notificationSummary } from './Topbar';
 
 const NOTIF_MS = 15_000;
 
@@ -628,11 +631,171 @@ describe('Topbar breadcrumb on a machine page', () => {
     expect(screen.getByTestId('topbar-crumb2').textContent).toBe('machine');
   });
 
+  // N10: at 1100 px the id of an investigation wrapped onto five lines. The
+  // id stays on one line, and the search field gives way. Round 3, T1: the
+  // box of the breadcrumb shrank under the id, and the search field covered
+  // its end. tests/browser/test_page_widths.py proves the boxes in a real
+  // browser. This test holds the classes that the proof depends on.
+  it('keeps the id on one line and lets the search field give way', async () => {
+    mountAt('/investigation/01M44S6F4JPXDCK7FC19KVS0D9', null);
+    await flush();
+    const crumb = screen.getByTestId('topbar-crumb2');
+    expect(crumb.className).toContain('whitespace-nowrap');
+    expect(crumb.className).toContain('flex-none');
+    expect(crumb.className).not.toContain('break-words');
+    const trail = screen.getByTestId('topbar-breadcrumb');
+    expect(trail.className).toContain('flex-none');
+    expect(trail.className).not.toContain('min-w-0');
+    const search = screen.getByTestId('topbar-search');
+    expect(search.className).toContain('shrink-[1000]');
+    expect(search.className).toContain('topbar-search');
+    expect(search.className).not.toContain('flex-none');
+    // The words hide by the width of the field, never by the viewport.
+    expect(screen.getByTestId('topbar-search-words').className).toContain('topbar-search-words');
+    expect(screen.getByTestId('topbar-search-words').className).not.toMatch(/\bhidden\b|xl:/);
+    expect(screen.getByTestId('topbar-search-key').className).toContain('topbar-search-key');
+  });
+
+  it('lets a machine name wrap whole beside the full search words', async () => {
+    // Negative control: a name is no id. It wraps, and only a name lets the
+    // box of the breadcrumb shrink.
+    mountAt(`/hosts/${encodeURIComponent(KEY)}`, { key: KEY, name: 'web-01' });
+    await flush();
+    expect(screen.getByTestId('topbar-crumb2').className).toContain('break-words');
+    expect(screen.getByTestId('topbar-breadcrumb').className).toContain('min-w-0');
+    // Round 4, C5: the box of a name gives way only after the search field.
+    expect(screen.getByTestId('topbar-breadcrumb').className).toContain('shrink-[0.001]');
+    expect(screen.getByTestId('topbar-search-words').classList.contains('hidden')).toBe(false);
+  });
+
   it('keeps the id of a page that is not a machine page', async () => {
     mountAt('/investigation/01M44S6F4JPXDCK7FC19KVS0D9', null);
     await flush();
     const crumb = screen.getByTestId('topbar-crumb2');
     expect(crumb.textContent).toBe('01M44S6F4JPXDCK7FC19KVS0D9');
     expect(crumb.getAttribute('title')).toBeNull();
+  });
+});
+
+// Dogfood 2026-11-17, AB4: the pill read "unreachable" for up to 60 seconds
+// while the health route answered in under 0.1 second. One failed read set
+// the state until the next poll, and the word named nothing.
+describe('Topbar health pill: one retry before a failure', () => {
+  const healthy = {
+    es: { ok: true, detail: 'ok' },
+    llm: { ok: true, detail: 'ok' },
+    so: { ok: true, detail: 'ok' },
+    pcap: null,
+  };
+  const pill = () => screen.getByRole('button', { name: /^(Upstream health|connected|checking|soc-ai)/ });
+
+  it('reads once more after a failed read and shows no failure when the retry answers', async () => {
+    vi.mocked(getHealth).mockRejectedValueOnce(new Error('Network error')).mockResolvedValue(healthy);
+    mount();
+    await flush();
+    expect(screen.queryByText(HEALTH_FAILED_LABEL)).toBeNull();
+    await tick(HEALTH_RETRY_MS);
+    expect(getHealth).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('connected')).toBeTruthy();
+    expect(screen.queryByText(HEALTH_FAILED_LABEL)).toBeNull();
+    // NEGATIVE CONTROL of the rule below: "connected" takes no room of the
+    // second clock.
+    expect(screen.getByTestId('topbar').getAttribute('data-health-long')).toBeNull();
+  });
+
+  it('marks a long health label, so that the second clock gives its room (round 4)', async () => {
+    // "soc-ai API unreachable" is longer than "connected". With a second
+    // clock the bar had no room for both at 1100 px (index.css hides the
+    // second clock of the bar on this mark; its panel keeps it).
+    vi.mocked(getHealth).mockRejectedValue(new RequestTimeoutError(20_000));
+    mount();
+    await flush();
+    await tick(HEALTH_RETRY_MS);
+    expect(screen.getByText(HEALTH_FAILED_LABEL)).toBeTruthy();
+    expect(screen.getByTestId('topbar').getAttribute('data-health-long')).toBe('on');
+  });
+
+  it('names the soc-ai API and the reason after two failed reads', async () => {
+    // NEGATIVE CONTROL: a real outage still shows. The retry delays it by
+    // one short wait and does not hide it.
+    vi.mocked(getHealth).mockRejectedValue(new RequestTimeoutError(20_000));
+    mount();
+    await flush();
+    await tick(HEALTH_RETRY_MS);
+    expect(screen.getByText(HEALTH_FAILED_LABEL)).toBeTruthy();
+    fireEvent.click(pill());
+    expect(screen.getByTestId('health-failed').textContent).toBe(
+      'The soc-ai API did not answer two reads in 20 s. The console reads it again in 1 minute.',
+    );
+  });
+
+  it('words each failure', () => {
+    expect(healthFailure(new ApiError('Bad gateway', 502))).toBe('The soc-ai API answered two reads with HTTP 502.');
+    expect(healthFailure(new Error('Network error'))).toBe(
+      'The browser could not reach the soc-ai API on two reads.',
+    );
+  });
+});
+
+// Round 4, C1: the top bar states the time now in UTC. The clock sits after
+// the search field, so the search field gives way first and the clock stays.
+describe('Topbar clock', () => {
+  it('states the time in UTC between the search field and the health pill', async () => {
+    vi.setSystemTime(new Date('2026-11-19T14:32:10Z'));
+    mount();
+    await flush();
+    const clock = screen.getByTestId('topbar-clock');
+    expect(screen.getByTestId('topbar-clock-utc').textContent).toBe('14:32 UTC');
+    expect(clock.className).toContain('flex-none');
+    const search = screen.getByTestId('topbar-search');
+    const pill = screen.getByRole('button', { name: /connected/ });
+    expect(search.compareDocumentPosition(clock) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(clock.compareDocumentPosition(pill) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await tick(60_000);
+    expect(screen.getByTestId('topbar-clock-utc').textContent).toBe('14:33 UTC');
+  });
+
+  // Round 4, C5: the bar is a container, so its parts give way by the room
+  // of the bar. tests/browser/test_topbar_clock.py proves the boxes at
+  // 1100 px. This test holds the hooks that the rules of index.css read.
+  it('marks the bar as a container and states when the second clock takes room', async () => {
+    mount();
+    await flush();
+    const bar = screen.getByTestId('topbar');
+    expect(bar.className).toContain('topbar');
+    expect(bar.getAttribute('data-second-clock')).toBeNull();
+    act(() => setSecondClock({ mode: 'zone', zone: 'Asia/Tokyo' }));
+    expect(bar.getAttribute('data-second-clock')).toBe('on');
+    expect(screen.getByTestId('topbar-clock-second').className).toContain('topbar-clock-second');
+    // The clocks never shrink. The search field gives way.
+    expect(screen.getByTestId('topbar-clock').className).toContain('flex-none');
+    expect(screen.getByTestId('topbar-clock-button').className).toContain('whitespace-nowrap');
+    expect(screen.getByTestId('topbar-search').className).toContain('shrink-[1000]');
+    act(() => setSecondClock(SECOND_CLOCK_OFF));
+    expect(bar.getAttribute('data-second-clock')).toBeNull();
+  });
+
+  // Round 4, C3: storage that is off breaks nothing of the bar.
+  it('renders the bar and its clock when storage throws', async () => {
+    const refuse = () => {
+      throw new DOMException('The storage is off.', 'SecurityError');
+    };
+    const spies = [
+      vi.spyOn(Storage.prototype, 'getItem').mockImplementation(refuse),
+      vi.spyOn(Storage.prototype, 'setItem').mockImplementation(refuse),
+    ];
+    try {
+      reloadSecondClock();
+      vi.setSystemTime(new Date('2026-11-19T14:32:10Z'));
+      mount();
+      await flush();
+      expect(screen.getByTestId('topbar-clock-utc').textContent).toBe('14:32 UTC');
+      expect(screen.queryByTestId('topbar-clock-second')).toBeNull();
+      expect(screen.getByTestId('topbar-search')).toBeTruthy();
+      expect(bell()).toBeTruthy();
+    } finally {
+      for (const spy of spies) spy.mockRestore();
+      reloadSecondClock();
+    }
   });
 });

@@ -6,7 +6,7 @@ import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import { anchoredSummary } from '../lib/observationWords';
 import { plural } from '../lib/plural';
 import { isZScore, statisticSentence } from '../lib/statistics';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import {
   CHIP_IN_LEAD,
   CHIP_NO_LEAD,
@@ -49,7 +49,7 @@ function Row({ observation }: { observation: EntityObservation }) {
     >
       <span
         className="font-mono text-[11px] text-dim"
-        title={observation.born_at ? absTime(observation.born_at) : undefined}
+        title={observation.born_at ? timeTitle(observation.born_at) : undefined}
       >
         {ago(observation.born_at)}
       </span>
@@ -133,27 +133,41 @@ function Row({ observation }: { observation: EntityObservation }) {
   );
 }
 
+/** "last 7 days", "last 24 hours": the window of the panel in words. */
+function windowLabel(days: number): string {
+  return days === 1 ? 'last 24 hours' : `last ${days} days`;
+}
+
 export function HostObservations({
   entityKey,
   noun = 'host',
   className = 'mt-4',
+  days = DAYS,
 }: {
   entityKey: string;
   /** The word for the thing the panel is mounted on. A user account is not a
    *  host, and the heading said host on both. */
   noun?: string;
   className?: string;
+  /** The days the panel reads. The host page passes the window of its 24h
+   *  and 7d buttons (dogfood 2026-11-17, AB1). */
+  days?: number;
 }) {
-  const data = useAsync(() => getObservations(entityKey, DAYS), [entityKey], {
-    refetchInterval: 300_000,
-  });
-  const rows = data.data?.observations ?? [];
+  const data = useAsync(
+    () => getObservations(entityKey, days).then((res) => ({ days, res })),
+    [entityKey, days],
+    { refetchInterval: 300_000 },
+  );
+  // The label states the window of the rows it shows, not the one just asked
+  // for while the read is in flight.
+  const shownDays = data.data?.days ?? days;
+  const rows = data.data?.res.observations ?? [];
   return (
     <Panel className={className}>
       <PanelHeader
         title={
           <span title={COUNT_OBSERVATIONS}>
-            {`Observations on this ${noun} · last ${DAYS} days · ${rows.length}`}
+            {`Observations on this ${noun} · ${windowLabel(shownDays)} · ${rows.length}`}
           </span>
         }
         right={
@@ -172,7 +186,7 @@ export function HostObservations({
         )
       ) : rows.length === 0 ? (
         <div className="px-[15px] py-3 text-[12.5px] text-dim">
-          No observations on this {noun} in the last {DAYS} days.{' '}
+          No observations on this {noun} in the {windowLabel(shownDays)}.{' '}
           <Link to="/operate#catalog" className="text-accent hover:underline">
             The Status page shows the analytics that could not score it.
           </Link>

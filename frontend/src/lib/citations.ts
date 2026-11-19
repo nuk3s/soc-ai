@@ -1,4 +1,5 @@
 import { toolWords } from './headline';
+import { utcTimesInText } from './timeRange';
 
 // ---------------------------------------------------------------------------
 // A cited field of an investigation report, in words.
@@ -17,9 +18,9 @@ const FIELD_WORDS: Record<string, string> = {
   payload: 'Payload',
   message: 'Message',
   rule_name: 'Rule name',
-  signature_severity: 'Signature severity',
+  signature_severity: 'Rule metadata severity',
   metadata_tags: 'Rule tags',
-  severity_label: 'Severity',
+  severity_label: 'Alert severity',
   alert_action: 'Alert action',
   event_action: 'Event action',
   classtype: 'Rule class',
@@ -56,6 +57,15 @@ const FIELD_WORDS: Record<string, string> = {
   as_source: 'Alerts as source',
   as_destination: 'Alerts as destination',
   planes: 'Coverage planes',
+};
+
+/** What a field is, for a field that a reader can mix up with another. The
+ *  alert severity and the severity of the rule metadata are two fields, and a
+ *  card showed "High" beside "Informational" (round 3 part 2, P4). */
+const FIELD_NOTES: Record<string, string> = {
+  signature_severity:
+    'The author of the rule writes this level in the rule metadata. It can differ from the alert severity.',
+  severity_label: 'Security Onion records this level on the alert. It can differ from the rule metadata severity.',
 };
 
 /** The leaf of a path that names something. An index names nothing. */
@@ -104,7 +114,8 @@ export function fieldChipTitle(
   path: string,
   opts: { documentId?: string | null; value?: string | null; resolved?: boolean | null },
 ): string {
-  const raw = `Field ${path}.`;
+  const note = FIELD_NOTES[leafOf(path)];
+  const raw = note ? `Field ${path}. ${note}` : `Field ${path}.`;
   if (opts.resolved === false) {
     return `${raw} The validator did not resolve this citation. The investigation retrieved nothing that it names.`;
   }
@@ -137,7 +148,8 @@ export function findingCitation(raw: string): FindingCitation {
     const head = words.charAt(0).toUpperCase() + words.slice(1);
     return {
       kind: 'text',
-      label: tool[2] ? `${head}: ${tool[2]}` : head,
+      // A time in the citation reads in the UTC form of the page (F15).
+      label: utcTimesInText(tool[2] ? `${head}: ${tool[2]}` : head),
       title: `A tool result that the finding cites. It names no single document. The finding wrote: ${text}`,
     };
   }
@@ -151,7 +163,7 @@ export function findingCitation(raw: string): FindingCitation {
   if (/\s/.test(text)) {
     return {
       kind: 'text',
-      label: text,
+      label: utcTimesInText(text),
       title: 'A query result that the finding cites. It names no single document.',
     };
   }

@@ -94,6 +94,17 @@ describe('dataset names in words', () => {
     // NEGATIVE CONTROL
     expect(plainEvidence('blue (from agent host log)')).toBe('blue (from agent host log)');
   });
+
+  it('states a stored ISO time in the UTC form of the page', () => {
+    // Round 3 part 2, P1: the host page read "last 2026-11-18T20:41:32.112000+00:00".
+    expect(plainEvidence('web-1 (self-reported, filebeat 9.3.7, last 2026-11-18T20:41:32.112000+00:00)')).toBe(
+      'web-1 (self-reported, filebeat 9.3.7, last 2026-11-18 20:41:32 UTC)',
+    );
+    // Negative control: a line in the new form stays as it is.
+    expect(plainEvidence('web-1 (self-reported, last 2026-11-18 20:41 UTC)')).toBe(
+      'web-1 (self-reported, last 2026-11-18 20:41 UTC)',
+    );
+  });
 });
 
 describe('numbers with a scale', () => {

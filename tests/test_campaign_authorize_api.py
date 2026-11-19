@@ -363,10 +363,12 @@ def test_a_revoke_clears_each_mark_and_the_decision_and_forms_no_lead(
     assert _holds(client, web_1) == [False, False, False]
     campaign = _campaign(client, campaign_id)
     assert (campaign.decision, campaign.authorization_id) == (None, record.id)
-    assert _changes(client, campaign_id)[-1] == (
-        "reopened",
-        {"cause": "revoked", "by": "anonymous"},
-    )
+    kind, detail = _changes(client, campaign_id)[-1]
+    assert (kind, detail["cause"], detail["by"]) == ("reopened", "revoked", "anonymous")
+    # SD1: the change keeps the authorization that the revoke ended.
+    was = detail["was"]
+    assert (was["decision"], was["by"], was["label"]) == ("authorized", "anonymous", record.label)
+    assert was["decidedAt"] and was["basis"]["parties"]
     kinds = [(k, m) for k, _p, m in client.app.state.audit.records]
     assert ("authorized_activity_revoked", True) in kinds
     if route == "record":

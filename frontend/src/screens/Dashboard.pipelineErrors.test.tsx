@@ -91,7 +91,7 @@ describe('Dashboard pipeline-error KPI', () => {
     );
     // Live fallbacks = 2 (dismissed + superseded excluded) even though the
     // recent sample holds ZERO fallbacks — the old newest-100 tally read 0 here.
-    expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: '2 failed investigations' })).toBeTruthy();
 
     // And the number is the DESTINATION's query: same verdict filter, same 30d
     // widening the deep-linked screen applies (Investigations.test pins the
@@ -115,7 +115,7 @@ describe('Dashboard pipeline-error KPI', () => {
       </MemoryRouter>,
     );
     await screen.findByText('Run r1');
-    expect(screen.queryByText(/pipeline error/)).toBeNull();
+    expect(screen.queryByText(/failed investigation/)).toBeNull();
   });
 
   // The KPI counts rows, because its two exclusions (dismissed, superseded)
@@ -135,7 +135,7 @@ describe('Dashboard pipeline-error KPI', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    const link = await screen.findByRole('button', { name: '500+ pipeline errors' });
+    const link = await screen.findByRole('button', { name: '500+ failed investigations' });
     // And the "+" is explained where the operator can see it, not left to guess.
     expect(link.getAttribute('title')).toMatch(/at least/i);
   });
@@ -151,8 +151,8 @@ describe('Dashboard pipeline-error KPI', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    expect(await screen.findByRole('button', { name: '2 pipeline errors' })).toBeTruthy();
-    expect(screen.queryByRole('button', { name: /\+ pipeline error/ })).toBeNull();
+    expect(await screen.findByRole('button', { name: '2 failed investigations' })).toBeTruthy();
+    expect(screen.queryByRole('button', { name: /\+ failed investigation/ })).toBeNull();
   });
 
   // The tile's exclusions used to exist only in the browser, so the list it
@@ -168,7 +168,7 @@ describe('Dashboard pipeline-error KPI', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    await screen.findByRole('button', { name: '2 pipeline errors' });
+    await screen.findByRole('button', { name: '2 failed investigations' });
     const call = listInvestigations.mock.calls.find((c) => c[0]?.verdict?.length)?.[0];
     expect(call.errorState).toBe('live');
   });
@@ -187,7 +187,7 @@ describe('Dashboard pipeline-error KPI', () => {
         <Dashboard />
       </MemoryRouter>,
     );
-    expect(await screen.findByRole('button', { name: '2+ pipeline errors' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: '2+ failed investigations' })).toBeTruthy();
   });
 });
 
@@ -215,7 +215,7 @@ describe('Dashboard pipeline-error KPI, runs that died without a verdict', () =>
         <Dashboard />
       </MemoryRouter>,
     );
-    expect(await screen.findByRole('button', { name: '3 pipeline errors' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: '3 failed investigations' })).toBeTruthy();
   });
 
   it('stops counting a failed run once it is dismissed', async () => {
@@ -229,7 +229,7 @@ describe('Dashboard pipeline-error KPI, runs that died without a verdict', () =>
         <Dashboard />
       </MemoryRouter>,
     );
-    expect(await screen.findByRole('button', { name: '1 pipeline error' })).toBeTruthy();
+    expect(await screen.findByRole('button', { name: '1 failed investigation' })).toBeTruthy();
   });
 
   // Negative control: a healthy instance grows no tile. Cancelled and
@@ -250,6 +250,6 @@ describe('Dashboard pipeline-error KPI, runs that died without a verdict', () =>
       </MemoryRouter>,
     );
     await screen.findByText('Run r1');
-    expect(screen.queryByText(/pipeline error/)).toBeNull();
+    expect(screen.queryByText(/failed investigation/)).toBeNull();
   });
 });

@@ -54,7 +54,8 @@ describe('Runbooks list rows', () => {
     render(<Runbooks />);
     const updated = await screen.findByTestId('runbook-updated-42');
     expect(updated.textContent).toMatch(/^updated \d+(?:d|mo|y) ago$/);
-    expect(updated.getAttribute('title')).toMatch(/^2026-07-1[34] \d{2}:\d{2} \S+$/);
+    // Round 3, T3: the tooltip of a relative time states UTC and the local time.
+    expect(updated.getAttribute('title')).toMatch(/^2026-07-14 \d{2}:\d{2} UTC\. Local time: 2026-07-1[34] \d{2}:\d{2} \S+$/);
   });
 
   // The intro named the internal tool. The operator reads what the model does.

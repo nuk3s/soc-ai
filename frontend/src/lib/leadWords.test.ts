@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   HUNT_AGAIN_CLOSE,
+  LEAD_OUTCOME_WORDS,
   agoWords,
   entityCountWords,
   huntAgainWords,
@@ -9,12 +10,14 @@ import {
   moreEntityWords,
   kindCount,
   leadHuntLabel,
+  leadHuntResult,
   leadHuntSentence,
   leadSeenSentence,
   leadStateSentence,
   leadWaitSentence,
   runTime,
   staleHuntSentence,
+  stoppedHuntWords,
 } from './leadWords';
 import { ago } from './timeRange';
 
@@ -137,16 +140,16 @@ describe('huntRecordSentence', () => {
 
   it('states the threat count and the newest answer', () => {
     expect(huntRecordSentence([clean, threat, threat, threat])).toBe(
-      '3 of 4 hunts found a threat. The newest hunt found none.',
+      '3 of 4 hunts found a threat. The newest lead hunt found none.',
     );
     expect(huntRecordSentence([threat, clean])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt found a threat.',
+      '1 of 2 hunts found a threat. The newest lead hunt found a threat.',
     );
     expect(huntRecordSentence([{ status: 'running', outcome: '' }, threat])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt is running.',
+      '1 of 2 hunts found a threat. The newest lead hunt is running.',
     );
     expect(huntRecordSentence([{ status: 'complete', outcome: 'failed' }, clean])).toBe(
-      '0 of 2 hunts found a threat. The newest hunt could not run.',
+      '0 of 2 hunts found a threat. The newest lead hunt could not run.',
     );
   });
 
@@ -157,13 +160,13 @@ describe('huntRecordSentence', () => {
     const confirmed = { status: 'complete', outcome: 'threats_confirmed' };
     const refuted = { status: 'complete', outcome: 'no_threat_confirmed' };
     expect(huntRecordSentence([confirmed, threat, threat])).toBe(
-      '3 of 3 hunts found a threat. The newest hunt confirmed a threat.',
+      '3 of 3 hunts found a threat. The newest lead hunt confirmed a threat.',
     );
     expect(huntRecordSentence([refuted, threat])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt confirmed no threat.',
+      '1 of 2 hunts found a threat. The newest lead hunt confirmed no threat.',
     );
     expect(huntRecordSentence([{ status: 'investigating', outcome: 'investigating' }, threat])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt investigates its findings.',
+      '1 of 2 hunts found a threat. The newest lead hunt investigates its findings.',
     );
   });
 
@@ -173,13 +176,13 @@ describe('huntRecordSentence', () => {
     const found = { status: 'complete', outcome: 'threat_found' };
     const none = { status: 'complete', outcome: 'no_threat' };
     expect(huntRecordSentence([none, found, threat])).toBe(
-      '2 of 3 hunts found a threat. The newest hunt found none.',
+      '2 of 3 hunts found a threat. The newest lead hunt found none.',
     );
     expect(huntRecordSentence([{ status: 'complete', outcome: 'could_not_run' }, found])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt could not run.',
+      '1 of 2 hunts found a threat. The newest lead hunt could not run.',
     );
     expect(huntRecordSentence([{ status: 'error', outcome: '' }, found])).toBe(
-      '1 of 2 hunts found a threat. The newest hunt could not run.',
+      '1 of 2 hunts found a threat. The newest lead hunt could not run.',
     );
   });
 
@@ -221,9 +224,59 @@ describe('leadHuntLabel', () => {
 
   // Negative control: a hunt that did not complete has no threat count to state.
   it('states no threat count on a hunt that ended in error', () => {
+    // The steps move to the outcome words of the row (dogfood 2026-11-17, b08).
     const label = leadHuntLabel({ ...DONE, status: 'error' });
-    expect(label).toBe('Lead hunt · 17 steps · 6 min');
+    expect(label).toBe('Lead hunt · 6 min');
     expect(label).not.toContain('threat');
+  });
+});
+
+// Dogfood 2026-11-17, b08: "14 steps · 3 min · Failed · Could not run" for a
+// hunt that ran 14 steps and then stopped. "Could not run" is for a hunt
+// with no step.
+describe('a hunt that stopped after its steps', () => {
+  it('states the stop and the steps', () => {
+    expect(stoppedHuntWords({ status: 'error', steps: 14 })).toBe('Stopped with an error after 14 steps');
+    expect(stoppedHuntWords({ status: 'cancelled', steps: 1 })).toBe('Cancelled after 1 step');
+    expect(
+      huntRecordSentence([
+        { status: 'error', outcome: 'failed', steps: 14 },
+        { status: 'error', outcome: 'failed', steps: 2 },
+      ]),
+    ).toBe('0 of 2 hunts found a threat. The newest lead hunt stopped with an error after 14 steps.');
+    expect(
+      leadHuntSentence({ hunts: [{ status: 'error', outcome: 'failed', started_at: null, steps: 14 }] }),
+    ).toBe('The newest lead hunt stopped with an error after 14 steps.');
+  });
+
+  it('keeps "could not run" for a hunt with no step', () => {
+    expect(stoppedHuntWords({ status: 'error', steps: 0 })).toBeNull();
+    expect(stoppedHuntWords({ status: 'complete', steps: 9 })).toBeNull();
+    expect(leadHuntSentence({ hunts: [{ status: 'error', outcome: 'failed', started_at: null, steps: 0 }] })).toBe(
+      'The newest lead hunt could not run.',
+    );
+    expect(leadHuntLabel({ status: 'error', steps: 0, elapsed_sec: 360, threat_findings: 0 })).toBe(
+      'Lead hunt · 0 steps · 6 min',
+    );
+  });
+});
+
+// Dogfood 2026-11-17, b05: the lead card on the host page read "found a
+// threat" beside the pill "Closed. No threat confirmed.". The card and the
+// lead page read one word map for one outcome code.
+describe('one outcome sentence for a lead', () => {
+  it('reads the verdict outcome in the card and on the page', () => {
+    const lead = { hunt_id: 'h1', hunt_status: 'complete', hunt_outcome: 'no_threat_confirmed', hunt_threat_count: 0 };
+    expect(leadHuntResult(lead)).toEqual({ key: 'no_threat', words: 'confirmed no threat' });
+    expect(
+      leadHuntSentence({ hunts: [{ status: 'complete', outcome: 'no_threat_confirmed', started_at: null }] }),
+    ).toBe('The newest lead hunt confirmed no threat.');
+    // The negative control: a confirmed threat stays a threat in both.
+    expect(leadHuntResult({ ...lead, hunt_outcome: 'threats_confirmed', hunt_threat_count: 1 })).toEqual({
+      key: 'threat',
+      words: 'confirmed a threat',
+    });
+    expect(LEAD_OUTCOME_WORDS.threats_confirmed).toBe('confirmed a threat');
   });
 });
 
@@ -276,16 +329,16 @@ describe('leadHuntSentence', () => {
 
   it('states when the newest hunt ran and what it found', () => {
     expect(leadHuntSentence({ hunts: [hunt({})] }, NOW)).toBe(
-      'The newest hunt ran 39 days ago and found no threat.',
+      'The newest lead hunt ran 39 days ago and found no threat.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ outcome: 'threats' })] }, NOW)).toBe(
-      'The newest hunt ran 39 days ago and found a threat.',
+      'The newest lead hunt ran 39 days ago and found a threat.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ outcome: 'threats_confirmed' })] }, NOW)).toBe(
-      'The newest hunt ran 39 days ago and confirmed a threat.',
+      'The newest lead hunt ran 39 days ago and confirmed a threat.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ outcome: 'gap' })] }, NOW)).toBe(
-      'The newest hunt ran 39 days ago. It found no threat and reported a visibility gap.',
+      'The newest lead hunt ran 39 days ago. It found no threat and reported a visibility gap.',
     );
   });
 
@@ -295,7 +348,7 @@ describe('leadHuntSentence', () => {
 
   it('keeps an earlier threat beside a newer clean hunt', () => {
     expect(leadHuntSentence({ hunts: [hunt({})], hunt_threat_count: 1 }, NOW)).toBe(
-      'The newest hunt ran 39 days ago and found no threat. An earlier hunt found a threat.',
+      'The newest lead hunt ran 39 days ago and found no threat. An earlier hunt found a threat.',
     );
   });
 
@@ -305,20 +358,20 @@ describe('leadHuntSentence', () => {
       'A hunt runs on this lead now.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ status: 'investigating', outcome: 'threats' })] }, NOW)).toBe(
-      'The newest hunt investigates its findings now.',
+      'The newest lead hunt investigates its findings now.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ status: 'error', outcome: 'failed' })] }, NOW)).toBe(
-      'The newest hunt could not run.',
+      'The newest lead hunt could not run.',
     );
     expect(leadHuntSentence({ hunts: [hunt({ outcome: 'no_answer' })] }, NOW)).toBe(
-      'The newest hunt ran 39 days ago and gave no answer.',
+      'The newest lead hunt ran 39 days ago and gave no answer.',
     );
   });
 
   it('reads the lead record when the server names no hunt list', () => {
     expect(
       leadHuntSentence({ hunt_id: 'H', hunt_status: 'complete', hunt_outcome: 'clean' }, NOW),
-    ).toBe('The newest hunt found no threat.');
+    ).toBe('The newest lead hunt found no threat.');
     expect(leadHuntSentence({ hunt_id: null }, NOW)).toBe('No hunt ran on this lead.');
   });
 });
@@ -357,6 +410,17 @@ describe('leadWaitSentence', () => {
       'soc-ai closed the lead. It waits on nothing.',
     );
   });
+
+  // Round 3 part 2 (W4): the words follow the state of the campaign at read time.
+  it('says that the campaign of a closed lead opened again, and the lead stays closed', () => {
+    expect(leadWaitSentence({ state: 'dismissed', dismissedReason: 'campaign_closed', campaignReopened: true })).toBe(
+      'soc-ai closed the lead: an analyst closed the campaign. The campaign opened again and waits on a decision. The lead stays closed.',
+    );
+    // NEGATIVE CONTROL: a campaign that stays closed keeps the words of before.
+    expect(leadWaitSentence({ state: 'dismissed', dismissedReason: 'campaign_closed' })).toBe(
+      'soc-ai closed the lead: an analyst closed the campaign. It waits on nothing.',
+    );
+  });
 });
 
 describe('leadStateSentence', () => {
@@ -377,7 +441,7 @@ describe('leadStateSentence', () => {
       ),
     ).toBe(
       'soc-ai saw 1 rate spike on adguard2 at 192.0.2.33 in 1 hour. ' +
-        'The newest hunt ran 39 days ago and found no threat. ' +
+        'The newest lead hunt ran 39 days ago and found no threat. ' +
         'The lead waits on your decision: dismiss it or hunt again.',
     );
   });

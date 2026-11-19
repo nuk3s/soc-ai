@@ -392,3 +392,16 @@ def test_the_prompt_list_is_empty_with_fewer_than_two_timed_documents() -> None:
     base = _base()
     assert prompt_section([_doc("onlyOneDocument1", base)], focus_ids=None, omitted=0) == ""
     assert prompt_section([], focus_ids=None, omitted=5) == ""
+
+
+def test_utc_text_states_a_grid_time_in_the_utc_form_of_the_console() -> None:
+    """Round 3 part 2, P1: a raw grid time read
+    "2026-11-18T20:41:32.112000+00:00" in analyst text."""
+    from soc_ai.event_time import utc_text
+
+    assert utc_text("2026-11-18T20:41:32.112000+00:00") == "2026-11-18 20:41:32 UTC"
+    assert utc_text("2026-11-18T15:41:32-05:00") == "2026-11-18 20:41:32 UTC"
+    # A naive time is UTC, the clock of the grid.
+    assert utc_text("2026-11-18T20:41:32") == "2026-11-18 20:41:32 UTC"
+    # Negative control: a value that does not parse stays as it is.
+    assert utc_text("now-60m") == "now-60m"

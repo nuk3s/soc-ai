@@ -1027,7 +1027,7 @@ def _dcerpc_summary(
         parts.append(f"{flagged_total} dangerous operation(s) seen ({names})")
     if rare_total:
         parts.append(f"{rare_total} rare-against-busy-baseline operation(s)")
-    return "; ".join(parts) + f" — {distinct_ops} distinct operation(s) total, {scope}."
+    return "; ".join(parts) + f". {distinct_ops} distinct operation(s) in total, {scope}."
 
 
 _DCERPC_HISTOGRAM_DESCRIPTION = (
@@ -1339,9 +1339,8 @@ def _first_seen_summary(
         )
     if baseline_truncated:
         summary += (
-            " Baseline was truncated (more distinct baseline destinations exist than "
-            "the scan captured), so novelty here is approximate — a destination could "
-            "have an uncaptured prior baseline."
+            " The baseline scan was cut, so the novelty is approximate. A new "
+            "destination can have an earlier record that the scan did not read."
         )
     return summary
 
@@ -1549,8 +1548,8 @@ async def first_seen(
             "provenance": provenance,
             "items": [],
             "summary": (
-                "Baseline window contained no data (retention/coverage gap) — "
-                "novelty cannot be determined: with nothing to compare against, "
+                "Baseline window contained no data. Retention or coverage has a "
+                "gap. The novelty cannot be determined: with nothing to compare against, "
                 f"every one of the {recent_destinations} recent destination(s) "
                 "would falsely read as first-seen. Shorten baseline_days to fit "
                 "the data actually retained, or verify the dataset's coverage, "

@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 
 import { ApiError, getEvent, type EventDocument } from '../lib/api';
+import { citationWords } from '../lib/toolLabels';
 import { useAsync } from '../lib/useAsync';
 import { Drawer } from './Drawer';
 import { LoadingInline, Spinner } from './States';
@@ -277,6 +278,21 @@ export function DocumentDrawer({
  *  cites a document id mounts this, so one id behaves the same everywhere. */
 export function DocumentChip({ id, className }: { id: string; className?: string }) {
   const [open, setOpen] = useState(false);
+  // A model can cite a tool call, "t_query_events_oql BPFDoor groupby". It is
+  // no document, so it reads in words from the one label map and opens
+  // nothing. The tooltip keeps the tool name (dogfood 2026-11-17, AB5).
+  const words = citationWords(id);
+  if (words) {
+    return (
+      <span
+        data-testid="citation-words"
+        title={`The record cites a tool result: ${id}`}
+        className="rounded-chip border border-border-2 bg-surface-3 px-1.5 py-px font-sans text-[11px] text-dim"
+      >
+        {words}
+      </span>
+    );
+  }
   return (
     <>
       <button

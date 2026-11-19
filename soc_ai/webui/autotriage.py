@@ -27,12 +27,13 @@ from soc_ai.api.deps import ctx_from_state
 from soc_ai.api.runner import run_recorded
 from soc_ai.errors import OqlValidationError
 from soc_ai.oracle import retry as oracle_retry
+from soc_ai.so_client.elastic import GridQueryRejectedError
 from soc_ai.so_client.fields import get_dotted
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store import rule_prior as rule_prior_store
 from soc_ai.triage_models import is_pipeline_fallback
 from soc_ai.webui import alerts_query as aq
-from soc_ai.webui import autotriage_health
+from soc_ai.webui import autotriage_health, rule_decisions
 from soc_ai.webui.autotriage_health import TriageHealth
 
 _LOGGER = logging.getLogger(__name__)
@@ -327,6 +328,17 @@ def _is_query_class(exc: BaseException) -> bool:
     return False
 
 
+def _is_rejected_filter(exc: BaseException, oql: str | None) -> bool:
+    """True when the grid rejected a read that carries the analyst's filter.
+
+    The grid answered and the query was wrong for a field
+    (:class:`GridQueryRejectedError`). With an analyst filter that is the
+    analyst's to correct, and the route answers 400 ``query_rejected``. With
+    no filter the read is soc-ai's own and keeps the degraded mark of today.
+    """
+    return isinstance(exc, GridQueryRejectedError) and bool((oql or "").strip())
+
+
 async def _read_backlog(
     state: Any,
     *,
@@ -357,7 +369,7 @@ async def _read_backlog(
             all_groups.extend(page.groups)
             severities_read += 1
         except Exception as exc:
-            if _is_query_class(exc):
+            if _is_query_class(exc) or _is_rejected_filter(exc, oql):
                 raise
             _LOGGER.exception("auto-triage: fetch_groups failed for severity=%s", severity)
             # These labels are shown to the operator, so the unlabelled read
@@ -393,7 +405,7 @@ async def _read_backlog(
                 size=20,
             )
         except Exception as exc:
-            if _is_query_class(exc):
+            if _is_query_class(exc) or _is_rejected_filter(exc, oql):
                 raise
             _LOGGER.exception("auto-triage: fetch_group_events failed for rule=%s", group.rule_name)
             grid_errors.append(f"rule {group.rule_name}")
@@ -900,7 +912,7 @@ def _log_not_acked_once(cand: InheritedAck) -> None:
     )
 
 
-async def _ack_inherited_fps(
+async def _ack_inherited_fps(  # noqa: PLR0915 - one ordered chain of guards for each candidate
     state: Any,
     ctx: Any,
     acks: list[InheritedAck],
@@ -948,6 +960,13 @@ async def _ack_inherited_fps(
         list(dict.fromkeys(a.alert_es_id for a in acks)),
         list(dict.fromkeys(a.inherited_from for a in acks)),
     )
+    # The standing rule decisions in force (round 3, RS5). Each lifts the hold
+    # high_stakes for its rule and no other guard. An unreadable store lifts
+    # nothing.
+    standing = await rule_decisions.standing_for_rules(
+        state.db_sessionmaker, {a.rule_name for a in acks}
+    )
+    under: dict[int, int] = {}
     try:
         lookup = await state.elastic.search(
             state.settings.events_index_pattern,
@@ -985,9 +1004,12 @@ async def _ack_inherited_fps(
         except Exception:
             _LOGGER.warning("auto-triage: unparseable alert %s — not acking", cand.alert_es_id)
             continue
+        decision: int | None = None
         if _is_high_stakes_alert(alert):
-            _bump(status.inherited_refused, "high_stakes")
-            continue
+            decision = (standing or {}).get(cand.rule_name)
+            if decision is None:
+                _bump(status.inherited_refused, "high_stakes")
+                continue
         if (refused := _earlier_runs_refusal(earlier_tp, cand.alert_es_id)) is not None:
             # An earlier run of this alert leaned true positive, or the store
             # did not answer. A sibling's false positive does not close it
@@ -1012,6 +1034,8 @@ async def _ack_inherited_fps(
             )
         else:
             status.inherited_acked += 1
+            if decision is not None:
+                under[decision] = under.get(decision, 0) + 1
             written.setdefault(cand.inherited_from, []).append(cand.alert_es_id)
             rule_of.setdefault(cand.inherited_from, cand.rule_name)
             _LOGGER.info(
@@ -1021,31 +1045,39 @@ async def _ack_inherited_fps(
                 cand.confidence,
                 cand.inherited_from,
             )
-        await _record_inherited_ack_provenance(ctx, cand, ok=not error)
+        await _record_inherited_ack_provenance(ctx, cand, ok=not error, rule_decision=decision)
     await _persist_inherited_acks(state, status, written, rule_of)
+    await rule_decisions.count_under(state.db_sessionmaker, under)
 
 
-async def _record_inherited_ack_provenance(ctx: Any, cand: InheritedAck, *, ok: bool) -> None:
+async def _record_inherited_ack_provenance(
+    ctx: Any, cand: InheritedAck, *, ok: bool, rule_decision: int | None = None
+) -> None:
     """Audit the ack with the investigation whose verdict authorized it.
 
     Best-effort and never raises: ``execute_write_tool`` has already written the
     fail-closed intent record, so a lost provenance line must not turn a
     completed SO write into an exception that aborts the rest of the sweep.
+    ``rule_decision`` names the standing rule decision that lifted the hold
+    ``high_stakes`` for this ack, when one did.
     """
     audit = getattr(ctx, "audit", None)
     if audit is None:
         return
+    payload: dict[str, Any] = {
+        "alert_id": cand.alert_es_id,
+        "inherited_from": cand.inherited_from,
+        "rule_name": cand.rule_name,
+        "confidence": cand.confidence,
+        "ok": ok,
+    }
+    if rule_decision is not None:
+        payload["rule_decision"] = rule_decision
     try:
         await audit.log_kind(
             f"auto-ack-inherited:{cand.alert_es_id}",
             "auto_ack_inherited",
-            {
-                "alert_id": cand.alert_es_id,
-                "inherited_from": cand.inherited_from,
-                "rule_name": cand.rule_name,
-                "confidence": cand.confidence,
-                "ok": ok,
-            },
+            payload,
             user="auto-ack:inherited",
             approved_by="auto-ack:inherited",
         )

@@ -15,6 +15,38 @@
   single write path, and it runs through the audited `execute_write_tool` in
   `soc_ai/tools/write_exec.py`.
 
+## Auto-acknowledge
+
+The auto-acknowledge is the one write that runs with no click of the analyst. The
+auto-acknowledge writes `ack_alert` for a confident false positive through
+`execute_write_tool`. `auto_ack_fp_enabled` turns on the auto-acknowledge, and the
+default is off.
+
+The write needs a false positive verdict with a confidence at or above
+`auto_ack_fp_threshold`. The investigation must have retrieved evidence, and the
+report must cite evidence that resolves. An analyst verdict other than false
+positive holds the write. An earlier true positive investigation of the alert and
+an Oracle dissent also hold the write.
+
+The auto-acknowledge also holds a high-stakes alert. An alert is high-stakes when
+one of these facts is true:
+
+- The severity is critical or high.
+- The classification names an exploit, an attack, malware or command and control.
+- The rule name or a rule tag signals malware or an exploit.
+- A deception sensor raised the alert.
+
+A high severity alone does not make one alert high-stakes: a Suricata alert of the
+classification policy violation or inappropriate content, with each signature
+severity Informational.
+
+An analyst can lift the hold for a high-stakes alert for one rule with a standing
+rule decision. The term is `rule_decision_days`, and the default is 30 days. The
+decision ends after the term or when the analyst ends the decision. A true positive
+verdict on an investigation of the rule ends the decision at once. Every other guard
+stays. soc-ai refuses a standing decision for a rule that holds a true positive
+verdict. soc-ai also refuses a standing decision while `auto_ack_fp_enabled` is off.
+
 ## Audit log hardening
 
 soc-ai writes every LLM input, every LLM output and every tool invocation to a

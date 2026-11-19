@@ -186,7 +186,7 @@ def imports_note(count: int | None) -> str:
     return (
         f" This grid does hold {count} imported or replayed document(s) matching it, "
         "excluded here because backfill is somebody else's network rather than "
-        "something a sensor here observed. They are real and queryable — ask for "
+        "something a sensor here observed. They are real and queryable. Ask for "
         "provenance='any' to include them."
     )
 

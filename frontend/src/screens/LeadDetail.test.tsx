@@ -402,7 +402,7 @@ describe('LeadDetail hunts on the lead', () => {
     } as never);
     mount();
     const record = await screen.findByTestId('lead-hunt-record');
-    expect(record.textContent).toBe('3 of 4 hunts found a threat. The newest hunt found none.');
+    expect(record.textContent).toBe('3 of 4 hunts found a threat. The newest lead hunt found none.');
     expect(screen.getByTestId('lead-status').textContent).toBe(
       'Hunted · An earlier hunt found a threat',
     );
@@ -468,9 +468,10 @@ describe('LeadDetail hunts on the lead', () => {
   // record states the status and the outcome, so the row reads those.
   it.each([
     ['running', 'Running'],
-    // The label map reads every stop as "Failed". The hover names the cause.
-    ['error', 'Failed'],
-    ['interrupted', 'Failed'],
+    // A stop with no step reads "Could not run", the words of the Hunts list,
+    // the hunt page and the campaign fold (F5). The hover names the cause.
+    ['error', 'Could not run'],
+    ['interrupted', 'Could not run'],
   ])('states the lead\'s own %s hunt when the server sends no list', async (status, label) => {
     vi.mocked(getLead).mockResolvedValue({
       ...LEAD,
@@ -486,6 +487,42 @@ describe('LeadDetail hunts on the lead', () => {
     expect(within(panel).getByText(label)).toBeTruthy();
     expect(within(panel).queryByText('Complete')).toBeNull();
     expect(within(panel).queryByText(/threat finding/)).toBeNull();
+  });
+
+  // Dogfood 2026-11-17, b08: "14 steps · 3 min · Failed · Could not run" for
+  // a hunt that ran 14 steps and then stopped.
+  it('states a hunt that stopped after its steps in one chip', async () => {
+    const stopped = {
+      id: 'H-STOP',
+      status: 'error',
+      outcome: 'failed',
+      outcome_label: 'Could not run',
+      threat_findings: 0,
+      steps: 14,
+      elapsed_sec: 180,
+      started_at: null,
+      started_by: 'auto-hunt',
+      answer: '',
+      not_checked: [],
+    };
+    const empty = { ...stopped, id: 'H-NONE', steps: 0 };
+    vi.mocked(getLead).mockResolvedValue({
+      ...LEAD,
+      hunt_id: 'H-STOP',
+      hunt_status: 'error',
+      hunts: [stopped, empty],
+    } as never);
+    mount();
+    const panel = await screen.findByTestId('lead-hunts');
+    expect(within(panel).getByTestId('lead-hunt-stopped-H-STOP').textContent).toBe(
+      'Stopped with an error after 14 steps',
+    );
+    expect(within(panel).queryByTestId('lead-hunt-outcome-H-STOP')).toBeNull();
+    // The negative control: a hunt with no step could not run. One chip
+    // states it, so the row no longer reads "Failed · Could not run".
+    expect(within(panel).getByTestId('lead-hunt-stopped-H-NONE').textContent).toBe('Could not run');
+    expect(within(panel).queryByTestId('lead-hunt-outcome-H-NONE')).toBeNull();
+    expect(within(panel).queryByText('Failed')).toBeNull();
   });
 
   it('carries the outcome, not a count it never read, on a finished hunt the list left out', async () => {
@@ -653,7 +690,7 @@ describe('LeadDetail dismissal and reopen', () => {
     } as never);
     mount();
     const chip = await screen.findByTestId('lead-status');
-    expect(chip.textContent).toBe('Closed. No threat found.');
+    expect(chip.textContent).toBe('Closed. The lead hunt found no threat.');
     expect(screen.getByTestId('lead-closed-reason').textContent).toBe('closed by soc-ai');
     const event = screen.getByTestId('lead-dismissal');
     expect(event.textContent).toContain('by soc-ai. No threat found.');

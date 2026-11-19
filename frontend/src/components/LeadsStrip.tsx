@@ -30,6 +30,7 @@ import { huntOutcome, outcomeLabel, outcomeMeta } from '../lib/labels';
 import { formedFromBacktest, holdSentence } from '../lib/leadDecisions';
 import {
   HUNT_AGAIN_CLOSE,
+  LEAD_OUTCOME_WORDS,
   campaignLeadSentence,
   leadHuntResult,
   moreEntityWords,
@@ -37,7 +38,7 @@ import {
   withStop,
 } from '../lib/leadWords';
 import { plural } from '../lib/plural';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import {
   ACTION_HUNT,
   ACTION_HUNT_NOW,
@@ -54,8 +55,6 @@ import {
   CLOSE_RULE,
   FLEET_CONDITION_LINE,
   INVESTIGATION_GONE,
-  LEADS_NOTE_AUTO_HUNT,
-  LEGEND_AUTO_HUNT,
   PILL_CLOSED_BY_HUNT,
   PILL_CLOSED_ON_VERDICTS,
   LEAD_LEGEND,
@@ -82,7 +81,7 @@ import { useAsync } from '../lib/useAsync';
 import { useListSelection } from '../lib/useListSelection';
 import { CampaignChip } from './campaign/CampaignChip';
 import { Checkbox } from './Controls';
-import { Definition } from './Definition';
+import { HowLeadsWork, leadStatusLegend } from './HowLeadsWork';
 import { SelectionStrip } from './ListToolbar';
 import { CollapseChevron } from './Panel';
 import { LoadingInline } from './States';
@@ -194,7 +193,11 @@ export const HUNT_CLEAN_REASON = 'hunt_clean';
 /** The settle rule closes a lead on a clean hunt only, so the closure names
  *  that outcome in the words of lib/labels.ts. */
 export const HUNT_CLOSED_OUTCOME = `${outcomeLabel('no_threat')}.`;
-export const HUNT_CLOSED_LABEL = `Closed. ${HUNT_CLOSED_OUTCOME}`;
+/** The pill names whose conclusion it states: the lead hunt. A pill read
+ *  "Closed. No threat confirmed." above a true positive of another
+ *  investigation on the card (dogfood 2026-11-17, F12). The words come from
+ *  the one outcome map of a lead (lib/leadWords LEAD_OUTCOME_WORDS). */
+export const HUNT_CLOSED_LABEL = `Closed. The lead hunt ${LEAD_OUTCOME_WORDS.no_threat}.`;
 /** The hand the server signs that closure with reads as the product on screen. */
 export const HUNT_CLOSED_ACTOR = 'soc-ai';
 
@@ -223,6 +226,11 @@ const SYSTEM_HUNT_ACTOR = 'system:hunt';
  *  the server sends it. */
 export function closedOnVerdictsLabel(label: string | null | undefined): string {
   const words = (label ?? '').trim().replace(/\.$/, '');
+  // A clean answer of the lead hunt names the lead hunt. A label with counts
+  // keeps its counts.
+  if (words === outcomeLabel('no_threat_confirmed')) {
+    return `Closed. The lead hunt ${LEAD_OUTCOME_WORDS.no_threat_confirmed}.`;
+  }
   return words ? `Closed. ${words}.` : `Closed. ${CLOSE_RULE}`;
 }
 
@@ -560,7 +568,7 @@ export const STATUS_LEGEND = LEAD_LEGEND;
 /** The legend, with the sentence auto-hunt adds. With the loop on, New no
  *  longer means "hunt it": it means the hunt is coming. */
 export function statusLegend(autoHunt: boolean): string {
-  return autoHunt ? `${STATUS_LEGEND} ${LEGEND_AUTO_HUNT}` : STATUS_LEGEND;
+  return leadStatusLegend(autoHunt);
 }
 
 /**
@@ -987,7 +995,7 @@ function LeadRow({
       </span>
       <span
         className="text-[11.5px] text-dim"
-        title={lead.formed_at ? absTime(lead.formed_at) : undefined}
+        title={lead.formed_at ? timeTitle(lead.formed_at) : undefined}
       >
         formed {ago(lead.formed_at)}
       </span>
@@ -2273,35 +2281,10 @@ export function LeadsStrip({
                 {leadsOfCampaignNote(inCampaign)}
               </span>
             )}
-            {/* The four words are a taxonomy. A taxonomy nobody can read is a
-                filter an analyst guesses at. */}
-            <span
-              data-testid="leads-legend"
-              className="basis-full text-[10.5px] font-normal normal-case tracking-normal text-faint"
-            >
-              {statusLegend(autoHunt)}
-            </span>
           </span>
           )}
         </span>
         <span className="flex items-center gap-2.5">
-          {/* The one thing an analyst must know before reading the list: who
-              acts on a lead. The 1.5.0 dogfood read the strip as a queue the
-              system was already working, and with the loop on it is exactly
-              that, so the note says which of the two this deployment is. */}
-          <span
-            data-testid="leads-note"
-            className="text-[11px] text-dim"
-            title={
-              autoHunt
-                ? LEADS_NOTE_AUTO_HUNT
-                : 'soc-ai records leads. It does not start a hunt from a lead by itself. An analyst starts every hunt from a lead in this release.'
-            }
-          >
-            {autoHunt
-              ? LEADS_NOTE_AUTO_HUNT
-              : 'soc-ai records leads. It does not start a hunt from a lead by itself.'}
-          </span>
           {paramEntity && (
             <span
               data-testid="leads-entity-filter"
@@ -2329,9 +2312,11 @@ export function LeadsStrip({
           )}
         </span>
       </div>
-      {/* What a lead is, before the leads. The definition stays while the
-          section is folded: a folded block still says what it holds. */}
-      <Definition of="lead" className="px-[15px] pt-2" />
+      {/* What a lead is, the four states and who starts a hunt, behind one
+          closed disclosure (dogfood 2026-11-17, N8). The leads are the facts
+          of the section, and the policy repeated on three pages above them.
+          The disclosure stays while the section is folded. */}
+      <HowLeadsWork autoHunt={autoHunt} className="px-[15px] pt-2" />
       {collapsed ? (
         <div id={LEADS_BODY_ID} className="pb-2" />
       ) : (

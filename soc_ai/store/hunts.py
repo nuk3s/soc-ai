@@ -38,7 +38,14 @@ from soc_ai.secret_scrub import (
 from soc_ai.store import chat_memory
 from soc_ai.store import investigations as inv_svc
 from soc_ai.store.auth import utcnow
-from soc_ai.store.models import Hunt, HuntEvent, HuntSpecState, Investigation, Lead
+from soc_ai.store.models import (
+    Hunt,
+    HuntAnswer,
+    HuntEvent,
+    HuntSpecState,
+    Investigation,
+    Lead,
+)
 
 STATUS_RUNNING = "running"
 STATUS_COMPLETE = "complete"
@@ -1196,6 +1203,8 @@ async def delete(db: AsyncSession, hunt_id: str) -> bool:
         sa_update(HuntSpecState).where(HuntSpecState.hunt_id == hunt_id).values(hunt_id=None)
     )
     await db.execute(sa_delete(HuntEvent).where(HuntEvent.hunt_id == hunt_id))
+    # The answers of the hunt name it (migration 0074).
+    await db.execute(sa_delete(HuntAnswer).where(HuntAnswer.hunt_id == hunt_id))
     # The hunt's chat thread was projected into chat_memory (dual-write below) —
     # remove it in the same transaction so a deleted hunt can't keep echoing
     # into future prompts via retrieval.

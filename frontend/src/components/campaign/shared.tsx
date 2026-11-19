@@ -8,86 +8,65 @@ import type {
   CampaignDecisionType,
   CampaignPartyBrief,
   CampaignStage,
+  CampaignState,
   CampaignStatus,
 } from '../../lib/api';
-import { decisionState } from '../../lib/campaignDecision';
+import { campaignState, stateWaits } from '../../lib/campaignDecision';
 import {
-  DECISION_CHIP_LABEL,
-  DECISION_CHIP_TITLE,
-  authorizedChipLabel,
-  authorizedChipTitle,
   beyondCountTitle,
-  caseChipLabel,
-  caseChipTitle,
   beyondCountWords,
   partyName,
   stageLabel,
-  statusLabel,
+  stateChipTitle,
+  stateLabel,
 } from '../../lib/campaignWords';
 import { stageColor } from '../../lib/campaignViz';
 import { machineHref } from '../../lib/hostsList';
 
-// The small parts the list page and the campaign page share: the two chips
-// and the name of a machine as a link to its host page.
+// The small parts the list page and the campaign page share: the state chip,
+// the stage chip and the name of a machine as a link to its host page.
 
 const CHIP =
   'inline-flex flex-none items-center whitespace-nowrap rounded-chip border px-1.5 py-px text-[10.5px]';
 
-/** The status of a campaign. Open wears the accent; the rest read neutral. */
-export function CampaignStatusChip({ status }: { status: CampaignStatus }) {
-  const tone =
-    status === 'open'
-      ? 'border-accent/40 bg-accent/10 text-accent'
-      : 'border-border-strong bg-surface-2 text-text-2';
-  return (
-    <span data-testid="campaign-status" className={`${CHIP} ${tone}`}>
-      {statusLabel(status)}
-    </span>
-  );
-}
-
-/** The decision state of a campaign on a list row: "Waits on you" in the
- *  warning tone, because it is work, or the decision in a neutral tone. An
- *  authorized chip states its expiry. A case chip states the day of the case
- *  when the payload carries the case: the detail does, and a list row of
- *  this release does not. A campaign that is not active, or a server with no
- *  decision field, renders nothing. */
-export function CampaignDecisionChip({
+/** The one state of a campaign (DC1, round "decide once"): Open, Ended,
+ *  Closed, Authorized, Case, Merged or Withdrawn, with a one-sentence hover
+ *  text. The state is the decision in force, else the activity status, so
+ *  no page shows "Open" beside "Closed". A campaign that waits on a decision
+ *  wears the warning tone, because it is work. A decision and a campaign
+ *  that is not active read neutral. */
+export function CampaignStateChip({
   campaign,
 }: {
   campaign: {
     status: CampaignStatus;
+    state?: CampaignState | '' | null;
     decision?: CampaignDecision | CampaignDecisionType | null;
-    /** The authorization of the campaign: an authorized chip states its expiry. */
+    /** The authorization of the campaign: the hover text states its expiry. */
     authorization?: Pick<CampaignAuthorizationRecord, 'expiresAt' | 'state'> | null;
-    /** The case of the campaign: a case chip states its day. */
+    /** The case of the campaign: the hover text states its time. */
     case?: Pick<CampaignCase, 'openedAt'> | null;
   };
 }) {
-  const state = decisionState(campaign);
-  if (state === 'unknown') return null;
-  const tone =
-    state === 'waits' ? 'border-warn/40 bg-warn/10 text-warn' : 'border-border-strong bg-surface-2 text-text-2';
-  const a = state === 'authorized' ? campaign.authorization : null;
-  const openedAt = state === 'case' ? campaign.case?.openedAt : null;
-  const title = a
-    ? authorizedChipTitle(a)
-    : state === 'case'
-      ? caseChipTitle(openedAt)
-      : (DECISION_CHIP_TITLE[state] ?? '');
-  const word = a
-    ? authorizedChipLabel(a)
-    : state === 'case'
-      ? caseChipLabel(openedAt)
-      : (DECISION_CHIP_LABEL[state] ?? String(state));
+  const state = campaignState(campaign);
+  const waits = stateWaits(campaign);
+  const tone = waits ? 'border-warn/40 bg-warn/10 font-semibold text-warn' : 'border-border-strong bg-surface-2 text-text-2';
+  const title = stateChipTitle({
+    state,
+    waits,
+    authorization: campaign.authorization,
+    caseOpenedAt: campaign.case?.openedAt,
+    ended: campaign.status === 'ended',
+  });
   return (
     <span
-      data-testid="campaign-decision-chip"
+      data-testid="campaign-state"
       data-state={state}
-      title={title}
-      className={`${CHIP} ${tone} ${state === 'waits' ? 'font-semibold' : ''}`}
+      data-waits={waits}
+      title={title || undefined}
+      className={`${CHIP} ${tone}`}
     >
-      {word}
+      {stateLabel(state)}
     </span>
   );
 }

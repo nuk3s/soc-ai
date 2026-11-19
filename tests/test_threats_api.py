@@ -239,11 +239,32 @@ def _parse(iso: str) -> datetime:
 
 def test_an_empty_window_has_the_whole_shape(client: TestClient) -> None:
     body = _threats(client)
-    assert set(body) == {"window", "rows", "authorized", "total", "campaigns"}
+    assert set(body) == {
+        "window",
+        "rows",
+        "authorized",
+        "total",
+        "campaigns",
+        "waiting",
+        "waitingHosts",
+        "waitingHref",
+        "waitingInCampaigns",
+        "waitingCampaigns",
+        "decided",
+        "earlier",
+    }
     assert body["rows"] == []
     assert body["authorized"] == []
     assert body["campaigns"] == []
     assert body["total"] == 0
+    assert (body["waiting"], body["waitingHosts"]) == (0, 0)
+    assert body["decided"] == {"campaigns": 0, "investigations": 0}
+    assert body["earlier"] == {
+        "campaigns": 0,
+        "investigations": 0,
+        "decision": None,
+        "decidedAt": None,
+    }
     # The default window is the last 24 hours.
     since, until = _parse(body["window"]["since"]), _parse(body["window"]["until"])
     assert until - since == timedelta(hours=24)
@@ -841,10 +862,16 @@ CAMPAIGN_ROW_KEYS = {
     "members",
     "alerts",
     "decision",
+    "state",
     "waitsSince",
     "authorization",
     "beyond",
     "case",
+    "sinceDecision",
+    "alertsReadAt",
+    "alertsBehind",
+    "lastAlertAt",
+    "lastActivity",
 }
 THREAT_CAMPAIGN_KEYS = CAMPAIGN_ROW_KEYS | {"investigations", "waiting", "authorized"}
 

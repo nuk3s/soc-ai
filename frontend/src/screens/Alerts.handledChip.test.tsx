@@ -145,7 +145,7 @@ describe('the campaign chip of a group', () => {
     await showGroup({ ...GROUP, verdict: 'true_positive', campaign: LINK });
     const chip = screen.getByTestId('alert-campaign-es-1');
     expect(chip).toHaveAttribute('href', '/campaigns/7');
-    expect(chip).toHaveAccessibleName(/^Campaign: actor-a against web-1\./);
+    expect(chip).toHaveAccessibleName(/^Campaign 7 · \w+: actor-a against web-1\./);
     expect(forbiddenWords(screen.getByTestId('alert-tags-es-1'))).toEqual([]);
   });
 

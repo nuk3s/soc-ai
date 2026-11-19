@@ -1155,8 +1155,14 @@ async def _authorized_expiry_loop(app: Any) -> None:
     ``expires_at``. This loop wakes once a minute and writes one audit record
     for each such row (:func:`soc_ai.agent.authorized_activity.record_expiries`).
     A failed wake is logged, and the next wake tries again.
+
+    The same wake asks the grid for the alerts of the open false positives
+    of each rule, in bounded batches, and stores the answer
+    (:func:`soc_ai.webui.rule_decisions.background_step`). A failed read
+    keeps the last state.
     """
     from soc_ai.agent import authorized_activity  # noqa: PLC0415
+    from soc_ai.webui import rule_decisions  # noqa: PLC0415
 
     while True:
         await asyncio.sleep(60)
@@ -1164,6 +1170,10 @@ async def _authorized_expiry_loop(app: Any) -> None:
             await authorized_activity.record_expiries(app.state)
         except Exception:
             _LOGGER.exception("authorized activity: the expiry record failed")
+        try:
+            await rule_decisions.background_step(app.state)
+        except Exception:
+            _LOGGER.exception("rule decisions: the grid state step failed")
 
 
 async def _tls_expiry_loop(app: Any, settings: Any) -> None:
@@ -1788,6 +1798,23 @@ async def _reap_orphans_at_startup(db_sessionmaker: Any) -> None:
         settled = await leads_store.settle_finished_hunts(db)
     if settled:
         _LOGGER.info("settled %d lead(s) whose hunt had finished, at startup", settled)
+
+    # The answers of the hunts of the last 30 days: what each hunt found for
+    # the campaigns and the leads that it read. A hunt that ended before this
+    # release, or while the process stopped, answers here. Never fatal.
+    from soc_ai.hunting import hunt_answers  # noqa: PLC0415 - startup step
+
+    try:
+        async with db_sessionmaker() as db:
+            answered = await hunt_answers.fill(db, now=datetime.now(UTC).replace(tzinfo=None))
+        if answered:
+            _LOGGER.info("recorded %d hunt answer(s) of earlier hunts, at startup", answered)
+    except Exception:
+        _LOGGER.warning(
+            "soc-ai could not record the answers of earlier hunts at startup. "
+            "The pages show no answer for those hunts.",
+            exc_info=True,
+        )
 
     # Backtests: mark 'error' — a backtest is a one-shot measurement whose replay
     # task died, not a re-huntable target.

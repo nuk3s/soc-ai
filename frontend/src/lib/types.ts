@@ -4,6 +4,7 @@
 // ---------------------------------------------------------------------------
 
 import type { CampaignStage, HostCampaign, InvestigationCampaign } from './api';
+import type { InvestigationRuleDecision, RuleDecisionReceipt } from './api';
 
 export type Verdict =
   | 'true_positive'
@@ -216,6 +217,13 @@ export interface AlertGroup {
   /** The campaign of the investigation that the group names as its verdict.
    *  Null when it is in no campaign. Absent on an older server. */
   campaign?: InvestigationCampaign | null;
+  /** The source and the target of the run behind `invId` and of the run
+   *  behind `windowInvId`. The row shows the hosts of the run whose verdict
+   *  the pill shows. Absent on an older server. */
+  verdictSrc?: string | null;
+  verdictDst?: string | null;
+  windowSrc?: string | null;
+  windowDst?: string | null;
 }
 
 /** Returned by GET /api/v1/alerts/empty-reason: why the queue is showing nothing.
@@ -409,6 +417,13 @@ export interface RecommendedAction {
   note?: string | null;
   /** The page of the note: the campaign page for the code `campaign`. */
   noteHref?: string | null;
+  /** True when the action waits for a person, by the one rule of Needs you.
+   *  The page counts these in "N actions wait for you". An open acknowledge
+   *  of a false positive waits for no one. Absent on an older server. */
+  waits?: boolean;
+  /** The receipt of an acknowledge that a rule decision wrote. Null on every
+   *  other action. Absent on an older server. */
+  ruleDecisionReceipt?: RuleDecisionReceipt | null;
 }
 
 export interface ResolutionProvenance {
@@ -555,6 +570,9 @@ export interface PromotedFinding {
   detail?: string;
   /** The documents the finding cites. */
   citations?: string[];
+  /** The note of a text that names a known machine that is no host of the
+   *  finding. null for no note. Absent from an older server. */
+  nameNote?: string | null;
 }
 
 export interface InvestigationSubject {
@@ -805,6 +823,10 @@ export interface Investigation {
   runClass?: string | null;
   /** Why the run ended in its class. Null when the report does not say. */
   runClassReason?: string | null;
+  /** Set when the investigation is an open false positive: a guard held its
+   *  acknowledge. The card of the Acknowledge links the rule page. Null on
+   *  every other investigation. Absent on an older server. */
+  ruleDecision?: InvestigationRuleDecision | null;
 }
 
 /** One citation of the report. `kind` is 'id', 'run', 'path', 'tool' or 'unknown'. */
@@ -937,6 +959,9 @@ export interface InvestigationRow {
    *  the list names this machine in place of a flow. Absent on an older
    *  backend and null on a row whose alert named no machine. */
   hostName?: string | null;
+  /** The hosts that the finding of a finding investigation names, when the
+   *  row holds no source. The list names them with no arrow. */
+  findingHosts?: string[] | null;
   status: 'complete' | 'running' | 'error' | 'cancelled' | 'interrupted';
   /** When soc-ai started the investigation: relative words and ISO time. */
   when: string;
@@ -997,6 +1022,10 @@ export interface InvestigationRow {
   /** The campaign of the investigation. Null when it is in no campaign.
    *  Absent on an older server. */
   campaign?: InvestigationCampaign | null;
+  /** The reason of the impact guard when it lowered "succeeded": "Impact:
+   *  attempted. The report cites no record that proves success." Null when the
+   *  stored report holds no change. Absent on an older server. */
+  impactNote?: string | null;
 }
 
 /** One recommended action that waits for a person, as a list row carries it.
@@ -1050,6 +1079,42 @@ export interface InvestigationList {
   /** Echo of the `entity` filter: every key of the machine the filter read.
    *  Null or absent when the request named no entity. */
   entityKeys?: string[] | null;
+  /** With `tpParts`, the parts of the true positives of the filter set. Null
+   *  when the set outgrew one read. An older server sends none. */
+  truePositiveParts?: TruePositiveParts | null;
+}
+
+/** The true positives of a filter set, split by the rule of the True
+ *  positives tile. The parts add up to `total`. */
+export interface TruePositiveParts {
+  total: number;
+  /** The verdict stands, and no decision or authorization holds it. */
+  waiting: number;
+  /** A campaign with a decision in force holds it. */
+  decided: number;
+  /** An authorization mark holds it. */
+  authorized: number;
+  /** A later run of the alert or finding replaced it, or a follow-up answered it. */
+  superseded: number;
+  /** The rest whose verdict does not stand. */
+  other: number;
+  /** The campaigns of the decided part, the most first. */
+  campaigns: { id: number; title: string; state: string; investigations: number }[];
+  /** The analyst decided on the investigation itself: a resolution, each
+   *  action applied or dismissed, or an acknowledge or an escalate of an
+   *  investigation with no action. An older server sends none. */
+  handled?: number;
+  /** The earlier decision of a reopened campaign covered it (W2). An older
+   *  server sends none. */
+  earlier?: number;
+  /** The reopened campaigns of the part `earlier`, the most first. */
+  earlierCampaigns?: {
+    id: number;
+    title: string;
+    investigations: number;
+    decision: string | null;
+    decidedAt: string | null;
+  }[];
 }
 
 // ---- Hunts -----------------------------------------------------------------
@@ -1119,6 +1184,8 @@ export interface HuntRow {
   /** The plain title of the hunt: a catalog run reads "<analytic>, last 24 h"
    *  and a lead hunt "Lead 6 hunt: domainadmin on SR-DC01". */
   title?: string;
+  /** The steps of a hunt that stopped, else null (lib/labels.ts huntStopLabel). */
+  steps?: number | null;
   affectedHosts: number;
   confidence: number | null;
   startedBy: string;
@@ -1363,6 +1430,8 @@ export interface HuntDetailData {
   outcome_headline?: string;
   /** The plain title, the one the bell and the list read. */
   title?: string;
+  /** The steps of a hunt that stopped, else null (lib/labels.ts huntStopLabel). */
+  steps?: number | null;
   /** What a running hunt does now: "the model reads the results". null on a
    *  hunt that has ended. */
   currentStep?: string | null;
@@ -2414,6 +2483,10 @@ export interface HostActivity {
    *  machine's logging that the query never proved. */
   users: UserSeen[] | null;
   alerts_7d: number;
+  /** The alerts of the window the page asked for, 24 hours or 7 days. The
+   *  Alerts card counts it. Absent from an older server: the card then
+   *  reads `alerts_7d` and names 7 days. */
+  alerts?: number;
   latest_investigation: LatestInvestigation | null;
   /** The server ranked and CUT the peer list — rows fell off the end. Decided
    *  by the backend from the pre-cut length; screens must not re-infer it from

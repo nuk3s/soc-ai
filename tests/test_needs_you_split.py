@@ -142,8 +142,18 @@ def _seed_needs_you_runs(client: TestClient) -> None:
         actions=[_ESCALATE, second],
         hours_ago=1,
     )
-    # The runs below wait on nobody.
-    _seed_run(client, "INV-TP-BARE", alert_id="es-bare", verdict="true_positive")
+    # A true positive with no action waits for a decision of the analyst
+    # (round "decide once" part 2, OW2).
+    _seed_run(client, "INV-TP-NONE", alert_id="es-none", verdict="true_positive", hours_ago=3)
+    # The runs below wait on nobody. The analyst acknowledged the true
+    # positive with no action from the card "No automatic action".
+    _seed_run(
+        client,
+        "INV-TP-BARE",
+        alert_id="es-bare",
+        verdict="true_positive",
+        events=[("analyst_settled", {"action": "ack", "by": "analyst", "alerts": 1})],
+    )
     _seed_run(client, "INV-FP", alert_id="es-fp", verdict="false_positive", actions=[_ACK])
     _seed_run(
         client,
@@ -174,9 +184,14 @@ def test_the_badge_counts_the_runs_the_needs_you_list_holds(client: TestClient) 
     # Every age counts: a verdict that needs more info waits until a person decides.
     assert body["needs_more_info"] == 2
     assert body["pending_actions"] == 2
-    assert body["investigations_waiting"] == 3
+    assert body["investigations_waiting"] == 4
     listed = _needs_you_list(client)
-    assert {row["id"] for row in listed["rows"]} == {"INV-NMI", "INV-NMI-OLD", "INV-TP-WAITS"}
+    assert {row["id"] for row in listed["rows"]} == {
+        "INV-NMI",
+        "INV-NMI-OLD",
+        "INV-TP-WAITS",
+        "INV-TP-NONE",
+    }
     assert listed["total"] == body["investigations_waiting"]
     # The row of the run with actions carries them, as under the action filter.
     tp = next(row for row in listed["rows"] if row["id"] == "INV-TP-WAITS")
@@ -187,8 +202,9 @@ def test_the_badge_counts_the_runs_the_needs_you_list_holds(client: TestClient) 
 def test_the_needs_you_list_leaves_out_every_run_that_waits_on_nobody(
     client: TestClient,
 ) -> None:
-    """NEGATIVE CONTROL. A true positive with no action, a false positive with
-    an acknowledge, a replay and a run outside the window wait on nobody."""
+    """NEGATIVE CONTROL. A true positive that the analyst acknowledged, a false
+    positive with an acknowledge, a replay and a run outside the window wait
+    on nobody."""
     _seed_needs_you_runs(client)
     ids = {row["id"] for row in _needs_you_list(client, since=_since_days(30))["rows"]}
     assert not ids & {"INV-TP-BARE", "INV-FP", "INV-NMI-OLD", "INV-NMI-REPLAY"}
@@ -198,7 +214,7 @@ def test_the_needs_you_list_joins_the_other_filters(client: TestClient) -> None:
     """The filter narrows. A verdict filter on top keeps its own meaning."""
     _seed_needs_you_runs(client)
     only_tp = _needs_you_list(client, since=_since_days(30), verdict="true_positive")
-    assert [row["id"] for row in only_tp["rows"]] == ["INV-TP-WAITS"]
+    assert [row["id"] for row in only_tp["rows"]] == ["INV-TP-WAITS", "INV-TP-NONE"]
     narrow = _needs_you_list(client, since=(datetime.now(UTC) - timedelta(hours=1.5)).isoformat())
     assert [row["id"] for row in narrow["rows"]] == ["INV-TP-WAITS"]
 

@@ -124,12 +124,12 @@ def _decode_input(data: str, encoding: str, notes: list[str]) -> tuple[bytes, st
         raw = _try_hex()
         if raw is not None:
             return raw, "hex"
-        notes.append("input is not valid hex — treated it as text instead")
+        notes.append("The input is not valid hex. The tool read it as text.")
     elif encoding == "base64":
         raw = _try_b64()
         if raw is not None:
             return raw, "base64"
-        notes.append("input is not valid base64 — treated it as text instead")
+        notes.append("The input is not valid base64. The tool read it as text.")
     elif encoding == "auto":
         raw = _try_hex()
         if raw is not None:
@@ -138,7 +138,7 @@ def _decode_input(data: str, encoding: str, notes: list[str]) -> tuple[bytes, st
         if raw is not None:
             return raw, "base64"
     elif encoding != "text":
-        notes.append(f"unknown encoding {encoding!r} — treated input as text")
+        notes.append(f"The encoding {encoding!r} is unknown. The tool read the input as text.")
     return data.encode("utf-8", errors="replace"), "text"
 
 
@@ -180,7 +180,8 @@ def _dedupe_capped(values: list[str], cap: int = _MAX_INDICATORS) -> list[str]:
     read_only=True,
     description=(
         "Decode payload bytes (base64/hex/text) into printable strings, embedded "
-        "indicators, entropy, and protocol hints — local, no egress."
+        "indicators, entropy, and protocol hints. The tool runs locally and "
+        "sends nothing out."
     ),
 )
 async def decode_payload(data: str, encoding: str = "auto") -> PayloadFacts:
@@ -202,7 +203,7 @@ async def decode_payload(data: str, encoding: str = "auto") -> PayloadFacts:
 
     raw, encoding_used = _decode_input(data, encoding, notes)
     if not raw:
-        notes.append("empty input — nothing to decode")
+        notes.append("The input is empty. The tool has nothing to decode.")
         return PayloadFacts(encoding_used=encoding_used, notes=notes)
 
     entropy = _entropy_bits_per_byte(raw)
@@ -244,7 +245,10 @@ async def decode_payload(data: str, encoding: str = "auto") -> PayloadFacts:
     )
 
     if entropy >= 7.3 and len(raw) >= 64:
-        notes.append("high entropy (>=7.3 bits/byte) — likely encrypted or compressed content")
+        notes.append(
+            "The entropy is 7.3 bits per byte or more. "
+            "The content is probably encrypted or compressed."
+        )
     elif printable_ratio >= 0.9 and len(raw) >= 16:
         notes.append("mostly printable text")
 

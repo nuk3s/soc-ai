@@ -111,7 +111,7 @@ describe('Dashboard recent investigations', () => {
     const fbRow = (await screen.findByText('ET Fallback Run')).closest(
       '[data-testid="recent-investigation"]',
     )! as HTMLElement;
-    expect(within(fbRow).getByText('Pipeline error')).toBeTruthy();
+    expect(within(fbRow).getByText('Failed')).toBeTruthy();
     expect(within(fbRow).queryByText('Needs more info')).toBeNull();
   });
 
@@ -125,7 +125,7 @@ describe('Dashboard recent investigations', () => {
       '[data-testid="recent-investigation"]',
     )! as HTMLElement;
     expect(within(nmiRow).getByText('Needs more info')).toBeTruthy();
-    expect(within(nmiRow).queryByText('Pipeline error')).toBeNull();
+    expect(within(nmiRow).queryByText('Failed')).toBeNull();
   });
 
   // A link goes to a page. The whole row was a button that navigated, so the

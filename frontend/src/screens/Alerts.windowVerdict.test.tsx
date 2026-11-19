@@ -129,7 +129,7 @@ describe('the list reads the window verdict of each group', () => {
   it('counts the untriaged groups by the verdict each group counts under', async () => {
     mountAt('/alerts?range=24h&hide_acked=false', [NEW, INH_FP, WIN_TP]);
     await screen.findByText(NEW.name);
-    expect(screen.getByText(/untriaged ·/).textContent).toBe('1 untriaged · 3 detections · 9 events in window');
+    expect(screen.getByText(/untriaged ·/).textContent).toBe('1 untriaged · 3 detections · 9 events in window · acknowledged alerts included');
   });
 
   it('puts a group under Needs decision by its window verdict', async () => {

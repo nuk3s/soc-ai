@@ -18,7 +18,7 @@ A read tool runs without human approval.
 
 | Tool | What it does | Backing system |
 |------|--------------|----------------|
-| `query_events` | Run a validated OQL query against the SO events index. The fields are whitelisted. It supports pipes and aggregations. This is the general-purpose pivot. | Elasticsearch events index |
+| `query_events` | Run a validated OQL query against the SO events index. The fields are whitelisted. The tool supports pipes and aggregations. This is the general-purpose pivot. Before the search, the tool reads the field types of the grid. The tool writes a wildcard of whole octets on an IP field as a CIDR, and a time with a space on a date field as ISO 8601 in UTC. The result states each rewrite. A query that the grid rejects for the type of a field returns an error with the reason `query_rejected` and the reason text of Elasticsearch. A known reason also gets a hint with the correct form. That result is unknown, and the model corrects the query. A grid that does not answer gives the reason `grid_unavailable`. | Elasticsearch events index |
 | `query_zeek_logs` | Pivot into the Zeek connection logs by `network.community_id`. The result shows the flow duration, the bytes and the conn state. | Elasticsearch (Zeek datasets) |
 | `run_analytic` | Run one catalog analytic over a window. The result lists the entities that matched and the document ids the agent can cite. Hunt role only. | Elasticsearch events index |
 | `query_cases` | Search the existing SOC cases with a free-text query. Use it to find out if someone saw or escalated this before. | SO cases index |

@@ -156,6 +156,8 @@ def test_the_investigation_api_carries_the_promoted_finding(client: TestClient) 
         # page work, dogfood 2026-10-06 hunting C4).
         "detail": "",
         "citations": [],
+        # The finding names no known machine outside its hosts (AA2).
+        "nameNote": None,
     }
 
 

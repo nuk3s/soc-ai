@@ -1,7 +1,8 @@
 import type { CampaignChange } from '../../lib/api';
 import { changeSentence } from '../../lib/campaignWords';
 import { stageColor } from '../../lib/campaignViz';
-import { utcStamp } from '../../lib/timeRange';
+import { UtcTime } from '../UtcTime';
+
 
 /** The dot of a change: the stage color for a new stage, the warning tone
  *  for a reopen and a refused case, the danger tone for an investigation
@@ -50,7 +51,7 @@ export function CampaignChanges({
             data-testid="campaign-change-at"
             className="w-[150px] flex-none whitespace-nowrap font-mono text-[11.5px] text-faint"
           >
-            {utcStamp(c.at)}
+            <UtcTime iso={c.at} seconds={false} />
           </span>
           <span className="flex min-w-0 flex-[1_1_18rem] items-baseline gap-2">
             <span

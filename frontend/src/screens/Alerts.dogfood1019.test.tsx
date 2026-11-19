@@ -153,7 +153,7 @@ describe('the event checkbox has a name (R2-D18)', () => {
     renderAlerts();
     await expandGroup();
     const boxes = screen.getAllByRole('checkbox', { name: /^Select the event at / });
-    expect(boxes[0].getAttribute('aria-label')).toMatch(/\w{3} \d{2}, \d{2}:\d{2}:\d{2} \S+$/);
+    expect(boxes[0].getAttribute('aria-label')).toMatch(/\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
   });
 });
 
@@ -502,12 +502,36 @@ describe('the empty list offers the window the probe found (R2-D20, R2-I8)', () 
   });
 });
 
+// Round 3, T3: the row states the time in UTC with the label. The tooltip
+// states the local time with its zone.
 describe('times state the date and the zone (R2-D17)', () => {
   it('dates each event row and names the zone', async () => {
     renderAlerts();
     await expandGroup();
     const cells = screen.getAllByTestId('event-time');
-    expect(cells[0].textContent).toMatch(/^\w{3} \d{2}, \d{2}:\d{2}:\d{2} \S+/);
+    expect(cells[0].textContent).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC$/);
+    const title = cells[0].getAttribute('title') ?? '';
+    expect(title).toMatch(/^Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
+    // Round 3 part 2, P1: the relative time under it states both clocks.
+    const rel = cells[0].parentElement?.querySelector('[data-time="relative"]');
+    expect(rel?.getAttribute('title')).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Local time: .+ \S+$/);
+  });
+
+  it('states both clocks in the tooltip of the last seen time of a row', async () => {
+    // Round 3 part 2, P1: the tooltip read "2026-11-18 10:08 EST" with no UTC.
+    const latestTs = new Date(Date.now() - 60_000).toISOString();
+    vi.mocked(getAlerts).mockResolvedValue(
+      queueOf([mkGroup({ latestTs }), mkGroup({ id: 'es-2', name: 'ET Other Detection' })]),
+    );
+    renderAlerts();
+    const cells = await screen.findAllByTestId('alert-last-seen');
+    expect(cells).toHaveLength(2);
+    const withTime = cells.find((c) => c.getAttribute('dateTime') === latestTs)!;
+    expect(withTime.textContent).toBe('1m ago');
+    expect(withTime.getAttribute('title')).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC\. Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
+    // Negative control: a row with no time on record names no time.
+    const without = cells.find((c) => c !== withTime)!;
+    expect(without.getAttribute('title')).toBeNull();
   });
 
   it('dates both ends of a collapsed run of identical events', async () => {
@@ -521,7 +545,10 @@ describe('times state the date and the zone (R2-D17)', () => {
     fireEvent.click(screen.getByText(NAME));
     const bucket = await screen.findByTestId('event-bucket-row');
     const span = within(bucket).getByTestId('event-time').textContent ?? '';
-    expect(span).toMatch(/^\w{3} \d{2}, \d{2}:\d{2}:\d{2} to \w{3} \d{2}, \d{2}:\d{2}:\d{2} \S+/);
+    // The second end carries its date when the run crosses midnight.
+    expect(span).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} to (\d{4}-\d{2}-\d{2} )?\d{2}:\d{2}:\d{2} UTC$/);
+    const title = within(bucket).getByTestId('event-time').getAttribute('title') ?? '';
+    expect(title).toMatch(/^Local time: \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+ to \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+$/);
   });
 });
 

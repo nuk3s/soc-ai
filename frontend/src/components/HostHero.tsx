@@ -26,7 +26,7 @@ import {
   sweepWindowWords,
 } from '../lib/hostDossier';
 import type { SituationLine } from '../lib/hostSituation';
-import { absTime } from '../lib/timeRange';
+import { timeTitle } from '../lib/timeRange';
 import type { Dossier, MachineDetail, MachineNameSource } from '../lib/types';
 
 export interface HostHeroProps {
@@ -224,7 +224,7 @@ function MachineHero({
             >
               agent {machine.agent.name}
               {machine.agent.os && <span className="font-sans opacity-80">· {machine.agent.os}</span>}
-              <span className="font-sans opacity-80" title={absTime(machine.agent.last_report)}>
+              <span className="font-sans opacity-80" title={timeTitle(machine.agent.last_report)}>
                 · last report {relativeAge(machine.agent.last_report)}
               </span>
             </span>
@@ -257,14 +257,14 @@ function MachineHero({
           <span data-testid="hero-events" title="Events on every address of this machine. The sweep counts them. The 24h and 7d buttons do not change this count.">
             {machine.events.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days, dossier.last_built_at)}
           </span>
-          <span title={absTime(machine.first_seen)}>first seen {relativeAge(machine.first_seen)}</span>
+          <span title={timeTitle(machine.first_seen)}>first seen {relativeAge(machine.first_seen)}</span>
           {/* The label names its source. The host page and the entity page
               each said "last seen" for two sources (dogfood round 2, V2-7). */}
-          <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
+          <span data-testid="hero-last-seen" title={timeTitle(lastSeen)}>
             last grid event {relativeAge(lastSeen)}
           </span>
           {dossier.last_built_at ? (
-            <span title={absTime(dossier.last_built_at)}>swept {relativeAge(dossier.last_built_at)}</span>
+            <span title={timeTitle(dossier.last_built_at)}>swept {relativeAge(dossier.last_built_at)}</span>
           ) : (
             <span title="No completed sweep has written the primary address yet">
               {dossier.build_error ? 'never successfully swept' : 'not swept yet'}
@@ -427,12 +427,12 @@ function AddressHero({ dossier, adminBlocked, lastActivity, situation = [] }: Ho
           >
             {dossier.event_count.toLocaleString()} events in the {sweepWindowWords(dossier.lookback_days, dossier.last_built_at)}
           </span>
-          <span title={absTime(dossier.first_seen)}>first seen {relativeAge(dossier.first_seen)}</span>
-          <span data-testid="hero-last-seen" title={absTime(lastSeen)}>
+          <span title={timeTitle(dossier.first_seen)}>first seen {relativeAge(dossier.first_seen)}</span>
+          <span data-testid="hero-last-seen" title={timeTitle(lastSeen)}>
             last grid event {relativeAge(lastSeen)}
           </span>
           {dossier.last_built_at ? (
-            <span title={absTime(dossier.last_built_at)}>
+            <span title={timeTitle(dossier.last_built_at)}>
               swept {relativeAge(dossier.last_built_at)}
             </span>
           ) : (

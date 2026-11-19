@@ -1,4 +1,4 @@
-import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Info, Keyboard, LayoutDashboard, Network, Search, Server, Settings, SlidersHorizontal, Triangle, User, Wrench, Zap } from 'lucide-react';
+import { AtSign, Bell, BookOpen, ChevronsLeft, Crosshair, Globe, History, Inbox, Info, Keyboard, LayoutDashboard, Network, Search, Server, Settings, SlidersHorizontal, Triangle, User, Wrench, Zap } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
@@ -19,6 +19,8 @@ import type { AlertGroup, EntitySearchHit, InvestigationRow, MachineRow } from '
 import { isSignedOut, useSession } from './Session';
 import { useShell } from './ShellContext';
 import { GUIDE_URL } from './pages';
+import { matchRules, paletteRules, type RuleTarget } from '../lib/ruleDecision';
+import { RULE_ICON } from '../components/rule/RuleRowFacts';
 import { returnFocusTarget } from './platform';
 import { upstreamState } from './upstream';
 
@@ -36,7 +38,8 @@ interface Command {
     | 'Users'
     | 'Domains'
     | 'Addresses'
-    | 'Hunts';
+    | 'Hunts'
+    | 'Rules';
   label: string;
   /** The second line. Two results with the same label read apart on it. */
   detail?: string;
@@ -180,6 +183,8 @@ export function CommandPalette() {
       navigate(to);
     };
     return [
+      // The first entry of the sidebar: the one list of every decision.
+      { group: 'Go to', label: 'Needs you', icon: <Inbox size={15} />, run: go('/needs-you') },
       { group: 'Go to', label: 'Dashboard', icon: <LayoutDashboard size={15} />, run: go('/dashboard') },
       { group: 'Go to', label: 'Alerts', icon: <Triangle size={15} />, run: go('/alerts') },
       { group: 'Go to', label: 'Investigations', icon: <Search size={15} />, run: go('/investigations') },
@@ -244,7 +249,8 @@ export function CommandPalette() {
       },
       { group: 'View', label: 'My queue', icon: <Triangle size={15} />, run: go('/alerts?view=mine') },
       { group: 'View', label: 'Critical alerts', icon: <Triangle size={15} />, run: go('/alerts?view=critical') },
-      { group: 'View', label: 'Needs decision', icon: <Triangle size={15} />, run: go('/alerts?view=decision') },
+      // The palette has one term for the decisions that wait: "Needs you"
+      // (round "decide once" part 2, OW5). It held "Needs decision" too.
       ...(signedOut
         ? []
         : ([
@@ -268,6 +274,9 @@ export function CommandPalette() {
   // palette open (fail-soft — a fetch error just means command-only results).
   const [invs, setInvs] = useState<InvestigationRow[]>([]);
   const [groups, setGroups] = useState<AlertGroup[]>([]);
+  // The rules with open false positives and the standing rule decisions:
+  // each opens the page of its rule decision.
+  const [rules, setRules] = useState<RuleTarget[]>([]);
 
   // Config corpus for the Settings group. Unlike the entity corpus this is
   // fetched ONCE per mount, not per open: it's large, near-static, and
@@ -386,9 +395,19 @@ export function CommandPalette() {
     const alerts = entities.filter((c) => c.group !== 'Investigations');
     const hunts = indexCmds.filter((c) => c.group === 'Hunts');
     const others = indexCmds.filter((c) => c.group !== 'Hunts');
-    return [...base, ...hostCmds, ...investigations, ...others, ...alerts, ...hunts, ...settings];
+    const ruleCmds = matchRules(rules, q).map<Command>((r) => ({
+      group: 'Rules',
+      label: r.name,
+      detail: r.detail,
+      icon: <RULE_ICON size={15} />,
+      run: () => {
+        closePalette();
+        navigate(r.href);
+      },
+    }));
+    return [...base, ...hostCmds, ...investigations, ...ruleCmds, ...others, ...alerts, ...hunts, ...settings];
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [q, commands, hostResult, indexResult, invs, groups, layout]);
+  }, [q, commands, hostResult, indexResult, invs, groups, layout, rules]);
 
   // reset query + selection on open; focus the input; refresh the entity corpus;
   // count into the shared modal stack and restore focus to the opener on close.
@@ -399,6 +418,7 @@ export function CommandPalette() {
     setBulk(null);
     getInvestigations().then(setInvs).catch(() => {});
     getAlerts({ range: '7d' }).then((q) => setGroups(q.groups)).catch(() => {});
+    paletteRules().then(setRules).catch(() => {});
     if (!versionRequested.current) {
       versionRequested.current = true;
       getAbout()

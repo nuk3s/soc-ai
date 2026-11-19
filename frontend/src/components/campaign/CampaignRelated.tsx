@@ -17,13 +17,14 @@ import {
   namedSentence,
   sessionTail,
 } from '../../lib/campaignWords';
-import { utcStamp } from '../../lib/timeRange';
+
 import { VerdictPill } from '../Badges';
 import { UNKNOWN } from '../Kpi';
 import { Panel, PanelHeader } from '../Panel';
 import { LEAD_STATUS_LABEL, leadStatusLabel } from '../LeadsStrip';
 import { ROW_BUTTON, RowConfirm } from './RowWrite';
 import { PartyLink, runHref } from './shared';
+import { UtcTime } from '../UtcTime';
 
 const ROW = 'px-[15px] py-2.5 text-[12.5px]';
 
@@ -134,7 +135,7 @@ function RelatedRunRow({
             {`${r.sourceAddress ?? UNKNOWN} to ${r.targetAddress ?? UNKNOWN}`}
           </span>
         )}
-        {r.finishedAt && <span className="font-mono text-[11.5px] text-faint">{utcStamp(r.finishedAt)}</span>}
+        {r.finishedAt && <UtcTime className="font-mono text-[11.5px] text-faint" iso={r.finishedAt} seconds={false} />}
         {writes && !confirming && (
           <button
             type="button"

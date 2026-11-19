@@ -52,7 +52,14 @@ export function scopeKey(s: ChatScope): string {
 
 /** The words on the button that opens the panel on `kind`. */
 export function askLabel(kind: ChatScopeKind): string {
-  return kind === 'general' ? 'Ask soc-ai' : `Ask soc-ai about this ${kind}`;
+  const { head, about } = askLabelParts(kind);
+  return `${head}${about}`;
+}
+
+/** The two parts of the label: "Ask soc-ai" and " about this host". The top
+ *  bar hides the second part whole when it has no room (round 4, C5). */
+export function askLabelParts(kind: ChatScopeKind): { head: string; about: string } {
+  return { head: 'Ask soc-ai', about: kind === 'general' ? '' : ` about this ${kind}` };
 }
 
 /** What an investigation page lends the panel. The verdict and the cited ids

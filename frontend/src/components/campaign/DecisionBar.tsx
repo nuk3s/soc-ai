@@ -41,6 +41,7 @@ import {
   waitsSentence,
 } from '../../lib/campaignWords';
 import { demoBlocked, useDemo } from '../../lib/demo';
+import { SinceDecisionLines } from './SinceDecision';
 
 const PRIMARY =
   'flex-none whitespace-nowrap rounded-control border border-accent bg-[rgba(75,139,245,.14)] px-3 py-1.5 text-[12.5px] font-semibold text-accent hover:bg-[rgba(75,139,245,.22)] disabled:opacity-60';
@@ -77,6 +78,13 @@ function errorText(err: unknown): string {
  *
  *  A decision with no form here states itself with no button. A campaign
  *  that is not active, or a server that sends no decision, shows no bar. */
+/** True when the bar states what is new since the earlier decision. The
+ *  banner then holds the newest hunt answer beside the hunt of the reopen
+ *  (W1), and the header does not state the answer a second time. */
+export function sinceInBar(c: CampaignDetail): boolean {
+  return Boolean(c.sinceDecision) && decisionState(c) === 'waits' && c.case?.state !== 'pending';
+}
+
 export function DecisionBar({
   campaign: c,
   onCloseRequest,
@@ -84,6 +92,7 @@ export function DecisionBar({
   onAuthorizeRequest,
   onCaseRequest,
   canAuthorize = false,
+  onShowNew,
 }: {
   campaign: CampaignDetail;
   onCloseRequest: () => void;
@@ -94,6 +103,8 @@ export function DecisionBar({
   onCaseRequest?: () => void;
   /** True for an admin, or for a session the console cannot read. */
   canAuthorize?: boolean;
+  /** Opens the investigations of the campaign with only the new ones (SD3). */
+  onShowNew?: () => void;
 }) {
   const demo = useDemo();
   const [confirming, setConfirming] = useState(false);
@@ -135,6 +146,11 @@ export function DecisionBar({
         data-state="waits"
         className="mt-2.5 rounded-card border border-warn/40 bg-warn/10 px-3 py-2"
       >
+        {/* A campaign that opened again states the earlier decision and
+            what is new since it, above the line of the wait. */}
+        {c.sinceDecision && (
+          <SinceDecisionLines since={c.sinceDecision} onShowNew={onShowNew} answer={c.answers?.[0] ?? null} />
+        )}
         <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
           <Clock size={15} aria-hidden className="flex-none text-warn" />
           <span data-testid="campaign-decision-state" className="min-w-0 flex-[1_1_20rem] break-words text-[13px] text-text">

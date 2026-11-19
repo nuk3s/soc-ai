@@ -1972,6 +1972,17 @@ class Settings(BaseSettings):
             raise ValueError(f"auto_ack_fp_threshold must be in [0.0, 1.0]. The value is {f}.")
         return f
 
+    rule_decision_days: int = Field(default=30, ge=1, le=365)
+    """The term of a standing rule decision, in days.
+
+    The analyst decides once on the open false positives of a rule. A
+    standing decision also lets soc-ai acknowledge each later false positive
+    of the rule while the hold ``high_stakes`` would hold it. Every other
+    guard of the automatic acknowledge stays. The decision ends after this
+    term, when the analyst ends it, or when an investigation of the rule
+    gets a true positive verdict (:mod:`soc_ai.webui.rule_decisions`).
+    """
+
     auto_triage_min_severity: str = "high"
     """Minimum severity included in a ⚡ auto-triage sweep — this level and
     above. One of: critical, high, medium, low.

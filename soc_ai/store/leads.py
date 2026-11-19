@@ -201,6 +201,10 @@ _DEGRADED_NOTES: dict[str, str] = {
 # answer (soc_ai.agent.toolset.GRID_UNAVAILABLE_REASON). The store does not
 # import the agent, and tests/test_lead_truth.py pins the two as equal.
 _GRID_UNAVAILABLE = "grid_unavailable"
+# The reason the tool boundary stamps when the grid answered and rejected the
+# query (soc_ai.agent.toolset.QUERY_REJECTED_REASON). A query error, so it
+# holds no lead. tests/test_query_rejected_tool.py pins the two as equal.
+_QUERY_REJECTED = "query_rejected"
 
 # The decision an analyst records when an investigation of one of the lead's
 # hunt findings reached a verdict and the lead stays open all the same. The
@@ -295,6 +299,12 @@ _CAMPAIGN_ACTIVE = "active"
 # The kinds of a promoted run (soc_ai.store.investigations.PROMOTED_KINDS).
 # Such a run writes no alert observation.
 _PROMOTED_KINDS: tuple[str, ...] = ("hunt", "lead")
+# The spec id of the observation of a promoted hunt finding
+# (soc_ai.hunting.sources.HUNT_SPEC_ID), and the kind of the investigation
+# of a hunt finding. The evidence of the observation names the hunt and the
+# ordinal of the finding; the investigation row names the same two.
+_HUNT_SPEC_ID = "hunt"
+_FINDING_KIND = "hunt"
 
 
 def campaign_lead_clause() -> Any:
@@ -303,9 +313,12 @@ def campaign_lead_clause() -> Any:
     The step after a rebuild sets ``leads.campaign_id``
     (:mod:`soc_ai.campaigns.lead_tags`). The clause holds while three facts
     hold: the lead names a campaign, the campaign is active, and every
-    observation on the lead that counts is the alert observation of a true
-    positive member of that campaign. A dismissed observation counts toward
-    no lead, so it does not count here either.
+    observation on the lead that counts maps to a true positive member of
+    that campaign. An alert observation maps through the alert id of an
+    alert investigation. The observation of a promoted hunt finding maps
+    through the finding investigation: the investigation row names the hunt
+    and the ordinal that the evidence of the observation names. A dismissed
+    observation counts toward no lead, so it does not count here either.
 
     The third fact is read again here, on each read. A sweep in another
     process can attach a statistics observation to the lead, and no rebuild
@@ -330,14 +343,34 @@ def campaign_lead_clause() -> Any:
         )
         .correlate(Lead)
     )
+    # The JSON reads are portable: SQLite renders JSON_EXTRACT and
+    # PostgreSQL renders ->>. An observation with no hunt in its evidence
+    # matches no row, so it stays stray.
+    held_finding = (
+        select(Investigation.id)
+        .join(CampaignMember, CampaignMember.run_id == Investigation.id)
+        .where(
+            CampaignMember.campaign_id == Lead.campaign_id,
+            CampaignMember.verdict_differs.is_(False),
+            Investigation.kind == _FINDING_KIND,
+            Investigation.hunt_id == EntityObservation.evidence_json["hunt_id"].as_string(),
+            Investigation.finding_ordinal
+            == EntityObservation.evidence_json["ordinal"].as_integer(),
+        )
+        .correlate(Lead, EntityObservation)
+        .exists()
+    )
     stray = (
         select(EntityObservation.id)
         .where(
             EntityObservation.lead_id == Lead.id,
             EntityObservation.dismissed_at.is_(None),
-            or_(
-                EntityObservation.spec_id != _ALERT_SPEC_ID,
-                EntityObservation.fingerprint.not_in(held_alerts),
+            ~or_(
+                and_(
+                    EntityObservation.spec_id == _ALERT_SPEC_ID,
+                    EntityObservation.fingerprint.in_(held_alerts),
+                ),
+                and_(EntityObservation.spec_id == _HUNT_SPEC_ID, held_finding),
             ),
         )
         .correlate(Lead)
@@ -951,15 +984,19 @@ def _grid_error_types() -> frozenset[str]:
     failure the tool boundary stamps, so the settle rule reads both. An
     ``ApiError`` with no subclass is a status the client does not map: a 5xx,
     a 408 or a 429. The 4xx subclasses are query errors and are not listed.
+    ``GridQueryRejectedError`` is not listed either: the grid answered and
+    rejected the query.
     """
     from elastic_transport import TransportError  # noqa: PLC0415 - lazy, the store reads no grid
 
-    from soc_ai.so_client import elastic  # noqa: F401, PLC0415 - defines GridPartialResultsError
+    from soc_ai.so_client import elastic  # noqa: PLC0415 - defines the partial-read errors
 
     names = {"ApiError", "TimeoutError"}
     pending: list[type] = [TransportError]
     while pending:
         cls = pending.pop()
+        if issubclass(cls, elastic.GridQueryRejectedError):
+            continue
         names.add(cls.__name__)
         pending.extend(cls.__subclasses__())
     return frozenset(names)
@@ -976,6 +1013,8 @@ def _grid_failed(result: Any) -> bool:
         return False
     if _GRID_UNAVAILABLE in (result.get("reason"), result.get("error")):
         return True
+    if result.get("reason") == _QUERY_REJECTED:
+        return False
     return str(result.get("type") or "") in _grid_error_types()
 
 

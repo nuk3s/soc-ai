@@ -19,6 +19,7 @@ import {
   CASE_SKIPPED_HEADING,
   CASE_SUBMIT_EXISTING,
   CASE_TITLE,
+  lastActivityOf,
   caseAlertsSentence,
   caseCappedSentence,
   caseExistingSentence,
@@ -30,10 +31,11 @@ import {
 } from '../../lib/campaignWords';
 import { stageColor } from '../../lib/campaignViz';
 import { demoBlocked, useDemo } from '../../lib/demo';
-import { utcWindow } from '../../lib/timeRange';
+
 import { Spinner } from '../States';
 import { MachinesPicture } from './MachinesPicture';
 import { StageMeter } from './StageMeter';
+import { UtcTime } from '../UtcTime';
 
 const LABEL = 'mb-1 block text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint';
 const BOX = 'rounded-[7px] border px-3 py-2.5 text-[12.5px] leading-[1.5]';
@@ -68,7 +70,7 @@ export function OpenCaseDialog({
   onClose,
   onOpened,
 }: {
-  campaign: Pick<CampaignDetail, 'id' | 'title' | 'bottomLine' | 'stage' | 'parties' | 'graph' | 'firstEvent' | 'lastEvent'>;
+  campaign: Pick<CampaignDetail, 'id' | 'title' | 'bottomLine' | 'stage' | 'parties' | 'graph' | 'firstEvent' | 'lastEvent' | 'lastActivity'>;
   open: boolean;
   onClose: () => void;
   onOpened: (next: CampaignDetail) => void;
@@ -211,7 +213,7 @@ export function OpenCaseDialog({
             </p>
           )}
           <div data-testid="case-period" className="mt-1 font-mono text-[11.5px] text-dim">
-            {utcWindow(campaign.firstEvent, campaign.lastEvent)}
+            <UtcTime iso={campaign.firstEvent} to={lastActivityOf(campaign)} seconds={false} />
           </div>
 
           <div

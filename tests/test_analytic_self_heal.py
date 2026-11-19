@@ -27,6 +27,7 @@ from soc_ai.store.db import make_engine, make_sessionmaker, run_migrations
 from soc_ai.store.leads import HUNT_CLEAN_REASON
 from soc_ai.store.models import (
     AnalyticState,
+    AnalyticVersion,
     EntityObservation,
     Hunt,
     Investigation,
@@ -543,6 +544,38 @@ def test_a_hold_raises_a_bell_entry_until_the_analyst_acts(client: TestClient) -
         if n["id"].startswith("analytic-held:")
     ]
     assert after == []
+
+
+def test_a_hold_of_an_older_build_reads_the_daily_hit_limit(client: TestClient) -> None:
+    """N16: an older build stored "Its fire budget is 3 a day." on a hold.
+    The bell and the analytic read one term for the setting. The row stays."""
+
+    async def breach() -> None:
+        now = datetime.now(UTC).replace(tzinfo=None)
+        async with client.app.state.db_sessionmaker() as db:
+            await _live(db, _spec_text(budget=2), at=now - timedelta(hours=3))
+            await _hits(db, 4, now - timedelta(hours=1))
+            await self_heal.run_self_heal(db, now=now)
+            row = (
+                await db.scalars(select(AnalyticVersion).order_by(AnalyticVersion.id.desc()))
+            ).first()
+            assert row is not None
+            row.why = "The analytic wrote 4 hits in 24 hours. Its fire budget is 2 a day."
+            await db.commit()
+
+    asyncio.run(breach())
+    entry = next(
+        n
+        for n in client.get("/api/v1/notifications").json()
+        if n["id"].startswith("analytic-held:")
+    )
+    assert entry["title"].endswith("Its daily hit limit is 2.")
+    assert "fire budget" not in entry["title"]
+    detail = client.get(f"/api/v1/analytics/{_ID}").json()
+    assert "fire budget" not in str(detail)
+    # Negative control: a reason with no old sentence reads as stored.
+    assert self_heal.hold_words("An analyst held it.") == "An analyst held it."
+    assert self_heal.hold_words(None) is None
 
 
 def test_no_bell_entry_without_a_hold(client: TestClient) -> None:

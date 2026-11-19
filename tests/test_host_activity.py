@@ -462,6 +462,30 @@ async def test_alert_count_is_seven_days_even_on_the_24h_view(
 
 
 @pytest.mark.asyncio
+async def test_the_window_alert_count_follows_the_chosen_range(
+    settings_kratos: Settings,
+) -> None:
+    """The Alerts card counts the window of the 24h and 7d buttons (AB1).
+
+    The card read "Alerts raised · 7d" under a 24h toggle (dogfood
+    2026-11-17). ``alerts`` is the in-range filter bucket's count. The 7-day
+    total stays in ``alerts_7d``: the negative control, so an older page keeps
+    its number.
+    """
+    es = _FakeConnElastic(_CONN_AGG, detections=_DET_AGG, alerts_total=4)
+    act = await fetch_host_activity(es, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+
+    assert act.alerts == 3
+    assert act.alerts_7d == 4
+
+    # A grid that returned no filter bucket counts no alert in the window.
+    bare = _FakeConnElastic(_CONN_AGG, detections={}, alerts_total=4)
+    quiet = await fetch_host_activity(bare, settings_kratos, _IP, range="24h")  # type: ignore[arg-type]
+    assert quiet.alerts == 0
+    assert quiet.alerts_7d == 4
+
+
+@pytest.mark.asyncio
 async def test_the_alerted_intersection_is_wide_enough_to_not_lie(
     settings_kratos: Settings,
 ) -> None:

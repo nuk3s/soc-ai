@@ -1,19 +1,20 @@
 import { Network } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { HostCampaign, ThreatCampaign } from '../../lib/api';
-import { alertsWords, hostRoleLabel } from '../../lib/campaignWords';
-import { utcWindow } from '../../lib/timeRange';
+import { alertsWords, gridReadWords, hostRoleLabel, lastActivityOf } from '../../lib/campaignWords';
+
 import { THREAT_CAMPAIGN_AUTHORIZED } from '../../lib/tooltips';
-import { CampaignDecisionChip, CampaignStatusChip } from './shared';
+import { CampaignStateChip } from './shared';
 import { StageMeter } from './StageMeter';
+import { UtcTime } from '../UtcTime';
 
 /** The campaigns of a machine on its host page, newest last event first. One
- *  line for each: the stage meter, the title as the link, Open or Ended, the
- *  decision state, the role of the machine in words, the period and the
- *  alerts.
+ *  line for each: the stage meter, the title as the link, the one state
+ *  chip, the role of the machine in words, the period and the alerts.
  *
  *  The campaign waits on a decision, and its investigations do not: the
- *  decision chip states "Waits on you" or the decision. A count of the
+ *  state chip states the decision, or Open or Ended in the warning tone while
+ *  the campaign waits. A count of the
  *  investigations that wait can no longer show, because the server counts
  *  none for an investigation that a campaign holds.
  *
@@ -60,17 +61,16 @@ export function HostCampaigns({
               >
                 {c.title}
               </Link>
-              <CampaignStatusChip status={c.status} />
-              <CampaignDecisionChip campaign={c} />
+              <CampaignStateChip campaign={c} />
               <span data-testid="host-campaign-role" className="text-text-2">
                 {hostRoleLabel(c.role)}
               </span>
               <span data-testid="host-campaign-period" className="font-mono text-[11.5px] text-dim">
-                {utcWindow(c.firstEvent, c.lastEvent)}
+                <UtcTime iso={c.firstEvent} to={lastActivityOf(c)} seconds={false} />
               </span>
               {typeof c.alerts === 'number' && (
                 <span data-testid="host-campaign-alerts" className="text-dim">
-                  {alertsWords(c.alerts)}
+                  {`${alertsWords(c.alerts)}${gridReadWords(c)}`}
                 </span>
               )}
               {threat && threat.authorized > 0 && (

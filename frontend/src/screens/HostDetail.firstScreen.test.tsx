@@ -52,7 +52,7 @@ import {
   resolveMachine,
   setDossierOverride,
 } from '../lib/api';
-import { absTime } from '../lib/timeRange';
+import { timeTitle } from '../lib/timeRange';
 import { HostDetail } from './HostDetail';
 
 const PRIMARY = '192.0.2.10';
@@ -290,7 +290,7 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
   });
 
   it('opens on the open lead, then the verdicts, then the identity', async () => {
-    mount('/hosts/agent%3Aea2d');
+    mount('/hosts/agent%3Aea2d?range=7d');
     const lines = await screen.findByTestId('host-situation');
     await waitFor(() =>
       expect(within(lines).getAllByRole('listitem').map((li) => li.textContent)).toEqual([
@@ -346,15 +346,39 @@ describe('HostDetail: the first screen leads with leads and verdicts', () => {
   });
 
   it('counts the alert verdicts under the Alerts card', async () => {
+    // NEGATIVE CONTROL: an older server sends the 7-day count alone. The
+    // card counts 7 days and says so beside a 24h toggle.
     mount('/hosts/agent%3Aea2d');
     const card = await screen.findByTestId('kpi-alerts');
     expect(card.textContent).toMatch(/Alerts raised · 7d/);
     expect((await within(card).findByTestId('kpi-alert-verdicts')).textContent).toBe(
       '6 alert verdicts on this host',
     );
-    // The card says it does not follow the window buttons.
     expect(within(card).getByTestId('kpi-alerts-fixed').textContent).toBe('This card counts the last 7 days.');
-    expect(card.getAttribute('title')).toMatch(/always counts 7 days/);
+    expect(card.getAttribute('title')).toMatch(/in the last 7 days\.$/);
+  });
+
+  it('counts every number on the page over the 24h and 7d buttons (AB1)', async () => {
+    // Dogfood 2026-11-17: the toggle read 24h and the cards read 30d, 7d and
+    // all time. The Alerts card, the verdict lines, the observations and the
+    // investigations block now read the page window.
+    vi.mocked(getHostActivity).mockResolvedValue(activity({ alerts_7d: 40, alerts: 3 }));
+    mount('/hosts/agent%3Aea2d');
+    const card = await screen.findByTestId('kpi-alerts');
+    await waitFor(() => expect(card.textContent).toMatch(/^Alerts raised · 24h3/));
+    expect(within(card).queryByTestId('kpi-alerts-fixed')).toBeNull();
+    expect(within(card).getByRole('link').getAttribute('href')).toMatch(/^\/alerts\?range=24h&/);
+    await waitFor(() => expect(getObservations).toHaveBeenCalledWith(PRIMARY, 1));
+    const lines = await screen.findByTestId('host-situation');
+    await waitFor(() => expect(lines.textContent).toContain('last 24 hours'));
+    expect(lines.textContent).not.toContain('last 7 days');
+    // The investigations block reads the events of the window.
+    await waitFor(() =>
+      expect(vi.mocked(listInvestigations).mock.calls.some(([q]) => typeof q?.since === 'string')).toBe(true),
+    );
+    expect((await screen.findByTestId('host-investigations-title')).textContent).toMatch(
+      /^Investigations on this host · 24h/,
+    );
   });
 
   it('puts the leads and the observations above the peer graph', async () => {
@@ -464,10 +488,10 @@ describe('HostDetail: one last-seen time', () => {
     vi.mocked(getHostActivity).mockResolvedValue(activity({ volume: [{ ts: live, events: 40 }] }));
     mount('/hosts/agent%3Aea2d');
     const row = await screen.findByTestId(`address-row-${PRIMARY}`);
-    await waitFor(() => expect(screen.getByTestId('hero-last-seen').getAttribute('title')).toBe(absTime(live)));
+    await waitFor(() => expect(screen.getByTestId('hero-last-seen').getAttribute('title')).toBe(timeTitle(live)));
     const cells = within(row).getAllByRole('cell');
     // Address, type, first seen, last seen, events, facts.
-    expect(cells[3].getAttribute('title')).toBe(absTime(live));
+    expect(cells[3].getAttribute('title')).toBe(timeTitle(live));
   });
 
   it('keeps the sweep time when the live read saw nothing newer', async () => {
@@ -478,7 +502,7 @@ describe('HostDetail: one last-seen time', () => {
     const row = await screen.findByTestId(`address-row-${PRIMARY}`);
     const sweep = m.addresses[0].last_seen;
     await waitFor(() => expect(getHostActivity).toHaveBeenCalled());
-    expect(within(row).getAllByRole('cell')[3].getAttribute('title')).toBe(absTime(sweep));
+    expect(within(row).getAllByRole('cell')[3].getAttribute('title')).toBe(timeTitle(sweep));
   });
 });
 
@@ -514,8 +538,11 @@ describe('HostDetail: every card names its window', () => {
     );
     mount('/hosts/agent%3Aea2d');
     const card = await screen.findByTestId('kpi-services');
-    expect(card.textContent).toMatch(/^Services · 30d/);
-    expect(card.getAttribute('title')).toMatch(/The 24h and 7d buttons do not change this card\.$/);
+    // A fact of the machine: the label names its source, and the dashed card
+    // sits after the window counts (AB1).
+    expect(card.textContent).toMatch(/^Services · profile/);
+    expect(card.getAttribute('data-fact')).toBe('true');
+    expect(card.getAttribute('title')).toMatch(/up to 30 days\. .*The 24h and 7d buttons do not change it\.$/);
     // The two live cards follow the buttons and say the window they show.
     expect((await screen.findByTestId('kpi-users')).textContent).toMatch(/^Users · 24h/);
     expect(screen.getByTestId('kpi-events').textContent).toMatch(/^Connections · 24h/);
@@ -584,13 +611,14 @@ describe('HostDetail: the investigations of the machine', () => {
     expect((await screen.findByTestId('host-investigations-count')).textContent).toBe(
       '7 investigations name this host. 6 reached a true-positive verdict.',
     );
-    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', limit: 3 });
+    expect(listInvestigations).toHaveBeenCalledWith({ entity: 'agent:ea2d', limit: 3, tpParts: true });
     const hero = await screen.findByTestId('host-hero');
     await waitFor(() =>
       expect(hero.textContent).toContain('6 investigations of this host reached a true-positive verdict.'),
     );
+    // The block reads the page window, and its link opens the same window.
     expect(screen.getByTestId('host-investigations-all').getAttribute('href')).toBe(
-      '/investigations?entity=agent%3Aea2d&entity_label=files01&range=all',
+      '/investigations?entity=agent%3Aea2d&entity_label=files01&range=24h',
     );
   });
 

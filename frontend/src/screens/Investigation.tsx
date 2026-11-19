@@ -23,11 +23,13 @@ import {
 } from 'lucide-react';
 import { type ReactNode, useEffect, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { DECIDE_ON_RULE, ruleDecisionHeadWords } from '../lib/ruleDecision';
 import { AskSocAiButton, investigationStarters } from '../components/AskPanel';
 import { AuthorizedActivityDialog } from '../components/AuthorizedActivityDialog';
 import { ConfidenceRing } from '../components/ConfidenceRing';
 import { DocumentChip, DocumentDrawer, type CitedField } from '../components/DocumentDrawer';
 import { DraftDetectionPane } from '../components/DraftDetectionPane';
+import { FindingNameNote } from '../components/FindingNameNote';
 import { EventTimelinePanel, eventTimelineMeta } from '../components/EventTimeline';
 import { Markdown } from '../components/Markdown';
 import { EntityGraph } from '../components/EntityGraph';
@@ -60,6 +62,7 @@ import {
   startHunt,
 } from '../lib/api';
 import { campaignHolds } from '../lib/campaignDecision';
+import { campaignDecidedNoWait } from '../lib/campaignWords';
 import {
   ackMessage,
   ackWroteNothing,
@@ -73,6 +76,7 @@ import { VERDICT_OPTIONS, confidenceWord, verdictLabel } from '../lib/labels';
 import { useToast } from '../lib/toast';
 import { gapSentence } from '../lib/openQuestions';
 import { plainHeadline, plainText, splitHeadline, toolWords } from '../lib/headline';
+import { ToolText } from '../components/ToolText';
 import { fieldChipLabel, fieldChipTitle, fieldWords, findingCitation } from '../lib/citations';
 import { asSentence, failureAction, failureCause, failureKind } from '../lib/runFailure';
 import {
@@ -91,7 +95,7 @@ import { useAsync } from '../lib/useAsync';
 import { useChat, useChatScope } from '../lib/chatScope';
 import { citedEventIds, splitEventIds } from '../lib/eventIds';
 import { demoBlocked, useDemo } from '../lib/demo';
-import { absTime } from '../lib/timeRange';
+import { stepTimeUtc, utcStamp, utcTimesInText } from '../lib/timeRange';
 import { TIMELINE_GROUP_COLOR, VERDICT, tint } from '../lib/tokens';
 import type {
   AlertMeta,
@@ -108,6 +112,7 @@ import type {
   SummarySegment,
   TimelineStep,
 } from '../lib/types';
+import { UtcTime } from '../components/UtcTime';
 
 
 interface InvestigationProps {
@@ -306,7 +311,9 @@ export const CONFIDENCE_TIP =
 
 /** What the severity chip on the verdict card is. */
 export const RULE_SEVERITY_TIP =
-  'Rule severity. The detection rule sets it. It is not the confidence of the verdict.';
+  'Alert severity. Security Onion records this level on the alert. The rule that raised the alert sets it. ' +
+  'It is not the confidence of the verdict. The rule metadata severity of a citation is a different field. ' +
+  'The author of the rule writes it.';
 
 /** The four Alert details rows the drawer shows first. */
 const BRIEF_ROWS = new Set(['rule', 'source', 'dest', 'user']);
@@ -454,12 +461,22 @@ function EntityText({ text, entities }: { text: string; entities?: EntityRef[] }
             className="font-[inherit] text-[inherit]"
           />
         ) : (
-          <span key={i}>{seg.v}</span>
+          <span key={i}>
+            <ToolText text={seg.v} />
+          </span>
         ),
       )}
     </>
   );
 }
+
+/** Prose on this page: the words of `plainText`, and each ISO instant in the
+ *  one time form of the page (dogfood 2026-11-17, AA5). */
+const pageText = (text: string): string => utcTimesInText(plainText(text));
+
+/** Prose that EntityText renders: a tool id stays, and EntityText shows its
+ *  words with the id in a tooltip (F20). */
+const linkedText = (text: string): string => utcTimesInText(plainText(text, { tools: false }));
 
 /** Text with each document id rendered as a control that opens the document,
  *  and each entity it names as a link to its page (dogfood 2026-10-06,
@@ -817,7 +834,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     <button
       onClick={dismissError}
       disabled={errDismiss === 'busy'}
-      title="This button acknowledges the failed investigation. The Dashboard stops counting it. The investigation stays under the Investigations 'Pipeline error' filter, and you can still re-run it."
+      title="This button acknowledges the failed investigation. The Dashboard stops counting it. The investigation stays in the Failed view of the Investigations list, and you can still run it again."
       className="flex items-center gap-1.5 rounded-control border border-border-strong bg-surface-3 px-4 py-2 text-[12.5px] font-semibold text-dim hover:border-accent hover:text-text disabled:opacity-60"
     >
       {errDismiss === 'busy' ? <Spinner size={13} /> : <X size={13} />}
@@ -969,10 +986,18 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
   // its actions waits. The server counts the same way (action_waits).
   // A run that a campaign holds requests nothing either: the analyst decides
   // once, on the campaign (owner, 2026-11-14). The server counts the same way.
+  //
+  // The server states whether each action waits, by the one rule of Needs you
+  // (`waits`). The page counted every open action, and 10 of 19 open
+  // detections read "1 action waits for you" for the acknowledge of a false
+  // positive that no queue held (macro review 2026-11-17, m14). An older
+  // server sends no `waits`, and the page then keeps its own count.
+  const ruled = inv.actions.some((a) => a.waits !== undefined);
   const pendingCount = markHolds(inv.authorization) || campaignHolds(inv.campaign)
     ? 0
     : inv.actions.filter(
         (a) =>
+          (!ruled || a.waits === true) &&
           actions[a.id] !== 'approved' &&
           a.applied !== true &&
           !(a.id in dismissals ? dismissals[a.id] : a.dismissed),
@@ -1009,6 +1034,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
           Object.values(actions).some((d) => d === 'approved') || settledMsg?.tone === 'ok',
         noWrites: isBacktestReplay(inv.meta?.ranBy),
         authorized: markHolds(inv.authorization),
+        campaignDecided: campaignHolds(inv.campaign) ? campaignDecidedNoWait(inv.campaign) : null,
+        ruleDecision: inv.ruleDecision ?? null,
       })}
       className="mb-3"
     />
@@ -1149,9 +1176,10 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       </div>
       {pf.detail && (
         <div className="mt-1 text-[12.5px] leading-[1.5] text-text-2">
-          <EntityText text={plainText(pf.detail)} entities={inv.entities} />
+          <EntityText text={linkedText(pf.detail)} entities={inv.entities} />
         </div>
       )}
+      <FindingNameNote note={pf.nameNote} className="mt-1.5" />
       {pf.attacker && pf.victim ? (
         <div data-testid="promoted-direction" className="mt-1.5 font-mono text-[12px] text-dim">
           <EntityLink value={pf.attacker} className="text-mono-amber" />
@@ -1558,7 +1586,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <div data-testid="verdict-context" className="mb-3 flex flex-wrap items-center gap-2.5">
             {inv.sev && (
               <span data-testid="rule-severity" title={RULE_SEVERITY_TIP} className="inline-flex cursor-help items-center gap-1.5">
-                <span className="text-[10.5px] uppercase tracking-[.05em] text-faint">rule severity</span>
+                <span className="text-[10.5px] uppercase tracking-[.05em] text-faint">alert severity</span>
                 <SeverityTag sev={inv.sev} />
               </span>
             )}
@@ -1611,7 +1639,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       )}
       {/* rationale as headline */}
       <div data-testid="verdict-headline" className="text-[21px] font-semibold leading-[1.32] tracking-[-.015em]" style={{ textWrap: 'pretty' }}>
-        {isFallback ? FALLBACK_HEADLINE : <CitedText text={headline.text} ids={citedIds} entities={inv.entities} />}
+        {isFallback ? FALLBACK_HEADLINE : <CitedText text={utcTimesInText(headline.text)} ids={citedIds} entities={inv.entities} />}
       </div>
       {/* A gate changed the verdict. The headline above is the sentence of
           the model, and this one line states the change and its reason
@@ -1638,7 +1666,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         <p data-testid="model-wrote" className="mt-3 text-[12.5px] leading-[1.6] text-dim" style={{ textWrap: 'pretty' }}>
           <span className="font-semibold text-[#8b94a3]">The model wrote</span>
           {': '}
-          {plainText(modelWrote)}
+          {pageText(modelWrote)}
         </p>
       )}
       {/* After an analyst override the model's paragraph no longer explains
@@ -1778,7 +1806,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
         className="mb-3 rounded-card border border-border-strong bg-surface-2 px-3.5 py-3"
       >
         <div className="mb-1.5 flex items-center gap-2 text-[12px] font-semibold uppercase tracking-[.05em] text-warn">
-          <Wrench size={13} /> Pipeline error
+          <Wrench size={13} /> Failed
         </div>
         <div className="mb-2.5 text-[13px] leading-[1.55] text-text-2" style={{ textWrap: 'pretty' }}>
           This investigation failed before it reached a verdict
@@ -1947,7 +1975,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
       >
         <span className="font-semibold" style={{ color: '#8fa3bf' }}>Verdict check</span>
         {': '}
-        {plainText(inv.validatorNote)}
+        {pageText(inv.validatorNote)}
       </div>
     )}
     </>
@@ -2073,6 +2101,14 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     if (a.id in dismissals) return dismissals[a.id];
     return a.dismissed ? { by: a.dismissedBy ?? 'an analyst', at: a.dismissedAt ?? null } : null;
   };
+  // An open false positive waits on one decision for its rule, and no queue
+  // holds its acknowledge alone. The head of the actions names that step in
+  // place of "0 actions wait for you" (dogfood 2026-11-19, D8).
+  const ruleWaits =
+    !!inv.ruleDecision &&
+    inv.ruleDecision.count > 0 &&
+    pendingCount === 0 &&
+    !Object.values(actions).some((d) => d === 'approved');
   // Whether each write may run is the server's answer (blockedReason), from
   // the one rule the row of the pending-action list, the needs-you count and
   // the execute route read. The card read the kind of the run, and offered a
@@ -2082,7 +2118,20 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     <CollapsibleSection
       title="Recommended actions"
       tour="investigation-actions"
-      meta={pendingCount === 1 ? '1 action waits for you' : `${pendingCount} actions wait for you`}
+      meta={
+        ruleWaits && inv.ruleDecision ? (
+          <span data-testid="actions-rule-decision" className="font-sans">
+            {ruleDecisionHeadWords(inv.ruleDecision.count)}{' '}
+            <Link to={inv.ruleDecision.href} className="font-semibold text-accent hover:underline">
+              {DECIDE_ON_RULE}
+            </Link>
+          </span>
+        ) : pendingCount === 1 ? (
+          '1 action waits for you'
+        ) : (
+          `${pendingCount} actions wait for you`
+        )
+      }
     >
       <div className="flex flex-col gap-2.5">
         {inv.actions.map((a, i) => (
@@ -2105,6 +2154,7 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
             findingCase={inv.promotedKind === 'finding'}
             campaign={inv.campaign}
             confirmRequest={confirmRequest?.id === a.id ? confirmRequest.n : undefined}
+            ruleDecision={inv.ruleDecision ?? null}
           />
         ))}
       </div>
@@ -2136,8 +2186,8 @@ export function Investigation({ inv, layout = 'drawer', onReHunt, onVerdictAppli
     // taken: a green line over "0 written" read as a write (R2-D15).
     const call: Promise<{ text: string; wrote: boolean }> =
       kind === 'ack'
-        ? ackGroup(group).then((r) => ({ text: ackMessage(r, inv.name), wrote: !ackWroteNothing(r) }))
-        : escalateGroup(group).then((r) => ({
+        ? ackGroup(group, {}, inv.id).then((r) => ({ text: ackMessage(r, inv.name), wrote: !ackWroteNothing(r) }))
+        : escalateGroup(group, {}, inv.id).then((r) => ({
             text: escalateMessage(r, inv.name),
             wrote: !escalateWroteNothing(r),
           }));
@@ -2891,7 +2941,7 @@ function AlertDetailsPanel({
     ['proto', alert.proto],
     ['action', alert.action],
     // With the zone: a bare local time read as UTC (R2-D17).
-    ['alert time', <span title={alert.time ?? undefined}>{absTime(alert.time, { zone: true })}</span>],
+    ['alert time', <UtcTime iso={alert.time} />],
     // The count is the fires of this rule on either end of the alert in the
     // host-context window. It read "events 6" on a 13-event group (R2-D21).
     [
@@ -3222,8 +3272,8 @@ function InvMetaPanel({ meta, id, toolCalls }: { meta: InvMeta; id: string; tool
     ['pivots', `${meta.pivots}`],
     ['run by', meta.ranBy],
     // The time of the event first, then the time of the investigation.
-    ['event time', absTime(meta.eventAt || meta.ranAt, { zone: true })],
-    ['ran at', absTime(meta.ranAt, { zone: true })],
+    ['event time', utcStamp(meta.eventAt || meta.ranAt, { seconds: true })],
+    ['ran at', utcStamp(meta.ranAt, { seconds: true })],
   ];
   return (
     <CollapsiblePanel
@@ -3364,7 +3414,7 @@ function Summary({
         if (seg.t === 'text')
           return (
             <span key={i}>
-              <CitedText text={plainText(seg.v)} ids={ids} entities={entities} />
+              <CitedText text={linkedText(seg.v)} ids={ids} entities={entities} />
             </span>
           );
         if (seg.t === 'mono')
@@ -3443,7 +3493,7 @@ function TimelineRow({
             {TIMELINE_GROUP_LABEL[step.group] ?? step.group}
           </span>
           <div className="flex-1" />
-          <span className="font-mono text-[11px] text-faint">{step.time}</span>
+          <span className="font-mono text-[11px] text-faint">{stepTimeUtc(step.time)}</span>
         </div>
         {failedCheck ? (
           // A failed query folds (dogfood 2026-10-06, W4). The raw tool

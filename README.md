@@ -46,6 +46,9 @@ Read the [Security Onion prerequisites](docs/SECURITY-ONION-SETUP.md) before the
 - Triage: the agent reads an alert and its related events, enriches the indicators and decodes the PCAP. It writes a verdict with citations.
 - Hunts: you type an objective in plain English, and the read-only agent runs it across many hosts and a time window.
 - Analytics and leads: analytics run over the grid on a schedule. Hits on one entity form a lead, and the lead starts its own hunt.
+- Campaigns: proven links join the investigations of one attack into one campaign. The analyst decides once on the campaign: one case, a close with a reason, or an authorization.
+- Needs you: one list holds each decision that waits on the analyst, the most important first.
+- Rule decisions: the analyst acknowledges the open false positives of one rule with one press. A standing decision lets soc-ai acknowledge the later false positives of the rule for 30 days by default.
 - Runbooks: the agent cites the procedures of your own team. The repo ships a starter pack of 10 runbooks.
 - Evidence gates: a true-positive or false-positive verdict needs evidence that the run retrieved. A weaker verdict becomes `needs_more_info`.
 - Write-backs: the agent recommends an acknowledge, an escalation or a comment. You run it with one click, and soc-ai audits it.

@@ -33,13 +33,18 @@ starts or joins a campaign, and you decide once on the campaign in Needs you.
   the finding. A lead of a campaign waits on the campaign, and a change of the campaign starts
   at most one hunt in 24 hours. The chain is Hit, Lead, Hunt, Investigation, Verdict, Campaign.
 
-Needs you is the single queue for your decisions. It holds the campaigns that wait on your
-decision, the investigations that wait on your decision, the leads that wait on a decision and the
-alert groups with no verdict. An investigation waits when its verdict needs more info or when a
-recommended action waits for you. An unread shadow hit is review work. The console counts the unread shadow hits
-apart, in a neutral color. You decide once on a campaign: open one Security Onion case for the whole
-activity, close it with a reason, or record its activity as authorized. On an investigation you override the verdict or approve a recommended
-action. Your actions go to Security Onion. You tune an analytic with approve, reject and draft.
+Needs you is the single queue for the decisions of the analyst. The queue holds the campaigns and
+the investigations that wait on a decision of the analyst. The queue also holds the leads that wait
+on a decision, the rules with open false positives and the alert groups with no verdict. An
+investigation waits when the verdict needs more info. A true positive investigation also waits
+when no campaign and no authorization holds the investigation, and the analyst did not decide on
+the investigation. The row of a true positive with no action that the console can execute reads
+"Acknowledge or escalate". An unread shadow hit is review work. The console counts the unread
+shadow hits apart, in a neutral color. The analyst decides once on a campaign. The analyst opens
+one Security Onion case for the whole activity, closes the campaign with a reason, or records the
+activity as authorized. On an investigation, the analyst overrides the verdict or approves a
+recommended action. The actions of the analyst go to Security Onion. The analyst tunes an analytic
+with approve, reject and draft.
 
 Two controls start the next step:
 
@@ -129,10 +134,11 @@ its role and state.
 
 ## Navigation
 
-The sidebar has two groups. Analyst holds Dashboard, Alerts, Investigations,
-Hosts and Hunts. It stays open, because an analyst spends most of a shift on those screens.
-Operator holds Status, Runbooks, Backtest and Settings. It starts collapsed,
-because you reach those screens once a shift or once a week.
+The sidebar has two groups. Analyst holds Needs you, Dashboard, Campaigns,
+Alerts, Investigations, Hosts and Hunts. The Analyst group stays open, because
+an analyst spends most of a shift on those screens. Operator holds Status,
+Runbooks, Backtest and Settings. The Operator group starts collapsed, because an
+operator opens those screens once a shift or once a week.
 
 Click the Operator heading to expand the group, or go straight to one of its
 screens. Operator expands itself when the current page is in that group. Thus a
@@ -144,7 +150,8 @@ entry for that page.
 
 The bell badge states the Needs-you count: the decisions that wait on you. The
 badge is red only when a decision waits. The "Needs you" block lists each part of
-that count, with its scope and a link to its list. The block is at the top of
+that count with the scope of the part. Each line opens the Needs you page with
+the type filter for the part on that line. The block is at the top of
 the bell panel and of the Notifications page. The parts add up to the badge. A
 neutral line under the parts states the unread shadow hits, for example "236
 shadow hits to review", with its own link. The badge does not count them. The
@@ -165,6 +172,10 @@ marks every unread shadow hit up to that moment as read, and the audit trail
 records it. Leads, alert groups with no verdict, verdicts that need more info and
 recommended actions are decisions. Dismiss all does not touch them.
 
+The first entry of the sidebar is **Needs you**. The badge of that entry states
+the decision count, and the entry opens the Needs you page. The command palette
+has the same entry.
+
 The Alerts, Investigations and Hunts entries carry a badge for the decisions that
 wait on you there. Each badge is a link to the list it counts. The Investigations
 badge counts investigations, and it opens the Needs you view of the list. The
@@ -180,11 +191,21 @@ The palette lists hosts and investigations before hunts. A hunt result shows the
 title of the hunt and its outcome on one line each.
 
 The Ask soc-ai button at the right end of the top bar opens the chat. See
-[Ask soc-ai](#ask-soc-ai).
+[Ask soc-ai](#ask-soc-ai). When the top bar has no room, the button shows
+"Ask soc-ai" only. The tooltip of the button states the full label.
 
 The top bar shows the workspace switcher only when more than one workspace
 exists. On a lead page, the breadcrumb reads "Hunts / Lead 18", and the Hunts
 entry stays highlighted.
+
+The top bar states the time now in UTC, for example "14:32 UTC". Every
+absolute time on a page is in UTC. The tooltip of each absolute time states the
+local time with the zone. Press the clock to set a second clock: "Off",
+"Local time of this browser" or "Another zone". The top bar then shows both
+clocks, UTC first. The second clock shows the weekday when the date of that zone
+is not the UTC date. A zone from "Another zone" is also the local time of each
+tooltip. This browser keeps the choice. Below 1100 px beside the open sidebar,
+the second clock shows only in the panel of the clock.
 
 ## Tours
 
@@ -357,13 +378,15 @@ chat on either one.
 
 ### Needs you
 
-The first tile states the decisions that wait on you. It has one line for each
-part, and each line opens the list that holds that work:
+The first tile states the decisions that wait on the analyst. The tile has one
+line for each part. Each line opens the Needs you page with the type filter for
+the part on that line:
 
-- the campaigns that wait on your decision, at any age,
-- the investigations that wait on your decision, at any age: a verdict that
-  needs more info or a recommended action that waits for you,
+- the campaigns that wait on a decision of the analyst, at any age,
+- the investigations that wait on a decision of the analyst, at any age: a
+  verdict that needs more info or a true positive that waits,
 - the leads that wait on a decision,
+- the rules with open false positives, at any age,
 - the alert groups with no verdict in the last 7 days.
 
 Each decision counts once. An investigation with two recommended actions is one
@@ -378,7 +401,96 @@ to review". The line opens the unread hits on the Hunts page. The tile number
 does not count them. A shadow hit is review work, and Dismiss all reads every
 hit in one press.
 
-The investigations line opens the Investigations list in the view **Needs you**.
+**The Needs you page.** The page lists each decision, the most important first:
+campaigns, true positives, leads, other investigations, rules with open false
+positives, then alert groups.
+Inside each group the impact, the severity and the newest event decide. Inside
+the group of the rules, the count with checked evidence decides first, then the
+newest event. A row
+starts with the verdict, the impact and the severity. Then the row states the
+title, why the item waits, the machines, the action that waits with what the
+action writes, and "Waits for 3 days". A value that soc-ai does not hold reads
+unknown. Select a row to open the item. No row writes. A chip for each type
+filters the list.
+
+On an investigation page, "1 action waits for you" counts only the actions that
+Needs you lists. The acknowledge of a false positive stays on the action card.
+That acknowledge waits for no one.
+
+**Rule decisions.** soc-ai gives a false positive verdict, and then a guard of the
+automatic acknowledge can hold the write. The alert stays open in Security Onion.
+An open false positive is such a verdict: the alert is not acknowledged on the grid,
+no person dismissed the acknowledge, and no analyst verdict stands on the alert.
+Needs you lists one row for each rule with one or more open false positives, after
+the other investigations and before the alert groups. Each rule is one decision in
+the count of the tile, the bell and the sidebar.
+
+soc-ai puts each open false positive in one of two groups:
+
+- **Checked evidence.** The hold is `high_stakes`, the automatic acknowledge
+  failed, or the automatic acknowledge was off. The evidence guards passed. The API
+  calls this group `confident`.
+- **Weak evidence.** The hold is `below_threshold`, `no_investigation`, `uncited`,
+  `oracle_dissent`, `earlier_true_positive` or `earlier_runs_unread`.
+
+No guard looked at an investigation that ran while the automatic acknowledge was
+off. soc-ai puts such an investigation in the group with weak evidence when the
+confidence is under the threshold `auto_ack_fp_threshold` of now. soc-ai does the
+same when the stored counts of the investigation show no tool call and no grid
+search.
+
+The page of a rule shows the investigations of each UTC day for the two groups, the
+machines and the hold reasons. A minute step asks the grid for the state of each
+alert. The page asks the grid again when the state is older than 5 minutes. When
+the grid does not answer, the page states the time of the last read. An alert that
+the grid states as acknowledged is in no count.
+
+Press **Acknowledge** to acknowledge the group with checked evidence once. Select the check box
+to add the group with weak evidence. soc-ai acknowledges the alert of each
+investigation and the open alerts of the same rule between the same machines.
+soc-ai never acknowledges an alert with a true positive, a needs more info or an
+analyst verdict. Each investigation then gets a receipt, and the card of the
+investigation shows no open Acknowledge. Each button states the count of the
+alerts that the press acknowledges: the alerts of the investigations, the alerts
+that inherit the verdict of the investigations, and the alerts of the rule that a
+separate verdict keeps open. The scan of the grid reads
+the last 30 days and at most 2,000 alerts, and the button states when the scan
+stops at that limit. When no open false positive of the rule has checked evidence,
+the main button acknowledges the group with weak evidence. Read the samples first.
+A rule can hold a true positive and false positives on the same two machines. The
+page marks the day and the machines of each true positive. The page also states
+how many open false positives are on the machine pair of a true positive. The main
+button leaves those out. The check box
+**Also the N on the machines of the true positive** adds those false positives.
+The check box is off by default. The API field is `includeTruePositivePairs`.
+The audit record `rule_decision_made` comes before the first write. A
+failed audit write changes nothing. When the grid does not answer, soc-ai writes
+nothing and the decision states the failure.
+
+A **standing decision** also lets soc-ai acknowledge each later false positive of
+the rule. The standing decision lifts the hold `high_stakes` for that rule and no
+other guard. A later verdict with weak evidence still waits, and
+`auto_ack_fp_enabled` must be on. A standing decision ends after the term
+`rule_decision_days`, when the analyst ends the decision, or at once when an
+investigation of the rule gets a true positive verdict. The default term is 30
+days. soc-ai refuses a standing decision for a rule that holds a true positive
+verdict, and while `auto_ack_fp_enabled` is off. The Needs you row of a rule
+states the end of the standing decision and the cause. On the page of a rule,
+the button "Acknowledge these, and each later false positive of this rule for 30
+days" makes a standing decision. The button "End the standing decision" ends the
+decision. The fold "Standing rule decisions" under the Needs you list names each
+standing decision in force, with the end date and the count of the false
+positives that soc-ai acknowledged under the decision.
+
+A change of the guard can let a rule pass that the guard held before. soc-ai reads
+that from the stored events: an automatic acknowledge succeeded after the newest
+hold `high_stakes` of the rule, and no rule decision allowed that acknowledge. The
+page of the rule then states the date and the count of the open holds from before
+that date. The hold reason reads in the past tense. soc-ai refuses a standing decision
+for such a rule, because the decision adds nothing.
+
+The Investigations badge in the sidebar opens the Investigations list in the
+view **Needs you**.
 A row with a recommended action that waits shows its waiting actions: the alert
 or the case, and the reason of the model. Each action has two buttons on the row. The
 first button names the write, as on the action card: **Escalate to case**,
@@ -455,9 +567,13 @@ Under the tile one sentence states the flow: "soc-ai investigates alerts, hunts 
 confirmed attacks into campaigns. You decide in Needs you, and soc-ai writes your actions to
 Security Onion." The **How this flows** link after it opens the chart on the Hunts page.
 
-The true positives tile counts the investigations with a true positive verdict
-in the Dashboard window. The Investigations list counts the same runs with the
-same query. "Open them" opens that list.
+The tile **True positives that wait** counts the true positive investigations in
+the Dashboard window that wait on the analyst. The tile counts only a verdict
+that stands. A true positive does not wait when a campaign with a decision in
+force holds the investigation. An authorization and a decision of the analyst
+on the investigation also end the wait. The tile states the count of the hosts
+of the investigations that wait. "Open them" opens the Investigations list with
+exactly the counted rows. The Confirmed threats panel reads the same count.
 
 When the grid answers the health probe late, an amber banner reads
 "The grid is slow. Counts can be late." Each tile that reads the grid then
@@ -581,7 +697,11 @@ Security Onion style. soc-ai groups them
 by rule and shows the newest first.
 
 - **Filter and sort:** the controls are the time range, the severity, the sort
-  order, and a free-text OQL box.
+  order, and a free-text OQL box. A filter that the parser refuses shows "The
+  filter is not valid". A filter that the grid rejects shows "The grid rejected
+  the filter". The message states the correct form first when soc-ai knows the
+  form. The reason text of Elasticsearch follows. The list does not refresh
+  until the analyst corrects or clears the filter.
 - **Expand a group:** click a group row to load its recent events.
 - **Investigate:** start an investigation for an alert or a group. An
   investigation runs as a background task. It continues when you close the drawer. It runs
@@ -626,29 +746,29 @@ The Investigations screen is at `/app/investigations`. It lists every past inves
 permalink on each. A row carries the verdict, the rule, the time and the person
 who started it. Use the list to review history and to find an earlier verdict.
 
-**Event time:** the time of an investigation is the time of the event that it
-judges. The When column states the time of the event. A second line reads
-"investigated 2h ago" when soc-ai investigated the event more than one hour
-later. The hover text states both times in UTC. The window and the order of the
-list read the time of the event. The Dashboard tile **True positives** and the
-**Confirmed threats** panel read it too. Thus an investigation of today on an
-event of 10 days ago is not in the last 24 hours. Needs you has no window, so it
-still lists that investigation. The bell states a change of the campaign that
-holds it. A
-bell row for a verdict on an event older than 24 hours states the date of the
-event. The **Failed** view reads the time when soc-ai started the investigation,
-because a pipeline error is a fact about soc-ai.
+**Event time:** the time of an investigation is the time of the event that the
+investigation judges. The When column states the time of the event. A second
+line reads "investigated 2h ago" when soc-ai investigated the event more than
+one hour later. The hover text states both times in UTC. The window and the order of the
+list read the time of the event. The Dashboard tile **True positives that wait**
+and the **Confirmed threats** panel read the time of the event too. Thus an
+investigation of today on an event of 10 days ago is not in the last 24 hours.
+Needs you has no window, so Needs you still lists that investigation. The bell
+states a change of the campaign that holds the investigation. A bell row for a
+verdict on an event older than 24 hours states the date of the event. The
+**Failed** view reads the time when soc-ai started the investigation,
+because a failed investigation is a fact about soc-ai.
 
 **Preset views:** the chips at the top of the list open a view in one press. The
 address names the active view, for example `?view=needs_you`, so a link opens it.
 
-- **Needs you:** the investigations that need more info or have a recommended
-  action that waits for you, at any age. The chip and the badge on the
-  Investigations entry state the same number. The badge opens this view.
+- **Needs you:** the investigations that need more info and the true positives
+  that wait on a decision of the analyst, at any age. The chip and the badge on
+  the Investigations entry state the same number. The badge opens this view.
 - **True positives:** the true positives in the window on screen. A row that
   states an impact comes first, and the worst impact leads.
 - **Failed:** the runs with no usable verdict that need a retry, started in the
-  last 30 days. The pipeline error tile on the Dashboard counts the same runs.
+  last 30 days. The line "N failed investigations" on the Dashboard counts the same runs.
 - **All:** every investigation in the window on screen.
 
 A view sets the filters it owns and clears the other filters. A filter change
@@ -701,6 +821,38 @@ the other findings of the hunt are not on its list. soc-ai builds the section fr
 that the run already holds. It makes no new grid query. The section counts the
 cited documents that have no stored time.
 
+## Campaigns
+
+The Campaigns screen is at `/app/campaigns`. The list holds one row for each
+active campaign, the newest last event first. A row states the campaign, the
+state, the stage, the actors, the targets, the period and the alert events.
+Select the title of a campaign to open the campaign page.
+
+Three filters are above the list: "All", "Waits on you" and "Decided". "Waits
+on you" keeps the campaigns with no decision. "Decided" keeps the campaigns
+with a decision in force: closed, authorized or with a case. The filter
+"Decided" lists every decided campaign, from any time.
+
+Each campaign surface shows one state chip. The chip states the decision in
+force, else the activity of the campaign:
+
+| Chip | Rule |
+|---|---|
+| Open | The campaign has an investigation event or an alert of a confirmed rule in the last 207 hours. |
+| Ended | The campaign has no investigation event and no alert of a confirmed rule in the last 207 hours. |
+| Closed | An analyst closed the campaign. A closed campaign that is not ended opens again on new activity. For an ended campaign, new activity starts a new campaign. |
+| Authorized | An authorization covers the campaign. The hover text states the expiry of the authorization. |
+| Case | A Security Onion case holds the campaign. The hover text states the time of the case. |
+
+An "Open" chip or an "Ended" chip with no decision has the warning color. The
+hover text then states that the campaign waits on a decision. The header of
+the campaign page, the campaigns list, a Confirmed threats row, the campaign
+chip of a row, the strip on an investigation page and the host page show the
+same chip.
+
+[Hunting](HUNTING.md#campaigns) describes the campaign page, the links, the
+stages, the end of a campaign and the decisions.
+
 ## Hunts
 
 The Hunts screen is at `/app/hunts`. It holds the hunting pipeline in order, top to bottom: the Needs you
@@ -712,14 +864,17 @@ the count states the unread shadow hits to review. Each link jumps to the block
 that holds them, with the filter set. The sidebar badges on the Hunts item show
 the same two numbers.
 
-A lead settles when its hunt finishes. A hunt that found no threat closes the
-lead. The lead then shows under Closed as "Closed. The hunt found no threat." with
-the chip "closed by soc-ai". A hunt closes the lead only when it read its
-evidence. A lead stays under Needs decision if its hunt could not read all
-evidence, or if an earlier hunt found a threat. A finding that linked the lead to
-other leads also keeps it there. The lead page states the reason. A
-hunt that found a threat or a visibility gap leaves the lead under Needs decision. If its hunt could not run on two attempts, the lead stays there as
-"Hunted · Could not run", with Hunt again.
+A lead settles when the lead hunt finishes. Only the lead hunt closes a lead. A
+lead hunt that found no threat closes the lead. The lead then shows under Closed
+as "Closed. The lead hunt found no threat." with the chip "closed by soc-ai". A
+lead hunt closes the lead only when the hunt read the evidence of the lead. A
+lead stays under Needs decision if the lead hunt could not read all evidence, or
+if an earlier hunt found a threat. A finding that linked the lead to other leads
+also keeps the lead under Needs decision. The lead page states the reason. A
+hunt that found a threat or a visibility gap leaves the lead under Needs
+decision. If the lead hunt could not run on two attempts, the lead stays under
+Needs decision as "Hunted · Could not run", with Hunt again. Another hunt that
+reads the lead records an answer and closes no lead.
 
 [docs/HUNTING.md](HUNTING.md) is the full guide. It covers the five nouns, the
 path from a hit to a lead and from a lead to a hunt, and the shadow week. It also
@@ -774,12 +929,17 @@ old link by address still opens the machine page with that address in focus.
   role, the OS, the criticality, and whether the machine reports on itself. "no
   agent data" means that the network supplied every field below. The host itself
   reported nothing to soc-ai.
-- **Four counters** cover the services the host answers on, the accounts that
-  authenticated, the connection volume, and the alerts over 7 days. An
-  `all alerts · 7d` link is under the alert count. The alerts console filters
-  by time, severity and verdict, and never by host. The link therefore opens on
-  the detections of the whole network over those days, with this host's
-  detections among them.
+- **The 24h and 7d buttons** set the window of the page. Each count on the page
+  reads that window: the accounts that authenticated, the connection volume, the
+  alerts, the verdict lines, the confirmed threats, the investigations and the
+  observations. A line with another scope names that scope, for example "all open
+  leads" or "all time".
+- **Four counters** cover the accounts that authenticated, the connection
+  volume and the alerts in the window. A link under the alert count opens the
+  alerts of this host over the same window. The fourth card, with a dashed
+  border, holds the services that the host answers on. The services are a fact
+  of the machine from the profile or the last sweep, so the buttons do not change
+  the card.
 - **Peers, volume and users** over the window that you pick, 24h or 7d.
 - **12 field cards**, one for each dossier field.
 - **The behavioural profile**, one row for each dimension of the host's baseline.
@@ -1310,8 +1470,15 @@ Onion state. The write tools acknowledge an alert, escalate it to a
 case, and add a comment. The agent can only *recommend* a write tool. You execute
 it with a click from the report, and soc-ai audits every execution.
 
-The only bounded exception is the confidence-gated auto-acknowledge for a
-low-stakes false positive. `auto_ack_fp_enabled` controls it. It never touches a
-critical alert or a malware-class alert. It never acts on a verdict for which the run
-retrieved nothing. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the agent
-capability surface in [AGENT_TOOLS.md](AGENT_TOOLS.md).
+The only bounded exception is the confidence-gated auto-acknowledge for a false
+positive. `auto_ack_fp_enabled` controls the auto-acknowledge. The auto-acknowledge
+holds a high-stakes alert for the analyst. A high-stakes alert is critical or high,
+has an exploit, attack or malware signal, or comes from a decoy. A Suricata alert of
+the classification policy violation or inappropriate content, with each signature
+severity Informational, is not high-stakes for a high severity alone. A standing rule
+decision lifts this one hold for one rule. The term is `rule_decision_days`, and the
+default is 30 days. The decision ends after the term or when the analyst ends the
+decision. A true positive verdict on an investigation of the rule ends the decision at
+once. Every other guard stays. The auto-acknowledge never acts on a verdict for which
+the investigation retrieved nothing. See [SAFETY_MODEL.md](SAFETY_MODEL.md) and the
+agent capability surface in [AGENT_TOOLS.md](AGENT_TOOLS.md).

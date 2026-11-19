@@ -99,7 +99,15 @@ describe('Alerts counts what is on the screen', () => {
 
     // Four events on the one row that survived the facet, not the 120 the
     // window held across all fifty-nine.
-    expect(headerLine()).toBe('1 untriaged · 1 detection · 4 events in window');
+    expect(headerLine()).toBe('1 untriaged · 1 detection · 4 events in window · acknowledged alerts hidden');
+  });
+
+  it('states that the events include acknowledged alerts when they show (AA6)', async () => {
+    // The Dashboard tile counts acknowledged alerts. The header states which
+    // set it counts, so the two numbers do not read as one count.
+    mount('/alerts?sev=critical&hide_acked=false');
+    await screen.findByText(CRITICAL.name);
+    expect(screen.getByTestId('alerts-acked-scope').textContent).toBe(' · acknowledged alerts included');
   });
 
   it('counts the preset chips after the facets are applied', async () => {
@@ -131,7 +139,7 @@ describe('Alerts counts what is on the screen', () => {
     await screen.findByText(CRITICAL.name);
 
     expect(footerLine()).toMatch(/^59 detections ·/);
-    expect(headerLine()).toBe('59 untriaged · 59 detections · 120 events in window');
+    expect(headerLine()).toBe('59 untriaged · 59 detections · 120 events in window · acknowledged alerts hidden');
     expect(chipTexts()).toContain('All59');
     expect(chipTexts()).toContain('Critical1');
   });
@@ -169,7 +177,7 @@ describe('Alerts says when the queue is bigger than the rows', () => {
     mount('/alerts');
     await screen.findByText(CRITICAL.name);
 
-    expect(headerLine()).toBe('59 untriaged · 59 detections · 120 events in window');
+    expect(headerLine()).toBe('59 untriaged · 59 detections · 120 events in window · acknowledged alerts hidden');
     expect(screen.getByText(/untriaged ·/).getAttribute('title')).toBeNull();
   });
 

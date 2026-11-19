@@ -66,11 +66,14 @@ describe('the confidence word', () => {
     expect(CONFIDENCE_TIP).toContain('0.70');
   });
 
-  it('labels the severity as the rule severity, apart from the confidence', () => {
+  it('labels the severity as the alert severity, apart from the confidence', () => {
     mount(0.9);
     const sev = screen.getByTestId('rule-severity');
     expect(sev.getAttribute('title')).toBe(RULE_SEVERITY_TIP);
-    expect(sev.textContent).toContain('rule severity');
+    expect(sev.textContent).toContain('alert severity');
+    // Round 3 part 2, P4: the tooltip names the second field, the severity
+    // of the rule metadata, so "High" beside "Informational" reads as two fields.
+    expect(sev.getAttribute('title')).toContain('rule metadata severity');
     // Negative control: the severity is not in the row that holds the confidence.
     const confRow = screen.getByTestId('confidence-word').closest('[title]')?.parentElement;
     expect(confRow?.contains(sev)).toBe(false);

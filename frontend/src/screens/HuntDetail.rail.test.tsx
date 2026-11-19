@@ -17,6 +17,7 @@ vi.mock('../lib/api', async (importOriginal) => ({
 }));
 
 import { getAbout, getHunt } from '../lib/api';
+import { huntHosts } from '../lib/huntGraph';
 import { HuntDetail } from './HuntDetail';
 
 const about: AboutInfo = {
@@ -95,13 +96,65 @@ describe('HuntDetail right rail', () => {
       }),
     );
     mount();
-    expect(await screen.findByText('Affected hosts')).toBeInTheDocument();
+    // The report of a threat hunt marks its hosts affected. The panel names
+    // the hosts and marks the affected ones (AB3).
+    expect(await screen.findByText('Hosts named')).toBeInTheDocument();
+    expect(screen.getByTestId('hunt-hosts-affected').textContent).toBe(
+      '2 affected: a threat finding or the report names them.',
+    );
     expect(screen.getByText('MITRE ATT&CK')).toBeInTheDocument();
     expect(
       screen.getByText(
         'Severity held at medium. The finding cites alerts only. An investigation can raise it.',
       ),
     ).toBeInTheDocument();
+  });
+
+  it('counts the hosts of the findings and of the report in one list with the map', async () => {
+    // Dogfood 2026-11-17, AB3: "Hosts named 12" from the report stood beside
+    // a map of 18 hosts from the findings.
+    vi.mocked(getHunt).mockResolvedValue(
+      hunt({
+        outcome: 'no_threat',
+        affectedHosts: ['10.1.10.11', '10.1.10.12'],
+        findings: [
+          {
+            title: 'beacon is ntp',
+            detail: 'd',
+            severity: 'info',
+            category: 'observation',
+            hosts: ['10.1.10.11', '10.1.10.21', '10.1.10.22'],
+            citations: [],
+          },
+        ],
+      }),
+    );
+    mount();
+    expect(await screen.findByText('Hosts named')).toBeInTheDocument();
+    expect(screen.getByTestId('hunt-hosts-count').textContent).toBe('4');
+    expect(huntHosts(
+      [{ title: 't', detail: 'd', severity: 'info', category: 'observation', hosts: ['10.1.10.11', '10.1.10.21', '10.1.10.22'], citations: [] }],
+      ['10.1.10.11', '10.1.10.12'],
+    ).length).toBe(4);
+    // NEGATIVE CONTROL: a hunt that found no threat marks no host affected.
+    expect(screen.queryByTestId('hunt-hosts-affected')).toBeNull();
+  });
+
+  it('marks a host that a threat finding names, whatever the stored outcome word', async () => {
+    // The demo hunt read "threats_confirmed", and the panel marked nothing.
+    vi.mocked(getHunt).mockResolvedValue(
+      hunt({
+        outcome: 'threats_confirmed',
+        affectedHosts: [],
+        findings: [
+          { title: 'beacon', detail: 'd', severity: 'high', category: 'threat', hosts: ['10.1.10.31'], citations: [] },
+        ],
+      }),
+    );
+    mount();
+    expect((await screen.findByTestId('hunt-hosts-affected')).textContent).toBe(
+      '1 affected: a threat finding or the report names it.',
+    );
   });
 
   it('lists the operator steps apart from the console actions', async () => {

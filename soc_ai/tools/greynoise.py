@@ -80,7 +80,7 @@ async def greynoise(ip: str, *, settings: Any) -> dict[str, Any]:
         return {
             "skipped": True,
             "ip": ip,
-            "summary": "private/internal IP — GreyNoise only tracks public scanners",
+            "summary": "private/internal IP. GreyNoise only tracks public scanners.",
         }
 
     key = settings.greynoise_api_key.get_secret_value()

@@ -19,7 +19,8 @@ import { relativeAge } from '../lib/hostDossier';
 import { machineHref } from '../lib/hostsList';
 import { isIpKey } from '../lib/ip';
 import { plural } from '../lib/plural';
-import { absTime } from '../lib/timeRange';
+import { timeTitle } from '../lib/timeRange';
+import { UtcTime } from '../components/UtcTime';
 import { ENTITY_ADDRESS, ENTITY_NAME } from '../lib/tooltips';
 import type { EntityDetail, EntityTimelineItem, EntityType, Severity, Verdict } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
@@ -58,7 +59,7 @@ function TimelineCard({ item }: { item: EntityTimelineItem }) {
           <span className="rounded-chip border border-border-input bg-surface-3 px-1.5 py-px font-mono text-[9.5px] font-semibold uppercase tracking-[.04em] text-dim">
             {isInv ? 'Investigation' : 'Hunt finding'}
           </span>
-          <span className="font-mono text-[10.5px] text-faint">{absTime(item.ts)}</span>
+          <UtcTime testId="entity-row-time" className="font-mono text-[10.5px] text-faint" iso={item.ts} />
         </div>
         <div className="mt-1 break-words text-[13px] font-medium text-text group-hover:text-white">
           {item.title || (isInv ? 'Investigation' : 'Hunt finding')}
@@ -243,10 +244,10 @@ function EntityBody({
               V2-7). */}
           {data.first_seen || data.last_seen ? (
             <>
-              <span title={data.first_seen ? absTime(data.first_seen) : undefined}>
+              <span title={data.first_seen ? timeTitle(data.first_seen) : undefined}>
                 first soc-ai record {data.first_seen ? relativeAge(data.first_seen) : 'never'}
               </span>
-              <span title={data.last_seen ? absTime(data.last_seen) : undefined}>
+              <span title={data.last_seen ? timeTitle(data.last_seen) : undefined}>
                 last soc-ai record {data.last_seen ? relativeAge(data.last_seen) : 'never'}
               </span>
             </>

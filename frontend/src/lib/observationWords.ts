@@ -1,4 +1,4 @@
-import { absoluteTime } from './timeRange';
+import { utcStamp } from './timeRange';
 
 // ---------------------------------------------------------------------------
 // The words of an observation, read after the fact.
@@ -20,7 +20,7 @@ export function anchoredSummary(text: string, bornAt: string | null | undefined,
   const born = new Date(bornAt).getTime();
   if (!Number.isFinite(born)) return text;
   const age = now - born;
-  const stamp = absoluteTime(bornAt);
+  const stamp = utcStamp(bornAt);
   let out = text.replace(LAST_HOURS, (whole, hours: string) =>
     age > Number(hours) * 3_600_000 ? `in the ${hours} h before ${stamp}` : whole,
   );

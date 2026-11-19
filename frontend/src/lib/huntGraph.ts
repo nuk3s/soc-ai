@@ -76,21 +76,25 @@ export interface HuntMap {
   hostsCut: number;
 }
 
-interface HostStat {
+export interface HostStat {
   host: string;
+  /** The findings that name the host. 0 for a host the report marked
+   *  affected that no finding names. */
   count: number;
+  /** The threat findings that name the host. */
   threats: number;
   worst: string;
 }
 
-export function findingNodeId(i: number): string {
-  return `finding:${i}`;
-}
-export function hostNodeId(h: string): string {
-  return `host:${h}`;
-}
-
-export function huntGraphView(findings: HuntFinding[], affectedHosts: string[] = []): HuntMap {
+/**
+ * The hosts of a hunt: every host a finding names, then the hosts the report
+ * marked affected that no finding names. The most named first.
+ *
+ * The one list behind the host panel of the hunt page and the map. The panel
+ * read "Hosts named 12" from the report beside a map of 18 hosts from the
+ * findings (dogfood 2026-11-17, AB3).
+ */
+export function huntHosts(findings: HuntFinding[], affectedHosts: string[] = []): HostStat[] {
   const stats = new Map<string, HostStat>();
   for (const f of findings) {
     const sev = sevKey(f.severity);
@@ -105,10 +109,20 @@ export function huntGraphView(findings: HuntFinding[], affectedHosts: string[] =
   for (const h of affectedHosts) {
     if (!stats.has(h)) stats.set(h, { host: h, count: 0, threats: 0, worst: 'info' });
   }
-
-  const ranked = [...stats.values()].sort(
+  return [...stats.values()].sort(
     (a, b) => b.count - a.count || b.threats - a.threats || a.host.localeCompare(b.host),
   );
+}
+
+export function findingNodeId(i: number): string {
+  return `finding:${i}`;
+}
+export function hostNodeId(h: string): string {
+  return `host:${h}`;
+}
+
+export function huntGraphView(findings: HuntFinding[], affectedHosts: string[] = []): HuntMap {
+  const ranked = huntHosts(findings, affectedHosts);
   const drawn = ranked.slice(0, MAX_MAP_HOSTS);
   const hostsCut = ranked.length - drawn.length;
   const empty: HuntMap = {

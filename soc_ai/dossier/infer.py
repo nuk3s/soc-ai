@@ -71,7 +71,7 @@ import dataclasses
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from soc_ai.dossier.resolve import DEFAULT_MIN_CONFIDENCE, below_confidence_floor
@@ -357,7 +357,7 @@ def _evidence(value: str, source: str) -> str:
 
 
 def _hostlog_evidence(value: str, report: AgentSelfReport) -> str:
-    """The hostlog form: ``"blue (self-reported, filebeat 9.3.7, last 2026-08-08T…)"``.
+    """The hostlog form: ``"blue (self-reported, filebeat 9.3.7, last 2026-08-08 14:02 UTC)"``.
 
     Says WHO reported and WHEN, because that is the whole difference between
     this rung and the ones below it: a name on the wire is what some packet
@@ -370,7 +370,11 @@ def _hostlog_evidence(value: str, report: AgentSelfReport) -> str:
     if agent:
         bits.append(agent)
     if report.last_report is not None:
-        bits.append(f"last {report.last_report.isoformat()}")
+        # The UTC form of the console. The host page read "last
+        # 2026-11-18T20:41:32.112000+00:00" (round 3 part 2, P1).
+        at = report.last_report
+        at = at.replace(tzinfo=UTC) if at.tzinfo is None else at.astimezone(UTC)
+        bits.append(f"last {at.strftime('%Y-%m-%d %H:%M UTC')}")
     return f"{value} ({', '.join(bits)})"
 
 

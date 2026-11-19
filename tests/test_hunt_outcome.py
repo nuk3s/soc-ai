@@ -86,6 +86,26 @@ def test_a_clean_narrative_is_no_threat() -> None:
     assert outcome_headline("no_threat", "complete", [], "anything") is None
 
 
+_COVERAGE_NARRATIVE = (
+    "The 72-hour hunt found no malicious activity or new indicators of compromise. The one "
+    "coverage limit is that this grid ships no SMB telemetry, so lateral movement over SMB "
+    "cannot be confirmed or ruled out."
+)
+
+
+def test_a_coverage_sentence_beside_observations_is_no_threat() -> None:
+    """N2: a hunt that looked, explained what it saw and found no threat
+    states that conclusion. Its coverage sentence is a caveat."""
+    observation = {"title": "web-1 DNS volume is normal", "category": "observation"}
+    gap = {"title": "No SMB telemetry", "category": "visibility_gap"}
+    assert public_outcome("complete", [observation, gap], _COVERAGE_NARRATIVE) == "no_threat"
+    assert public_outcome("complete", [observation], _COVERAGE_NARRATIVE) == "no_threat"
+    # Negative controls: with no observation the same sentence is still the
+    # answer of the hunt, and a gap-only hunt stays without an answer.
+    assert public_outcome("complete", [], _COVERAGE_NARRATIVE) == "no_answer"
+    assert public_outcome("complete", [gap], _COVERAGE_NARRATIVE) == "no_answer"
+
+
 def test_a_threat_outranks_a_failed_query_and_a_gap_sentence() -> None:
     threat = {"title": "beacon to 203.0.113.9", "category": "threat"}
     assert public_outcome("complete", [threat, _RUN_FAILURE]) == "threat_found"
@@ -338,3 +358,35 @@ def test_a_lead_hunt_title_reads_the_dossier_name(client: TestClient) -> None:
     assert detail["title"] == "Lead 6 hunt: domainadmin on SR-DC01"
     row = next(r for r in client.get("/api/v1/hunts").json() if r["id"] == hunt_id)
     assert row["title"] == detail["title"]
+
+
+def test_a_hunt_that_stopped_states_its_steps_on_the_list_and_the_page(
+    client: TestClient,
+) -> None:
+    """F5: the list and the page count the steps of a hunt that stopped, so
+    every surface reads "Stopped with an error after N steps"."""
+    hunt_id = _seed(
+        client, objective="read web-1", report={"findings": []}, status="error", narrative="x"
+    )
+
+    async def steps() -> None:
+        async with client.app.state.db_sessionmaker() as db:
+            await hunt_svc.append_events(
+                db,
+                hunt_id,
+                [
+                    {"kind": "tool_call", "sequence": 1, "payload": {"tool": "t_query_events"}},
+                    {"kind": "tool_result", "sequence": 2, "payload": {}},
+                    {"kind": "tool_call", "sequence": 3, "payload": {"tool": "t_host_summary"}},
+                ],
+            )
+
+    asyncio.run(steps())
+    detail = client.get(f"/api/v1/hunts/{hunt_id}").json()
+    rows = {r["id"]: r for r in client.get("/api/v1/hunts").json()}
+    # A tool result is no step of its own: the page lists two steps.
+    assert detail["steps"] == rows[hunt_id]["steps"] == 2
+    # Negative control: a complete hunt carries no stop count.
+    clean = _seed(client, objective="read ws-1", report={"findings": []})
+    assert client.get(f"/api/v1/hunts/{clean}").json()["steps"] is None
+    assert {r["id"]: r for r in client.get("/api/v1/hunts").json()}[clean]["steps"] is None

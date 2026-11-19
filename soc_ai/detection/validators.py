@@ -511,6 +511,9 @@ async def dry_run_detection(
             # the rule holds, so the dry run must not read the other names of
             # the field: it would report hits for a rule that never fires.
             widen_names=False,
+            # The same reason for the forms: a rewrite of the rule would
+            # report hits for a form that the rule does not hold.
+            rewrite_forms=False,
         )
     except Exception as e:
         return _not_run(str(e))

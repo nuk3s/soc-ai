@@ -564,15 +564,16 @@ describe('HostDetail: the confirmed threats strip', () => {
     mount(['/hosts/agent%3Aea2d']);
     const strip = await screen.findByTestId('host-threats');
     expect(within(strip).getByTestId('host-threats-count').textContent).toBe(
-      'This host has 42 true positive investigations in the last 30 days.',
+      'This host has 42 true positive investigations in the last 24 hours.',
     );
     expect(within(strip).getByTestId('impact-chip').textContent).toBe('Succeeded');
     expect(strip.textContent).toContain(threatRow.headline);
     expect(within(strip).getByTestId('host-threats-primary').textContent).toBe('3 actions wait');
-    // The read names the machine key and 30 days.
+    // The read names the machine key and the page window: 24 hours by
+    // default. It read 30 days under a 24h toggle (AB1).
     const q = vi.mocked(getThreats).mock.calls[0][0];
     expect(q.host).toBe('agent:ea2d');
-    expect(Math.abs(Date.now() - Date.parse(q.since) - 30 * 86_400_000)).toBeLessThan(60_000);
+    expect(Math.abs(Date.now() - Date.parse(q.since) - 86_400_000)).toBeLessThan(60_000);
     // The strip sits under the header and above the investigations.
     const hero = screen.getByTestId('hero-name');
     expect(hero.compareDocumentPosition(strip) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -610,9 +611,11 @@ describe('HostDetail: the campaigns of the machine', () => {
     expect(lines).toHaveLength(2);
     expect(within(lines[0]).getByRole('link', { name: 'actor-a against web-1' })).toHaveAttribute('href', '/campaigns/7');
     expect(within(lines[0]).getByTestId('host-campaign-role').textContent).toBe('Target');
-    // The campaign waits on the analyst: the chip states it. The authorized
-    // investigations come from the confirmed threats of the host.
-    expect(within(lines[0]).getByTestId('campaign-decision-chip')).toHaveTextContent('Waits on you');
+    // The campaign waits on the analyst: the state chip states it in the
+    // warning tone. The authorized investigations come from the confirmed
+    // threats of the host.
+    expect(within(lines[0]).getByTestId('campaign-state')).toHaveTextContent('Open');
+    expect(within(lines[0]).getByTestId('campaign-state')).toHaveAttribute('data-waits', 'true');
     expect(await within(lines[0]).findByTestId('host-campaign-authorized')).toHaveTextContent('4 authorized');
     expect(within(lines[0]).queryByTestId('host-campaign-waiting')).toBeNull();
     const hero = screen.getByTestId('hero-name');

@@ -121,6 +121,21 @@ describe('Sidebar needs-you badges', () => {
     const badge = await screen.findByTestId('sidebar-needs-you-investigations');
     expect(badge.textContent).toBe('2');
     expect(badge.getAttribute('href')).toBe('/investigations?view=needs_you&range=30d');
+    // Negative control: a window of days keeps its number of days.
+    expect(badge.getAttribute('title')).toContain('waits for you, in the last 30 days.');
+  });
+
+  it('states the scope of the Investigations badge in words when the window is all', async () => {
+    // Round 3 part 2, P3: the tooltip read "in the last all".
+    vi.mocked(getNeedsYouCount).mockResolvedValue({
+      ...count({ needs_more_info: 1 }),
+      investigations_waiting: 1,
+      verdict_window: 'all',
+    });
+    mount();
+    const title = (await screen.findByTestId('sidebar-needs-you-investigations')).getAttribute('title') ?? '';
+    expect(title).toContain('waits for you, at any age.');
+    expect(title).not.toContain('the last all');
   });
 
   it('sums the two parts on an older server that sends no run count', async () => {
@@ -240,3 +255,36 @@ describe('Sidebar needs-you badges on the collapsed rail', () => {
     expect(screen.getByRole('link', { name: 'Alerts, could not count what needs you' })).toBeTruthy();
   });
 });
+
+// NY4 (dogfood 2026-11-17). The one list has the first entry of the sidebar,
+// and its badge states the number of the top bar and the Dashboard tile.
+describe('Sidebar Needs you entry', () => {
+  it('is the first entry and states the decision count', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue({
+      ...count({ leads_needing_decision: 1, untriaged_groups: 9, unread_shadow_hits: 40 }),
+      campaigns: 2,
+      investigations_waiting: 3,
+      decisions: 15,
+    });
+    mount();
+    const badge = await screen.findByTestId('sidebar-needs-you-total');
+    expect(badge.textContent).toBe('15');
+    expect(badge.getAttribute('href')).toBe('/needs-you');
+    const names = screen.getAllByRole('link').map((l) => l.textContent ?? '');
+    expect(names.findIndex((t) => t === 'Needs you')).toBeLessThan(names.findIndex((t) => t === 'Dashboard'));
+    expect(screen.getByRole('link', { name: 'Needs you' }).getAttribute('href')).toBe('/needs-you');
+  });
+
+  // NEGATIVE CONTROL. A part that soc-ai could not read leaves a floor: "+".
+  it('marks a floor with a plus', async () => {
+    vi.mocked(getNeedsYouCount).mockResolvedValue({
+      ...count({ leads_needing_decision: 1 }),
+      untriaged_groups: null,
+      unknown: ['untriaged_groups'],
+      decisions: 1,
+    });
+    mount();
+    expect((await screen.findByTestId('sidebar-needs-you-total')).textContent).toBe('1+');
+  });
+});
+

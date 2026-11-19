@@ -221,6 +221,14 @@ class HuntRecorder:
             # The row did not take the plan. Nothing will investigate, so the
             # caller must not start the phase on a hunt that is not waiting.
             self.final_status = status
+        # A complete hunt states what it found for each campaign and each lead
+        # that it read. A hunt that investigates its findings answers when that
+        # phase ends (soc_ai.webui.hunt_findings).
+        if self.final_status == hunt_svc.STATUS_COMPLETE:
+            from soc_ai.hunting import hunt_answers  # noqa: PLC0415 - lazy, like the store reads
+
+            now = datetime.now(UTC).replace(tzinfo=None)
+            await hunt_answers.after_end(self._maker, self.hunt_id, now=now)
         # The lead the hunt was started on settles now, in the same breath as
         # the hunt row. Its own try block: the hunt is finalized whatever
         # happens here, and a settle failure must read as a settle failure.

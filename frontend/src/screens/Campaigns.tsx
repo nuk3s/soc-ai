@@ -1,19 +1,29 @@
 import { Link, useSearchParams } from 'react-router-dom';
 import {
   CampaignBeyondChip,
-  CampaignDecisionChip,
   CampaignStageChip,
-  CampaignStatusChip,
+  CampaignStateChip,
   PartyLinks,
 } from '../components/campaign/shared';
 import { StageMeter } from '../components/campaign/StageMeter';
 import { UNKNOWN, UNKNOWN_TONE } from '../components/Kpi';
 import { Panel } from '../components/Panel';
+import { UtcTime } from '../components/UtcTime';
 import { EmptyState, ErrorState, LoadingState, StaleNotice } from '../components/States';
 import { getCampaigns, type CampaignList, type CampaignRow } from '../lib/api';
-import { decisionState } from '../lib/campaignDecision';
-import { CAMPAIGNS_EMPTY, CAMPAIGNS_NONE_WAIT, FILTER_ALL, FILTER_WAITS, moreWords } from '../lib/campaignWords';
-import { utcWindow } from '../lib/timeRange';
+import { type DecisionState, decisionState } from '../lib/campaignDecision';
+import {
+  lastActivityOf,
+  CAMPAIGNS_EMPTY,
+  CAMPAIGNS_DECIDED_ALL,
+  CAMPAIGNS_NONE_DECIDED,
+  CAMPAIGNS_NONE_WAIT,
+  FILTER_ALL,
+  FILTER_DECIDED,
+  FILTER_DECIDED_TITLE,
+  FILTER_WAITS,
+  moreWords,
+} from '../lib/campaignWords';
 import { useAsync } from '../lib/useAsync';
 import { useTabTitle } from '../lib/useTabTitle';
 
@@ -26,13 +36,18 @@ import { useTabTitle } from '../lib/useTabTitle';
 // when the route is read, so the list polls once a minute and a rebuild that
 // failed reads as a stale notice over the rows of the last build.
 //
-// Each row states its decision: "Waits on you" or the decision. The filter
-// "Waits on you" (`?decision=waits`) holds the campaigns with no decision,
-// the ones the Campaigns badge counts. A server with no decision field shows
-// no filter and no chip.
+// Each row states one state: the decision in force, else Open or Ended in
+// the warning tone. The filter "Waits on you" (`?decision=waits`) holds the
+// campaigns with no decision, the ones the Campaigns badge counts. The filter
+// "Decided" (`?decision=decided`) holds the campaigns with a decision in
+// force; the Confirmed threats panel links to it. A server with no decision
+// field shows no filter.
 // ---------------------------------------------------------------------------
 
 const REFETCH_MS = 60_000;
+
+/** True for a decision in force: closed, authorized or case. */
+const isDecision = (s: DecisionState) => s === 'closed' || s === 'authorized' || s === 'case';
 
 const TH = 'px-2.5 py-2 text-left font-semibold';
 
@@ -45,14 +60,15 @@ export function Campaigns() {
   useTabTitle('Campaigns');
   const list = useAsync<CampaignList>(() => getCampaigns(), [], { refetchInterval: REFETCH_MS });
   const [params, setParams] = useSearchParams();
-  const waitsOnly = params.get('decision') === 'waits';
-  const setWaitsOnly = (on: boolean) =>
+  const wanted = params.get('decision');
+  const filter: 'waits' | 'decided' | null = wanted === 'waits' || wanted === 'decided' ? wanted : null;
+  const setFilter = (next: 'waits' | 'decided' | null) =>
     setParams(
       (p) => {
-        const next = new URLSearchParams(p);
-        if (on) next.set('decision', 'waits');
-        else next.delete('decision');
-        return next;
+        const out = new URLSearchParams(p);
+        if (next) out.set('decision', next);
+        else out.delete('decision');
+        return out;
       },
       { replace: true },
     );
@@ -66,8 +82,11 @@ export function Campaigns() {
   // An older server sends no decision on any row: no filter then.
   const decided = all.some((r) => r.decision !== undefined);
   const waiting = all.filter((r) => decisionState(r) === 'waits');
-  const filtered = decided && waitsOnly;
-  const rows = filtered ? waiting : all;
+  // The decided campaigns: a decision in force. The Confirmed threats panel
+  // links here with `?decision=decided`.
+  const decidedRows = all.filter((r) => isDecision(decisionState(r)));
+  const filtered = decided && filter !== null;
+  const rows = !filtered ? all : filter === 'waits' ? waiting : decidedRows;
 
   return (
     <div className="p-5">
@@ -91,7 +110,7 @@ export function Campaigns() {
             <button
               type="button"
               aria-pressed={!filtered}
-              onClick={() => setWaitsOnly(false)}
+              onClick={() => setFilter(null)}
               className={`${FILTER_BUTTON} ${filtered ? FILTER_OFF : FILTER_ON}`}
             >
               {FILTER_ALL}
@@ -99,20 +118,41 @@ export function Campaigns() {
             </button>
             <button
               type="button"
-              aria-pressed={filtered}
-              onClick={() => setWaitsOnly(true)}
-              className={`${FILTER_BUTTON} ${filtered ? FILTER_ON : FILTER_OFF}`}
+              aria-pressed={filter === 'waits'}
+              onClick={() => setFilter('waits')}
+              className={`${FILTER_BUTTON} ${filter === 'waits' ? FILTER_ON : FILTER_OFF}`}
             >
               {FILTER_WAITS}
               <span className="font-mono tabular-nums">{waiting.length.toLocaleString()}</span>
             </button>
+            <button
+              type="button"
+              aria-pressed={filter === 'decided'}
+              onClick={() => setFilter('decided')}
+              title={FILTER_DECIDED_TITLE}
+              className={`${FILTER_BUTTON} ${filter === 'decided' ? FILTER_ON : FILTER_OFF}`}
+            >
+              {FILTER_DECIDED}
+              <span className="font-mono tabular-nums">{decidedRows.length.toLocaleString()}</span>
+            </button>
           </div>
         )}
       </div>
+      {filtered && filter === 'decided' && (
+        <p data-testid="campaigns-decided-all" className="mt-2 text-[12px] text-dim">
+          {CAMPAIGNS_DECIDED_ALL}
+        </p>
+      )}
       <Panel className="mt-3">
         {rows.length === 0 ? (
           <div data-testid="campaigns-empty">
-            <EmptyState>{filtered && all.length > 0 ? CAMPAIGNS_NONE_WAIT : CAMPAIGNS_EMPTY}</EmptyState>
+            <EmptyState>
+              {filtered && all.length > 0
+                ? filter === 'decided'
+                  ? CAMPAIGNS_NONE_DECIDED
+                  : CAMPAIGNS_NONE_WAIT
+                : CAMPAIGNS_EMPTY}
+            </EmptyState>
           </div>
         ) : (
           <div className="overflow-x-auto">
@@ -123,7 +163,7 @@ export function Campaigns() {
                     Campaign
                   </th>
                   <th scope="col" className={TH}>
-                    Status
+                    State
                   </th>
                   <th scope="col" className={TH}>
                     Stage
@@ -169,8 +209,7 @@ function CampaignListRow({ row }: { row: CampaignRow }) {
       </td>
       <td className="px-2.5 py-2.5">
         <span className="flex flex-wrap items-center gap-1.5">
-          <CampaignStatusChip status={row.status} />
-          <CampaignDecisionChip campaign={row} />
+          <CampaignStateChip campaign={row} />
           <CampaignBeyondChip beyond={row.beyond} />
         </span>
       </td>
@@ -188,11 +227,19 @@ function CampaignListRow({ row }: { row: CampaignRow }) {
         {more && <span className="text-dim">{` ${more}`}</span>}
       </td>
       <td className="px-2.5 py-2.5 font-mono text-[11.5px] text-text-2">
-        {utcWindow(row.firstEvent, row.lastEvent)}
+        <UtcTime testId="campaign-row-range" iso={row.firstEvent} to={lastActivityOf(row)} seconds={false} />
       </td>
       <td data-testid="campaign-row-alerts" className="px-[15px] py-2.5 text-right font-mono">
         {typeof row.alerts === 'number' ? (
-          row.alerts.toLocaleString()
+          <>
+            {row.alerts.toLocaleString()}
+            {/* A count that can be behind its campaign states its read (SD5). */}
+            {row.alertsBehind && row.alertsReadAt && (
+              <span data-testid="campaign-row-alerts-read" className="block font-sans text-[11px] text-faint">
+                Grid read <UtcTime iso={row.alertsReadAt} seconds={false} />
+              </span>
+            )}
+          </>
         ) : (
           <span className={UNKNOWN_TONE}>{UNKNOWN}</span>
         )}

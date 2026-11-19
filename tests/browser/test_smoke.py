@@ -27,7 +27,7 @@ _WAIT_MS = 15000
 # of the honest disposition labels so a data tweak doesn't spuriously break the
 # smoke — the point is that A disposition rendered, not which one.
 _DISPOSITION_RE = re.compile(
-    r"Threat found|No threat found|No answer|Could not run|Running"
+    r"Threat found|No threat found|No answer|Could not run|Stopped with an error|Running"
     r"|Suspicious activity found|Low-severity findings",
     re.IGNORECASE,
 )
@@ -72,11 +72,11 @@ def test_walkthrough_smoke(page: Page, demo_stack: dict) -> None:
     expect(page.get_by_text(_DISPOSITION_RE).first).to_be_visible(timeout=_WAIT_MS)
     expect(page.get_by_text("Visual summary", exact=False).first).to_be_visible(timeout=_WAIT_MS)
 
-    # ---- failed hunt: the prominent "Re-hunt" affordance (accent on a failed
+    # ---- failed hunt: the prominent "Hunt again" affordance (accent on a failed
     # run) — the seed's status="error" hunt exercises the HuntDetail failed→
-    # re-hunt path. Assert the control exists; don't couple to its styling.
+    # hunt-again path. Assert the control exists; don't couple to its styling.
     page.goto(f"{base}/app/hunts/{manifest['hunt_error']}", wait_until="networkidle")
-    expect(page.get_by_role("button", name="Re-hunt").first).to_be_visible(timeout=_WAIT_MS)
+    expect(page.get_by_role("button", name="Hunt again").first).to_be_visible(timeout=_WAIT_MS)
 
     # ---- config (master-detail): the default pane, nav switching, search ----
     page.goto(f"{base}/app/config", wait_until="networkidle")

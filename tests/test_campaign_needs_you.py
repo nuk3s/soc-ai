@@ -5,7 +5,7 @@ Every active campaign with no decision is one item of the part
 of its own: it leaves ``pending_actions``, ``investigations_waiting`` and the
 Needs you list, by one rule. An investigation in no campaign, and an
 investigation whose verdict differs, keep their own place.
-``GET /needs-you/items`` lists every item, the oldest first, and its
+``GET /needs-you/items`` lists every item, the most important first, and its
 ``total`` is the number of the top bar.
 
 The data is synthetic: placeholder addresses, names and rule names.
@@ -184,15 +184,17 @@ def test_an_ended_campaign_with_no_decision_still_waits(client: TestClient) -> N
         assert _needs_you(client)["campaigns"] == 1
 
 
-def test_the_items_list_each_decision_once_the_oldest_first(client: TestClient) -> None:
+def test_the_items_list_each_decision_once_the_most_important_first(client: TestClient) -> None:
     runs = _seed(client)
     body = _items(client)
     assert set(body) == {"items", "total", "unknown"}
     assert body["unknown"] == []
     items = body["items"]
     assert {item["type"] for item in items} == {"campaign", "investigation"}
+    from tests.test_needs_you_items_facts import FIELDS
+
     for item in items:
-        assert set(item) == {"type", "id", "title", "detail", "since", "href", "stage"}
+        assert set(item) == FIELDS
     (campaign,) = [i for i in items if i["type"] == "campaign"]
     assert campaign["id"] == runs["campaign"]
     assert campaign["href"] == f"/campaigns/{runs['campaign']}"
@@ -200,9 +202,15 @@ def test_the_items_list_each_decision_once_the_oldest_first(client: TestClient) 
     assert campaign["detail"].startswith("Stage reached: Attempt.")
     ids = [i["id"] for i in items if i["type"] == "investigation"]
     assert set(ids) == {runs["alone"], runs["differs"], runs["old"]}
-    # The oldest first: the verdict of 40 days ago leads the list.
-    assert items[0]["id"] == runs["old"]
-    assert [i["since"] for i in items] == sorted(i["since"] for i in items)
+    # The most important first: the campaign, the true positive, then the two
+    # verdicts that need more info with the newest event first. The verdict of
+    # 40 days ago led the list before.
+    assert [i["id"] for i in items] == [
+        runs["campaign"],
+        runs["alone"],
+        runs["differs"],
+        runs["old"],
+    ]
     alone = next(i for i in items if i["id"] == runs["alone"])
     assert alone["detail"] == "1 recommended action waits."
     # The count and the list use one rule.

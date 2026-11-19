@@ -1,10 +1,10 @@
 import { ArrowUpRight } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { InvestigationCampaign } from '../../lib/api';
-import { decisionState } from '../../lib/campaignDecision';
+import { campaignState } from '../../lib/campaignDecision';
 import { OPEN_CAMPAIGN, STRIP_CLOSED, campaignStripWords, stageReachedWords } from '../../lib/campaignWords';
 import { stageColor } from '../../lib/campaignViz';
-import { CampaignDecisionChip } from './shared';
+import { CampaignStateChip } from './shared';
 import { StageMeter } from './StageMeter';
 
 /** The strip under the header of an investigation page that is part of a
@@ -12,7 +12,7 @@ import { StageMeter } from './StageMeter';
  *  one investigation is support for it, so the strip leads the page: the
  *  stage meter, the sentence with the title, the stage in words and the link
  *  to the campaign. The left edge wears the color of the stage. The chip
- *  states the decision of the campaign, and the sentence states a closed
+ *  states the one state of the campaign, and the sentence states a closed
  *  campaign. No campaign renders nothing. */
 export function InvestigationCampaignStrip({
   campaign,
@@ -39,9 +39,9 @@ export function InvestigationCampaignStrip({
         {words.before}
         <span className="font-semibold">{campaign.title.trim()}</span>
         {words.after}
-        {decisionState(campaign) === 'closed' && STRIP_CLOSED}
+        {campaignState(campaign) === 'closed' && STRIP_CLOSED}
       </span>
-      <CampaignDecisionChip campaign={campaign} />
+      <CampaignStateChip campaign={campaign} />
       <span data-testid="investigation-campaign-stage" className="flex-none text-[11.5px] text-dim">
         {stageReachedWords(campaign.stage)}
       </span>

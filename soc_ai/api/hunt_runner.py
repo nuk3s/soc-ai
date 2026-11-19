@@ -52,6 +52,7 @@ from soc_ai.agent.reasoning import extract_reasoning_trace
 from soc_ai.agent.toolset import GRID_BACKED_TOOLS, GRID_UNAVAILABLE_REASON
 from soc_ai.api.hunt_recorder import HuntRecorder
 from soc_ai.api.runner import CancelToken
+from soc_ai.campaigns import finding_names
 from soc_ai.dossier.prompt import host_dossier_prompt_block, internal_ips_in_text
 from soc_ai.hunting import authorized as authorized_block
 from soc_ai.hunting import campaign_block
@@ -1182,7 +1183,10 @@ def _grid_tool_outcomes(tool_results: list[Any]) -> tuple[int, int, int]:
     a bad query or bad arguments the grid answered and said no to; the model can
     fix those and try again, which is why a rejection is not a failure, but a run
     made of NOTHING BUT rejections still read nothing, which is why they are
-    counted at all.
+    counted at all. A query the grid answered with failed shards because the
+    query was wrong for a field (``reason: "query_rejected"``,
+    :data:`~soc_ai.agent.toolset.QUERY_REJECTED_REASON`) is a rejection too:
+    the grid was up (production 2026-11-19).
 
     A zero-hit result counts as a SUCCESS: the grid answered, and an empty answer
     from a healthy grid is a real, valuable result. Distinguishing "quiet" from
@@ -1486,7 +1490,39 @@ async def _post_hunt_gates(
     report, host_gap_ev = await _gate_host_gaps(report, ctx, ev_factory)
     if host_gap_ev is not None:
         events.append(host_gap_ev)
+    report = await _gate_finding_names(report, ctx)
     return report, events
+
+
+async def _gate_finding_names(report: Any, ctx: InvestigationContext) -> Any:
+    """Note each finding whose text names a known machine that is no host of it.
+
+    The model text stays. The note goes after the notes of the other gates
+    (:mod:`soc_ai.campaigns.finding_names`). Fail-soft: a failed read costs
+    the hunt no report.
+    """
+    maker = ctx.db_sessionmaker
+    findings = list(getattr(report, "findings", None) or [])
+    if maker is None or not findings:
+        return report
+    try:
+        async with maker() as db:
+            notes = await finding_names.notes_for_findings(
+                db,
+                [{"title": f.title, "detail": f.detail, "hosts": f.hosts} for f in findings],
+            )
+    except Exception:
+        _LOGGER.warning("hunt name check failed; persisting the report as-is", exc_info=True)
+        return report
+    marked = [
+        f
+        if note is None
+        else f.model_copy(
+            update={"validator_note": f"{f.validator_note} {note}" if f.validator_note else note}
+        )
+        for f, note in zip(findings, notes, strict=True)
+    ]
+    return report.model_copy(update={"findings": marked})
 
 
 async def _gate_host_gaps(

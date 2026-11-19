@@ -4,14 +4,24 @@ One test caused 6 leads, 20 hunts and 48 finding investigations beside its
 campaign (2026-11-16). The campaign is the unit of work, so the leads and the
 lead hunts of a campaign fold into it.
 
-A lead of a campaign is a lead whose every observation that counts is the
-alert observation of an investigation that the campaign holds: the
-fingerprint of the observation is the alert id of that investigation. Such a
-lead gets ``leads.campaign_id``. It waits on its campaign: it is no Needs you
-item and no bell row (:func:`soc_ai.store.leads.campaign_lead_clause`).
+A lead of a campaign is a lead whose every observation that counts maps to
+an investigation that the campaign holds. Two types of observation map:
 
-A lead with one observation of another type, or of an investigation that the
-campaign does not hold, is no lead of the campaign. It keeps normal handling.
+- An alert observation: its fingerprint is the alert id of an alert
+  investigation.
+- The observation of a promoted hunt finding (round "decide once",
+  2026-11-17): its evidence names the hunt and the ordinal of the finding,
+  and the finding investigation names the same two. Lead 73 on production
+  held 9 alert observations and 4 such observations, each of an
+  investigation of campaign 2, and it named no campaign.
+
+Such a lead gets ``leads.campaign_id``. It waits on its campaign: it is no
+Needs you item and no bell row
+(:func:`soc_ai.store.leads.campaign_lead_clause`).
+
+A lead with one observation of another type, of an investigation that the
+campaign does not hold, or of a finding with no investigation, is no lead of
+the campaign. It keeps normal handling.
 
 The tag follows the engine. :func:`after_rebuild` sets it and removes it in
 one step after each rebuild, from stored rows, and the refresh loop runs the
@@ -42,6 +52,7 @@ from typing import Any
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from soc_ai.campaigns import decisions
 from soc_ai.campaigns.facts import chunked
 from soc_ai.store.models import (
     Campaign,
@@ -49,6 +60,7 @@ from soc_ai.store.models import (
     CampaignParty,
     EntityObservation,
     Hunt,
+    HuntAnswer,
     Investigation,
     Lead,
 )
@@ -82,6 +94,19 @@ def _alert_spec_id() -> str:
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - one value for the readers
 
     return leads_store._ALERT_SPEC_ID
+
+
+def _hunt_spec_id() -> str:
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - one value for the readers
+
+    return leads_store._HUNT_SPEC_ID
+
+
+def finding_key(hunt_id: Any, ordinal: Any) -> str | None:
+    """The key of one hunt finding: the hunt and the ordinal. None for another shape."""
+    if not hunt_id or isinstance(ordinal, bool) or not isinstance(ordinal, int) or ordinal < 0:
+        return None
+    return f"{hunt_id}#{ordinal}"
 
 
 async def held_runs(db: AsyncSession) -> dict[str, int]:
@@ -127,22 +152,54 @@ async def _alert_campaigns(db: AsyncSession, held: Mapping[str, int]) -> dict[st
     return out
 
 
+async def _finding_campaigns(db: AsyncSession, held: Mapping[str, int]) -> dict[str, set[int]]:
+    """The campaigns that hold the finding investigation of each hunt finding.
+
+    The key is :func:`finding_key`. A synthetic run and a backtest replay
+    are read out, as for an alert.
+    """
+    out: dict[str, set[int]] = {}
+    for ids in chunked(sorted(held)):
+        rows = await db.execute(
+            select(Investigation.id, Investigation.hunt_id, Investigation.finding_ordinal).where(
+                Investigation.id.in_(ids),
+                Investigation.kind == "hunt",
+                Investigation.hunt_id.is_not(None),
+                Investigation.finding_ordinal.is_not(None),
+                Investigation.is_synth_eval.is_(False),
+                func.coalesce(Investigation.started_by, "") != _BACKTEST_ACTOR,
+            )
+        )
+        for run_id, hunt_id, ordinal in rows.all():
+            key = finding_key(hunt_id, ordinal)
+            if key is not None:
+                out.setdefault(key, set()).add(held[str(run_id)])
+    return out
+
+
 def campaign_of(
-    observations: Iterable[tuple[str, str]], alerts: Mapping[str, set[int]]
+    observations: Iterable[tuple[str, str]],
+    alerts: Mapping[str, set[int]],
+    findings: Mapping[str, set[int]] | None = None,
 ) -> int | None:
     """The campaign that holds every observation, or None.
 
-    ``observations`` holds the spec id and the fingerprint of each
-    observation that counts. None for no observation, for an observation of
-    another type, for an alert that no campaign holds, and for alerts that
-    two campaigns hold apart.
+    ``observations`` holds the spec id and the key of each observation that
+    counts: the fingerprint of an alert observation, and the
+    :func:`finding_key` of the observation of a hunt finding. None for no
+    observation, for an observation of another type, for an alert or a
+    finding that no campaign holds, and for observations that two campaigns
+    hold apart.
     """
-    alert_spec = _alert_spec_id()
+    alert_spec, hunt_spec = _alert_spec_id(), _hunt_spec_id()
     common: set[int] | None = None
-    for spec_id, fingerprint in observations:
-        if spec_id != alert_spec:
+    for spec_id, key in observations:
+        if spec_id == alert_spec:
+            holders = alerts.get(key)
+        elif spec_id == hunt_spec:
+            holders = (findings or {}).get(key)
+        else:
             return None
-        holders = alerts.get(fingerprint)
         if not holders:
             return None
         common = set(holders) if common is None else common & holders
@@ -151,25 +208,44 @@ def campaign_of(
     return min(common) if common else None
 
 
-async def _candidates(db: AsyncSession, alerts: Mapping[str, set[int]]) -> list[int]:
-    """The leads to judge: each lead that names a campaign, and each that holds a held alert."""
+async def _candidates(
+    db: AsyncSession, alerts: Mapping[str, set[int]], findings: Mapping[str, set[int]]
+) -> list[int]:
+    """The leads to judge: each that names a campaign, or holds a held alert or finding."""
+    from soc_ai.hunting.leads import content_fingerprint  # noqa: PLC0415 - the hunting package
+
     ids = {int(i) for i in (await db.scalars(select(Lead.id).where(Lead.campaign_id.is_not(None))))}
-    for chunk in chunked(sorted(alerts)):
-        rows = await db.scalars(
-            select(EntityObservation.lead_id).where(
-                EntityObservation.spec_id == _alert_spec_id(),
-                EntityObservation.fingerprint.in_(chunk),
-                EntityObservation.lead_id.is_not(None),
+    # The fingerprint of a finding observation is the hash of the hunt and
+    # the ordinal (soc_ai.hunting.sources.observe_hunt_finding). It finds
+    # the candidates only: the judge reads the evidence.
+    prints: set[str] = set()
+    for key in findings:
+        hunt_id, _sep, ordinal = key.rpartition("#")
+        prints.add(content_fingerprint(hunt_id, int(ordinal)))
+    for spec_id, keys in ((_alert_spec_id(), sorted(alerts)), (_hunt_spec_id(), sorted(prints))):
+        for chunk in chunked(keys):
+            rows = await db.scalars(
+                select(EntityObservation.lead_id).where(
+                    EntityObservation.spec_id == spec_id,
+                    EntityObservation.fingerprint.in_(chunk),
+                    EntityObservation.lead_id.is_not(None),
+                )
             )
-        )
-        ids.update(int(i) for i in rows.all() if i is not None)
+            ids.update(int(i) for i in rows.all() if i is not None)
     return sorted(ids)
 
 
 async def _observations(
     db: AsyncSession, lead_ids: Sequence[int]
 ) -> dict[int, list[tuple[str, str]]]:
-    """The observations of each lead that count: attached and not dismissed."""
+    """The observations of each lead that count: attached and not dismissed.
+
+    Each is the spec id and the key that :func:`campaign_of` reads. The key
+    of a finding observation comes from its evidence, as in the SQL of
+    :func:`soc_ai.store.leads.campaign_lead_clause`. Evidence with no hunt
+    gives an empty key, which no campaign holds.
+    """
+    hunt_spec = _hunt_spec_id()
     out: dict[int, list[tuple[str, str]]] = {}
     for chunk in chunked(list(lead_ids)):
         rows = await db.execute(
@@ -177,23 +253,28 @@ async def _observations(
                 EntityObservation.lead_id,
                 EntityObservation.spec_id,
                 EntityObservation.fingerprint,
+                EntityObservation.evidence_json,
             ).where(
                 EntityObservation.lead_id.in_(chunk),
                 EntityObservation.dismissed_at.is_(None),
             )
         )
-        for lead_id, spec_id, fingerprint in rows.all():
-            out.setdefault(int(lead_id), []).append((str(spec_id), str(fingerprint)))
+        for lead_id, spec_id, fingerprint, evidence in rows.all():
+            key = str(fingerprint)
+            if spec_id == hunt_spec:
+                ev = evidence if isinstance(evidence, dict) else {}
+                key = finding_key(ev.get("hunt_id"), ev.get("ordinal")) or ""
+            out.setdefault(int(lead_id), []).append((str(spec_id), key))
     return out
 
 
 async def _tag_leads(
-    db: AsyncSession, alerts: Mapping[str, set[int]]
+    db: AsyncSession, alerts: Mapping[str, set[int]], findings: Mapping[str, set[int]]
 ) -> tuple[int, int, dict[int, int]]:
     """Set and remove the tag of each lead. The counts, and the campaign of each tagged lead."""
     from soc_ai.store import leads as leads_store  # noqa: PLC0415 - the store reads this module
 
-    candidates = await _candidates(db, alerts)
+    candidates = await _candidates(db, alerts, findings)
     observations = await _observations(db, candidates)
     tagged = untagged = 0
     out: dict[int, int] = {}
@@ -202,7 +283,7 @@ async def _tag_leads(
             found = (
                 None
                 if leads_store.formed_from_backtest(lead)
-                else campaign_of(observations.get(int(lead.id), []), alerts)
+                else campaign_of(observations.get(int(lead.id), []), alerts, findings)
             )
             if found is not None:
                 out[int(lead.id)] = found
@@ -396,7 +477,8 @@ async def tag(db: AsyncSession, *, now: datetime) -> TagResult:
     """
     held = await held_runs(db)
     alerts = await _alert_campaigns(db, held)
-    tagged, untagged, leads = await _tag_leads(db, alerts)
+    findings = await _finding_campaigns(db, held)
+    tagged, untagged, leads = await _tag_leads(db, alerts, findings)
     hunts = await _stamp_hunts(db, leads, held, now=now)
     await db.commit()
     closed = await _close_decided(db, leads.values(), now=now)
@@ -567,25 +649,200 @@ async def leads_of(db: AsyncSession, campaign_id: int) -> list[CampaignLead]:
 
 
 async def hunts_of(db: AsyncSession, campaign_id: int) -> list[Hunt]:
-    """The hunts for the campaign and for the campaigns that a merge put into it.
+    """The hunts for the campaign and the hunts that read it, with the campaigns of its merges.
 
-    Newest first, at most :data:`HUNTS_MAX`, of any status and any starter.
-    An evaluation hunt never takes a campaign id. Empty for a campaign that is
-    not active.
+    A hunt for the campaign names it in ``hunts.campaign_id``. A hunt that
+    read the campaign holds an answer for it (:mod:`soc_ai.hunting.hunt_answers`):
+    the scheduled hunt reads the block of each active campaign. Newest first,
+    at most :data:`HUNTS_MAX`, of any status and any starter. An evaluation
+    hunt never takes a campaign id and writes no answer. Empty for a campaign
+    that is not active.
     """
     from soc_ai.hunting import campaign_hunt  # noqa: PLC0415 - the hunting package reads this
 
     row = await db.get(Campaign, int(campaign_id))
     if row is None or row.status != _ACTIVE:
         return []
-    ids = await campaign_hunt.family(db, row.id)
+    ids = sorted(await campaign_hunt.family(db, row.id))
+    read = select(HuntAnswer.hunt_id).where(
+        HuntAnswer.subject_type == "campaign", HuntAnswer.subject_id.in_(ids)
+    )
     rows = await db.scalars(
         select(Hunt)
-        .where(Hunt.campaign_id.in_(sorted(ids)), Hunt.is_synth_eval.is_(False))
+        .where(
+            or_(Hunt.campaign_id.in_(ids), Hunt.id.in_(read)),
+            Hunt.is_synth_eval.is_(False),
+        )
         .order_by(Hunt.created_at.desc(), Hunt.id.desc())
         .limit(HUNTS_MAX)
     )
     return list(rows.all())
+
+
+# ── The campaign and the authorized activity on the lead page (LH4) ────────
+
+
+@dataclass(frozen=True)
+class LeadCampaign:
+    """The campaign that a lead is part of, as the lead page states it.
+
+    ``closed_with_campaign`` is true for a lead that soc-ai closed with the
+    close or the authorization of its campaign (:func:`close_leads`).
+    ``closed_at`` is the time of that close. A lead that joins a campaign
+    after the decision closes later than the campaign (lead 73, dogfood N4).
+    """
+
+    id: int
+    title: str
+    decision: str | None
+    decided_at: datetime | None
+    decided_by: str | None
+    closed_with_campaign: bool
+    closed_at: datetime | None = None
+    # Round 3 part 2, W4: the decision that closed the lead (``closed`` or
+    # ``authorized``), the analyst of that decision, and the time of the
+    # newest reopen of the campaign after the close of the lead. Lead 73
+    # read "Its campaign is closed" beside the chip "Campaign 2 · Open".
+    closed_by_decision: str | None = None
+    closed_by: str | None = None
+    reopened_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class AuthorizedPart:
+    """The observations of a lead whose investigation matched one authorization."""
+
+    label: str
+    observations: int
+
+
+async def lead_campaign(db: AsyncSession, lead: Lead) -> LeadCampaign | None:
+    """The campaign of the lead, or None.
+
+    A lead of a campaign by the clause of the readers. A lead that closed
+    with its campaign names that campaign too.
+    """
+    from soc_ai.store import leads as leads_store  # noqa: PLC0415 - the store reads this module
+
+    closed_with = (
+        lead.status == "dismissed"
+        and lead.dismissed_reason in leads_store.SYSTEM_DISMISS_REASONS
+        and lead.dismissed_by == leads_store.CAMPAIGN_ACTOR
+    )
+    campaign_id = (await leads_store.campaign_leads(db, [int(lead.id)])).get(int(lead.id))
+    if campaign_id is None and closed_with and lead.campaign_id is not None:
+        campaign_id = int(lead.campaign_id)
+    if campaign_id is None:
+        return None
+    row = await db.get(Campaign, int(campaign_id))
+    if row is None:
+        return None
+    closed_by_decision: str | None = None
+    closed_by: str | None = None
+    reopened_at: datetime | None = None
+    if closed_with:
+        closed_by_decision = (
+            decisions.DECISION_AUTHORIZED
+            if lead.dismissed_reason == leads_store.CAMPAIGN_AUTHORIZED_REASON
+            else decisions.DECISION_CLOSED
+        )
+        closed_by, reopened_at = await _closed_by(db, row, lead.dismissed_at)
+    return LeadCampaign(
+        id=int(row.id),
+        title=str(row.title),
+        decision=row.decision,
+        decided_at=row.decided_at,
+        decided_by=row.decided_by,
+        closed_with_campaign=closed_with,
+        closed_at=lead.dismissed_at if closed_with else None,
+        closed_by_decision=closed_by_decision,
+        closed_by=closed_by,
+        reopened_at=reopened_at,
+    )
+
+
+async def _closed_by(
+    db: AsyncSession, row: Campaign, closed_at: datetime | None
+) -> tuple[str | None, datetime | None]:
+    """The analyst of the decision that closed a lead, and the reopen of the campaign after it (W4).
+
+    A decision in force names its analyst. After a reopen the campaign holds
+    no decision, so the earlier decision of the reopen names the analyst
+    (:func:`soc_ai.campaigns.since_decision.covered`). The reopen counts when
+    it is after the close of the lead.
+    """
+    from soc_ai.campaigns import since_decision as since_svc  # noqa: PLC0415 - it reads this module
+
+    if decisions.in_force(row.decision):
+        return row.decided_by, None
+    reopened = (await decisions.last_reopened(db, [int(row.id)])).get(int(row.id))
+    if reopened is None or (closed_at is not None and reopened < closed_at):
+        return None, None
+    earlier = (await since_svc.covered(db, [int(row.id)])).get(int(row.id))
+    return (earlier.earlier.by if earlier is not None else None), reopened
+
+
+async def authorized_parts(db: AsyncSession, lead_id: int) -> list[AuthorizedPart]:
+    """The observations of the lead that the store links to authorized activity.
+
+    An observation maps to its investigation as in :func:`campaign_of`. The
+    investigation names the authorization that it matched
+    (``investigations.authorization_id``). The most observations first.
+    """
+    from soc_ai.store.models import AuthorizedActivity  # noqa: PLC0415 - one reader
+
+    observations = (await _observations(db, [int(lead_id)])).get(int(lead_id), [])
+    if not observations:
+        return []
+    alert_spec, hunt_spec = _alert_spec_id(), _hunt_spec_id()
+    alerts = sorted({key for spec, key in observations if spec == alert_spec and key})
+    findings = sorted({key for spec, key in observations if spec == hunt_spec and key})
+    by_alert: dict[str, int] = {}
+    for chunk in chunked(alerts):
+        rows = await db.execute(
+            select(Investigation.alert_es_id, Investigation.authorization_id).where(
+                Investigation.alert_es_id.in_(chunk),
+                Investigation.authorization_id.is_not(None),
+                func.coalesce(Investigation.kind, "").not_in(_PROMOTED_KINDS),
+            )
+        )
+        for alert_id, auth in rows.all():
+            by_alert.setdefault(str(alert_id), int(auth))
+    by_finding: dict[str, int] = {}
+    hunts = sorted({key.rpartition("#")[0] for key in findings})
+    for chunk in chunked(hunts):
+        rows = await db.execute(
+            select(
+                Investigation.hunt_id, Investigation.finding_ordinal, Investigation.authorization_id
+            ).where(
+                Investigation.hunt_id.in_(chunk),
+                Investigation.kind == "hunt",
+                Investigation.authorization_id.is_not(None),
+            )
+        )
+        for hunt_id, ordinal, auth in rows.all():
+            key = finding_key(hunt_id, ordinal)
+            if key is not None:
+                by_finding.setdefault(key, int(auth))
+    counts: dict[int, int] = {}
+    for spec, key in observations:
+        auth = by_alert.get(key) if spec == alert_spec else by_finding.get(key)
+        if auth is not None:
+            counts[auth] = counts.get(auth, 0) + 1
+    if not counts:
+        return []
+    found = await db.execute(
+        select(AuthorizedActivity.id, AuthorizedActivity.label).where(
+            AuthorizedActivity.id.in_(sorted(counts))
+        )
+    )
+    labels: dict[int, str] = {int(i): str(label) for i, label in found.all()}
+    parts = [
+        AuthorizedPart(label=str(labels[auth]), observations=n)
+        for auth, n in counts.items()
+        if auth in labels
+    ]
+    return sorted(parts, key=lambda p: (-p.observations, p.label))
 
 
 __all__ = [
@@ -593,13 +850,18 @@ __all__ = [
     "LEADS_MAX",
     "RELATED_MAX",
     "REUSED_HUNT_DAYS",
+    "AuthorizedPart",
     "CampaignLead",
+    "LeadCampaign",
     "TagResult",
     "after_rebuild",
+    "authorized_parts",
     "campaign_of",
     "close_leads",
+    "finding_key",
     "held_runs",
     "hunts_of",
+    "lead_campaign",
     "leads_of",
     "tag",
 ]

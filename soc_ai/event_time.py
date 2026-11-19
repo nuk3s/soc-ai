@@ -229,6 +229,15 @@ def stamp(at: datetime) -> str:
     return at.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def utc_text(value: Any) -> str:
+    """An ISO string or a datetime in the UTC form of the console:
+    ``2026-11-18 20:41:32 UTC``. A raw grid time read
+    ``2026-11-18T20:41:32.112000+00:00`` in analyst text (round 3 part 2,
+    P1). A value that does not parse stays as it is."""
+    at = as_utc(value)
+    return f"{stamp(at)} UTC" if at is not None else str(value)
+
+
 def _fields_of(doc: Any) -> Mapping[str, Any] | None:
     """A document as its SoAlert JSON keys. A Mapping passes through."""
     if isinstance(doc, Mapping):

@@ -177,3 +177,73 @@ def test_a_running_hunt_and_a_lead_with_no_hunt_state_no_answer(client: TestClie
         assert row["hunt_answer"] == ""
         assert row["hunt_not_checked"] == []
     assert _row(client, no_hunt)["hunt_count"] == 0
+
+
+def _seed_judged_hunt(client: TestClient, lead_id: int, verdict: str) -> str:
+    """A lead hunt whose one threat finding has an investigation with ``verdict``."""
+    from soc_ai.store.models import Investigation
+
+    async def go() -> str:
+        async with client.app.state.db_sessionmaker() as db:
+            hunt = await hunt_svc.create(
+                db,
+                objective=f"[lead {lead_id}] look at this lead",
+                started_by="admin",
+                kind="lead",
+                starter="lead",
+                lead_id=lead_id,
+            )
+            run_id = f"01RUN{verdict.upper()[:8]}"
+            db.add(
+                Investigation(
+                    id=run_id,
+                    alert_es_id="doc-judged-1",
+                    kind="hunt",
+                    hunt_id=hunt.id,
+                    finding_ordinal=0,
+                    status="complete",
+                    verdict=verdict,
+                )
+            )
+            threat = {**_THREAT, "hosts": ["10.1.2.3"]}
+            await hunt_svc.finalize(
+                db,
+                hunt.id,
+                status=hunt_svc.STATUS_INVESTIGATING,
+                narrative="The hunt found one threat.",
+                report={"findings": [threat], "narrative": "The hunt found one threat."},
+                finding_plan={
+                    "0": hunt_svc.plan_entry(
+                        hunt_svc.LINK_ENDED,
+                        investigation_id=run_id,
+                        origin=hunt_svc.ORIGIN_OPENED,
+                    )
+                },
+            )
+            await hunt_svc.complete_investigating(db, hunt.id)
+            lead = await db.get(Lead, lead_id)
+            assert lead is not None
+            lead.hunt_id = hunt.id
+            await db.commit()
+            return hunt.id
+
+    return asyncio.run(go())
+
+
+@pytest.mark.parametrize(
+    ("verdict", "outcome", "threats"),
+    [("false_positive", "no_threat_confirmed", 0), ("true_positive", "threats_confirmed", 1)],
+)
+def test_the_row_the_page_and_the_record_read_one_outcome_after_the_verdicts(
+    client: TestClient, verdict: str, outcome: str, threats: int
+) -> None:
+    """Dogfood 2026-11-17, shot b05: the card read "found a threat" beside
+    "No threat confirmed". The investigation of the finding decides. The
+    second case is the negative control: a confirmed threat stays a threat."""
+    lead_id = _seed_lead(client)
+    _seed_judged_hunt(client, lead_id, verdict)
+    row = _row(client, lead_id)
+    detail = client.get(f"/api/v1/hunts/leads/{lead_id}").json()
+    assert (row["hunt_outcome"], row["hunt_threat_count"]) == (outcome, threats)
+    assert (detail["hunt_outcome"], detail["hunt_threat_count"]) == (outcome, threats)
+    assert detail["hunts"][0]["outcome"] == outcome

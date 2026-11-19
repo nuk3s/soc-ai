@@ -105,7 +105,7 @@ export function SameFlowPanel({
                 {s.verdict ? (
                   <VerdictPill verdict={s.verdict as Verdict} conf={s.conf} inherited={false} showConf={false} showInherited={false} />
                 ) : (
-                  <span className="flex-none font-mono text-[10.5px] text-danger">Pipeline error</span>
+                  <span className="flex-none font-mono text-[10.5px] text-danger">Failed</span>
                 )}
                 <span className="min-w-0 break-words text-[12px] font-medium text-text">{s.name}</span>
               </div>

@@ -17,6 +17,7 @@ export function Kpi({
   tone,
   title,
   chart,
+  fact = false,
 }: {
   testId: string;
   label: string;
@@ -33,12 +34,20 @@ export function Kpi({
    *  (the Events card's volume sparkline). Callers pass nothing rather than an
    *  empty box when there is nothing honest to draw. */
   chart?: ReactNode;
+  /** A fact with no page window, such as the services of the profile. The
+   *  card takes a dashed border, so it sits apart from the window counts
+   *  beside it (dogfood 2026-11-17, AB1). */
+  fact?: boolean;
 }) {
   return (
     <div
       data-testid={testId}
+      data-fact={fact ? 'true' : undefined}
       title={title}
-      className="rounded-panel border border-border bg-surface-1 px-4 py-3.5"
+      className={cn(
+        'rounded-panel border bg-surface-1 px-4 py-3.5',
+        fact ? 'border-dashed border-border-strong' : 'border-border',
+      )}
     >
       <div className="flex items-start justify-between gap-2">
         <div className="text-[10.5px] font-semibold uppercase tracking-[.06em] text-faint">

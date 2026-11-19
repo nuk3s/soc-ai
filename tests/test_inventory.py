@@ -489,7 +489,7 @@ def test_format_inventory_block_labels_imported_documents() -> None:
     assert "18.8M imported" in block
     assert "no live events" in block
     # The clean sensor's line stays a plain live line.
-    assert "`event.dataset:zeek.conn` — 800k · " in block
+    assert "`event.dataset:zeek.conn`: 800k · " in block
     assert "imported" not in block.split("`event.dataset:zeek.conn`")[1].split("\n")[0]
 
 

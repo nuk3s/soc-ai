@@ -1243,3 +1243,84 @@ async def test_a_lead_reopened_before_the_rule_shows_its_hold_on_read(
         clean.status = "open"
         await db.commit()
         assert await leads_store.derived_hold_reason(db, clean) is None
+
+
+async def test_the_campaign_clause_reads_the_finding_of_a_hunt_observation(
+    settings_kratos: Settings,
+) -> None:
+    """LH1 (2026-11-17): a finding observation maps through its finding investigation.
+
+    The clause reads the evidence of the observation in SQL, so this test
+    also runs on PostgreSQL.
+    """
+    from soc_ai.store.models import (
+        Campaign,
+        CampaignMember,
+        EntityObservation,
+        Investigation,
+    )
+
+    engine, maker = await _db(settings_kratos)
+    now = datetime.now(UTC).replace(tzinfo=None)
+    async with maker() as db:
+        campaign = Campaign(
+            status="active",
+            seed_run_id="seed",
+            title="actor-a against web-1",
+            bottom_line="actor-a acted against web-1.",
+            stage="access",
+            first_event=now - timedelta(hours=3),
+            last_event=now - timedelta(hours=2),
+            member_count=1,
+            detail={},
+            built_at=now,
+        )
+        db.add(campaign)
+        db.add(
+            Investigation(
+                id="01FINDINGRUN",
+                alert_es_id="doc-1",
+                kind="hunt",
+                hunt_id="01HUNTF",
+                finding_ordinal=1,
+                status="complete",
+                verdict="true_positive",
+            )
+        )
+        await db.flush()
+        db.add(
+            CampaignMember(
+                campaign_id=campaign.id,
+                run_id="01FINDINGRUN",
+                link="pair",
+                evidence={},
+                direction="forward",
+                verdict_differs=False,
+            )
+        )
+        lead = Lead(status="open", shadow=False, formed_at=now, campaign_id=campaign.id)
+        db.add(lead)
+        await db.flush()
+
+        def observation(ordinal: int) -> EntityObservation:
+            return EntityObservation(
+                entity_kind="host",
+                entity_key="10.20.30.5",
+                kind="hunt_finding",
+                spec_id="hunt",
+                fingerprint=content_fingerprint("01HUNTF", ordinal),
+                birth_weight=1.0,
+                source="hunt",
+                evidence_json={"hunt_id": "01HUNTF", "ordinal": ordinal},
+                lead_id=lead.id,
+            )
+
+        db.add(observation(1))
+        await db.commit()
+        lead_id, campaign_id = int(lead.id), int(campaign.id)
+        assert await leads_store.campaign_leads(db, [lead_id]) == {lead_id: campaign_id}
+        # The negative control: a finding of the same hunt with no investigation.
+        db.add(observation(2))
+        await db.commit()
+        assert await leads_store.campaign_leads(db, [lead_id]) == {}
+    await engine.dispose()

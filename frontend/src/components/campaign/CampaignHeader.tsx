@@ -1,16 +1,24 @@
 import { ShieldCheck } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import type { CampaignDetail } from '../../lib/api';
-import { authorizationSentence, eventsFacts } from '../../lib/campaignWords';
-import { utcWindow } from '../../lib/timeRange';
+import {
+  authorizationSentence,
+  campaignLaterSentence,
+  eventsFacts,
+  heldInvestigations,
+  lastActivityOf,
+} from '../../lib/campaignWords';
+
 import { Panel } from '../Panel';
 import { BeyondBanner } from './CampaignBeyond';
-import { DecisionBar } from './DecisionBar';
-import { CampaignStageChip, CampaignStatusChip } from './shared';
+import { DecisionBar, sinceInBar } from './DecisionBar';
+import { HuntAnswerLine } from './HuntAnswerLine';
+import { CampaignStageChip, CampaignStateChip } from './shared';
+import { UtcTime } from '../UtcTime';
 
 const LINK = 'text-accent hover:underline';
 
-/** The title, the status, the stage and the period, then the decision bar,
+/** The title, the state, the stage and the period, then the decision bar,
  *  the alarm of the investigations beyond the authorization, the bottom line, one line of facts about the events of the campaign, and
  *  one line for each authorization that covers investigations of the
  *  campaign. A merged campaign names the campaign that holds it. */
@@ -22,6 +30,7 @@ export function CampaignHeader({
   onCaseRequest,
   canAuthorize = false,
   onShowBeyond,
+  onShowNew,
 }: {
   campaign: CampaignDetail;
   onCloseRequest?: () => void;
@@ -32,6 +41,8 @@ export function CampaignHeader({
   canAuthorize?: boolean;
   /** Opens the fold of the investigations beyond the authorization. */
   onShowBeyond?: () => void;
+  /** Opens the investigations of the campaign with only the new ones. */
+  onShowNew?: () => void;
 }) {
   const facts = eventsFacts(c.events);
   // The decision bar states the authorization on the campaign. The lines
@@ -42,10 +53,10 @@ export function CampaignHeader({
       <div data-testid="campaign-header" className="px-[15px] py-3">
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5">
           <h1 className="break-words text-[19px] font-semibold">{c.title}</h1>
-          <CampaignStatusChip status={c.status} />
+          <CampaignStateChip campaign={c} />
           <CampaignStageChip stage={c.stage} />
           <span data-testid="campaign-period" className="font-mono text-[11.5px] text-dim">
-            {utcWindow(c.firstEvent, c.lastEvent)}
+            <UtcTime iso={c.firstEvent} to={lastActivityOf(c)} seconds={false} />
           </span>
         </div>
         <DecisionBar
@@ -55,6 +66,7 @@ export function CampaignHeader({
           onAuthorizeRequest={onAuthorizeRequest}
           onCaseRequest={onCaseRequest}
           canAuthorize={canAuthorize}
+          onShowNew={onShowNew}
         />
         <BeyondBanner beyond={c.beyond} onShow={onShowBeyond} />
         {c.status === 'merged' && c.mergedInto != null && (
@@ -71,6 +83,19 @@ export function CampaignHeader({
             {c.bottomLine}
           </p>
         )}
+        {/* The newest hunt that read the campaign, and what it found. A
+            reopened campaign states it in the bar, beside the hunt of the reopen.
+            The banner of a reopened campaign states the later alert events
+            already. Else the answer line states them (G6). */}
+        {!sinceInBar(c) && (
+          <HuntAnswerLine
+            subject="campaign"
+            answer={c.answers?.[0]}
+            testId="campaign-hunt-answer"
+            className="mt-1.5"
+            later={(c.sinceDecision?.laterAlerts ?? 0) > 0 ? null : campaignLaterSentence(c.events)}
+          />
+        )}
         {facts && (
           <p data-testid="campaign-facts" className="mt-1.5 break-words text-[12.5px] leading-snug text-text-2">
             {facts}
@@ -81,7 +106,7 @@ export function CampaignHeader({
             {older.map((a) => (
               <li key={a.id} className="flex items-start gap-2 text-[12.5px] leading-snug text-text-2">
                 <ShieldCheck size={14} aria-hidden className="mt-px flex-none text-dim" />
-                <span className="min-w-0 break-words">{authorizationSentence(a, c.members.length)}</span>
+                <span className="min-w-0 break-words">{authorizationSentence(a, heldInvestigations(c.members), c.authorization)}</span>
               </li>
             ))}
           </ul>

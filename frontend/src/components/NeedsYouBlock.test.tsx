@@ -5,7 +5,7 @@
 // words, so the numbers on the panel add up to the number on the bell.
 // Production review 2026-11-12 (ui-core 4): the unread shadow hits are review
 // work. They have their own neutral line, and the badge leaves them out.
-import { render, screen } from '@testing-library/react';
+import { render, screen, within } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, expect, it } from 'vitest';
 
@@ -68,7 +68,7 @@ describe('needsYouLines', () => {
     };
     const lines = needsYouLines(data);
     expect(lines.map((l) => `${l.text}, ${l.scope}`)).toEqual(['2 investigations wait on your decision, at any age']);
-    expect(lines[0].to).toBe('/investigations?view=needs_you&range=all');
+    expect(lines[0].to).toBe('/needs-you?type=investigation');
     expect(lines.reduce((sum, l) => sum + (l.count ?? 0), 0)).toBe(decisionCount(data));
     expect(needsYouLines({ ...data, investigations_waiting: 1, decisions: 1 })[0].text).toBe(
       '1 investigation waits on your decision',
@@ -170,7 +170,7 @@ describe('needsYouLines with campaigns', () => {
       count: 2,
       text: '2 campaigns wait on your decision',
       scope: 'at any age',
-      to: '/campaigns?decision=waits',
+      to: '/needs-you?type=campaign',
     });
     expect(lines.reduce((sum, l) => sum + (l.count ?? 0), 0)).toBe(data.decisions);
     expect(needsYouLines({ ...data, campaigns: 1 })[0].text).toBe('1 campaign waits on your decision');
@@ -197,7 +197,9 @@ describe('NeedsYouBlock', () => {
       </MemoryRouter>,
     );
 
-  it('links each part to the list that holds it', () => {
+  // NY4. A line that states waiting work opens the one list with a type
+  // filter, and no other list. The review line keeps the shadow hits.
+  it('links each decision part to the Needs you page with its type filter', () => {
     mount(PROD);
     expect(screen.queryByTestId('needs-you-part-unread_shadow_hits')).toBeNull();
     expect(screen.getByTestId('needs-you-review').textContent).toBe('300 shadow hits to review, all unread');
@@ -211,11 +213,17 @@ describe('NeedsYouBlock', () => {
     // The review link is neutral. Only a decision takes the accent color.
     expect(hits.className).not.toContain('text-accent');
     expect(screen.getByRole('link', { name: '7 leads wait on a decision' }).getAttribute('href')).toBe(
-      '/hunts?leads=needs_decision#leads',
+      '/needs-you?type=lead',
     );
     expect(screen.getByRole('link', { name: '2 investigations wait on your decision' }).getAttribute('href')).toBe(
-      '/investigations?view=needs_you&range=30d',
+      '/needs-you?type=investigation',
     );
+    // Every decision line opens the Needs you page. Only the review line does not.
+    const links = within(screen.getByTestId('needs-you-block')).getAllByRole('link');
+    const others = links
+      .map((l) => l.getAttribute('href') ?? '')
+      .filter((href) => !href.startsWith('/needs-you'));
+    expect(others).toEqual(['/hunts?hits=unread#analytic-hits']);
   });
 
   it('says when the count could not be read', () => {

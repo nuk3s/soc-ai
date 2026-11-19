@@ -2445,7 +2445,7 @@ async def test_migration_adds_the_detail_column_and_removes_it(tmp_path: Path) -
     async with engine.connect() as conn:
         assert "detail" in await conn.run_sync(_columns)
         head = await conn.execute(text("SELECT version_num FROM alembic_version"))
-        assert head.scalar_one() == "0073"
+        assert head.scalar_one() == "0076"
     async with engine.begin() as conn:
         await conn.run_sync(_downgrade)
     async with engine.connect() as conn:

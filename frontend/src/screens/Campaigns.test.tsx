@@ -57,7 +57,7 @@ describe('Campaigns', () => {
       'href',
       '/campaigns/7',
     );
-    expect(within(row).getByTestId('campaign-status')).toHaveTextContent('Open');
+    expect(within(row).getByTestId('campaign-state')).toHaveTextContent('Open');
     expect(within(row).getByTestId('campaign-stage')).toHaveTextContent('Action on the target');
     // A party name links to its host page. A party with no name reads its address.
     expect(within(row).getByRole('link', { name: 'actor-a' })).toHaveAttribute(
@@ -69,9 +69,21 @@ describe('Campaigns', () => {
     expect(row).toHaveTextContent('2026-10-24 01:11 to 2026-10-28 22:44 UTC');
     // The last column counts the alert events. The count of investigations is no column.
     const head = within(screen.getByTestId('campaigns-table')).getAllByRole('columnheader');
-    expect(head.map((h) => h.textContent)).toEqual(['Campaign', 'Status', 'Stage', 'Actors', 'Targets', 'Period', 'Alerts']);
+    expect(head.map((h) => h.textContent)).toEqual(['Campaign', 'State', 'Stage', 'Actors', 'Targets', 'Period', 'Alerts']);
     expect(within(row).getByTestId('campaign-row-alerts')).toHaveTextContent('1,072');
     expect(row).not.toHaveTextContent('63');
+    // NEGATIVE CONTROL: a current count states no read time.
+    expect(within(row).queryByTestId('campaign-row-alerts-read')).toBeNull();
+  });
+
+  it('states the grid read of a count that can be behind its campaign (SD5)', async () => {
+    vi.mocked(getCampaigns).mockResolvedValue({
+      ...LIST,
+      rows: [{ ...ROW, alertsBehind: true, alertsReadAt: '2026-11-18T12:40:00Z' }],
+    });
+    mount();
+    const row = await screen.findByTestId('campaign-row-7');
+    expect(within(row).getByTestId('campaign-row-alerts-read')).toHaveTextContent('Grid read 2026-11-18 12:40 UTC');
   });
 
   it('marks the alerts unknown when the campaign holds no stored events or the server sends none', async () => {
@@ -179,8 +191,11 @@ describe('Campaigns stage meter', () => {
     });
     mount();
     const waits = await screen.findByTestId('campaign-row-7');
-    expect(within(waits).getByTestId('campaign-decision-chip').textContent).toBe('Waits on you');
-    expect(within(screen.getByTestId('campaign-row-8')).getByTestId('campaign-decision-chip').textContent).toBe('Closed');
+    expect(within(waits).getByTestId('campaign-state').textContent).toBe('Open');
+    expect(within(waits).getByTestId('campaign-state')).toHaveAttribute('data-waits', 'true');
+    // One chip on a decided row: the decision, never "Open" beside it.
+    const closed = screen.getByTestId('campaign-row-8');
+    expect(within(closed).getAllByTestId('campaign-state').map((c) => c.textContent)).toEqual(['Closed']);
     const filter = screen.getByTestId('campaigns-filter');
     const all = within(filter).getByRole('button', { name: 'All 3' });
     const waitsOnYou = within(filter).getByRole('button', { name: 'Waits on you 2' });
@@ -206,10 +221,10 @@ describe('Campaigns stage meter', () => {
     });
     mount();
     const row = await screen.findByTestId('campaign-row-7');
-    const chip = within(row).getByTestId('campaign-decision-chip');
+    const chip = within(row).getByTestId('campaign-state');
     expect(chip.textContent).toBe('Case');
     expect(chip).toHaveAttribute('data-state', 'case');
-    expect(chip).toHaveAttribute('title', 'A Security Onion case is open for this campaign.');
+    expect(chip).toHaveAttribute('title', 'A Security Onion case holds this campaign.');
     // NEGATIVE CONTROL: a case is a decision, so the filter counts it out.
     expect(within(screen.getByTestId('campaigns-filter')).getByRole('button', { name: 'Waits on you 1' })).toBeInTheDocument();
     expect(forbiddenWords(row)).toEqual([]);
@@ -227,7 +242,8 @@ describe('Campaigns stage meter', () => {
     });
     mount();
     const row = await screen.findByTestId('campaign-row-7');
-    expect(within(row).getByTestId('campaign-decision-chip').textContent).toBe(`Authorized, expires ${expiresAt.slice(0, 10)}`);
+    expect(within(row).getByTestId('campaign-state').textContent).toBe('Authorized');
+    expect(within(row).getByTestId('campaign-state').getAttribute('title')).toMatch(/^An authorization covers this campaign until /);
     const alarm = within(row).getByTestId('campaign-beyond-chip');
     expect(alarm.textContent).toBe('3 beyond the authorization');
     expect(alarm.className).toContain('text-danger');
@@ -236,7 +252,7 @@ describe('Campaigns stage meter', () => {
     );
     // NEGATIVE CONTROL: a count of 0 and no authorization field state the plain chip and no alarm.
     const other = screen.getByTestId('campaign-row-8');
-    expect(within(other).getByTestId('campaign-decision-chip').textContent).toBe('Authorized');
+    expect(within(other).getByTestId('campaign-state').textContent).toBe('Authorized');
     expect(within(other).queryByTestId('campaign-beyond-chip')).toBeNull();
     expect(forbiddenWords(row)).toEqual([]);
   });
@@ -259,17 +275,52 @@ describe('Campaigns stage meter', () => {
     );
   });
 
+  it('opens on the filter of the decided campaigns that the Confirmed threats panel links to', async () => {
+    vi.mocked(getCampaigns).mockResolvedValue({
+      rows: [
+        { ...ROW, id: 7, decision: null, waitsSince: '2026-10-24T01:11:00Z', state: 'open' },
+        { ...ROW, id: 8, title: 'actor-b against db-1', decision: 'closed', waitsSince: null, state: 'closed' },
+        { ...ROW, id: 9, title: 'actor-c against mail-1', decision: 'case', waitsSince: null, state: 'case' },
+      ],
+      total: 3,
+      stale: false,
+    });
+    mount('/campaigns?decision=decided');
+    await screen.findByTestId('campaign-row-8');
+    // NEGATIVE CONTROL: a campaign with no decision is no decided campaign.
+    expect(screen.queryByTestId('campaign-row-7')).toBeNull();
+    expect(screen.getByTestId('campaign-row-9')).toBeInTheDocument();
+    const filter = screen.getByTestId('campaigns-filter');
+    expect(within(filter).getByRole('button', { name: 'Decided 2' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(filter).getByRole('button', { name: 'Waits on you 1' })).toHaveAttribute('aria-pressed', 'false');
+    // N15: the Decided line of the panel counts a window. The list states
+    // that it holds every decided campaign.
+    expect(screen.getByTestId('campaigns-decided-all').textContent).toBe(
+      'The list shows every decided campaign, from any time.',
+    );
+    fireEvent.click(within(filter).getByRole('button', { name: 'All 3' }));
+    expect(screen.getAllByTestId(/^campaign-row-\d+$/)).toHaveLength(3);
+    // Negative control: the full list states no such line.
+    expect(screen.queryByTestId('campaigns-decided-all')).toBeNull();
+  });
+
+  it('states that no campaign holds a decision when the decided filter holds none', async () => {
+    vi.mocked(getCampaigns).mockResolvedValue({ rows: [{ ...ROW, decision: null, waitsSince: '2026-10-24T01:11:00Z' }], total: 1, stale: false });
+    mount('/campaigns?decision=decided');
+    expect(await screen.findByText('No campaign holds a decision.')).toBeInTheDocument();
+  });
+
   it('states that no campaign waits when the filter holds none', async () => {
     vi.mocked(getCampaigns).mockResolvedValue({ rows: [{ ...ROW, decision: 'closed', waitsSince: null }], total: 1, stale: false });
     mount('/campaigns?decision=waits');
     expect(await screen.findByText('No campaign waits on your decision.')).toBeInTheDocument();
   });
 
-  it('shows no filter and no chip for a server that sends no decision', async () => {
+  it('shows no filter and claims no wait for a server that sends no decision', async () => {
     mount('/campaigns?decision=waits');
     // NEGATIVE CONTROL. With no decision field the filter would hide every row.
     expect(await screen.findByTestId('campaign-row-7')).toBeInTheDocument();
     expect(screen.queryByTestId('campaigns-filter')).toBeNull();
-    expect(screen.queryByTestId('campaign-decision-chip')).toBeNull();
+    expect(screen.getByTestId('campaign-state')).toHaveAttribute('data-waits', 'false');
   });
 });

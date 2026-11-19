@@ -26,9 +26,10 @@ import { Activity, Copy, X } from 'lucide-react';
 import { useState } from 'react';
 import type { QualityFreshness, QualityPoint } from '../lib/api';
 import { dismissNotification, getDismissed } from '../lib/notifications';
-import { absoluteTime, ago } from '../lib/timeRange';
+import { ago, utcStamp } from '../lib/timeRange';
 import { tint } from '../lib/tokens';
 import { LoadingState } from './States';
+import { RelTime } from './RelTime';
 
 // ---- pure seams (unit-tested in QualityCard.test.tsx) -----------------------
 
@@ -270,9 +271,9 @@ export function alarmBanner(points: QualityPoint[]): AlarmBanner | null {
 
   const errored = latest.n_error;
   const total = latest.n_ok + latest.n_error;
-  // The console's one absolute format, with its zone, as on the rest of the
-  // Dashboard (dogfood 2026-10-19, V1-S5).
-  const ongoingClause = `ongoing since ${absoluteTime(since)}, ${runs} run${runs === 1 ? '' : 's'}`;
+  // The console's one absolute format, UTC with its zone, as on the rest of
+  // the Dashboard (dogfood 2026-10-19, V1-S5; round 3, T3).
+  const ongoingClause = `ongoing since ${utcStamp(since)}, ${runs} run${runs === 1 ? '' : 's'}`;
 
   if (pipelineOnly) {
     return {
@@ -361,7 +362,7 @@ function FreshnessLine({ freshness }: { freshness: QualityFreshness }) {
         </span>
       )}
       <span>
-        latest point {ago(freshness.latest_ts)}
+        latest point <RelTime iso={freshness.latest_ts} />
         {attemptClause(freshness)}
       </span>
     </div>
@@ -546,7 +547,7 @@ export function QualityCard({
         <div data-testid="quality-freshness" className="mt-1.5 text-[11.5px] text-faint">
           {freshness?.last_attempt_at ? (
             <>
-              Last attempt {ago(freshness.last_attempt_at)}
+              Last attempt <RelTime iso={freshness.last_attempt_at} />
               {freshness.last_detail ? `: ${freshness.last_detail}` : ''}
             </>
           ) : (

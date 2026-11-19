@@ -322,6 +322,23 @@ describe('the Investigations row at 1100 px', () => {
     expect(name.className).not.toMatch(/max-h-|overflow-hidden/);
   });
 
+  it('states why the impact reads attempted under a title that claims success (AA3)', async () => {
+    const note = 'Impact: attempted. The report cites no record that proves success.';
+    listInvestigations.mockResolvedValue(
+      list([
+        inv({ name: 'Successful LFI read-back on 10.40.50.7', impact: 'attempted', impactNote: note }),
+        inv({ id: 'INV-Y', alertId: 'ev-2', impact: 'attempted', impactNote: null }),
+      ]),
+    );
+    media = windowIs(false);
+    mountInvestigations();
+    const row = await rowOf('INV-X');
+    expect(within(row).getByTestId('inv-impact-note-INV-X').textContent).toBe(note);
+    expect(within(row).getByTestId('impact-chip')).toHaveTextContent('Attempted');
+    // NEGATIVE CONTROL: a row with no stored change states no reason.
+    expect(screen.queryByTestId('inv-impact-note-INV-Y')).toBeNull();
+  });
+
   it('prints the headline of the run as one quiet line under the name', async () => {
     // The first line repeated the verdict chip and the Source → Dest cells
     // (polish review 2026-11-13). The row states the headline of the run.

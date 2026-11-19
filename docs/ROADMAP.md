@@ -270,12 +270,10 @@ config toggle, and the admin page hot-applies most of them.
 Release 1.7 holds five items. Each item comes from a limit that the 1.5 work
 recorded.
 
-- **A campaign object over related leads:** today a lead names the open leads
-  that may belong to one attack, and the hunt prompt asks whether they are one
-  campaign.
-  Nothing joins them into one record with one owner and one verdict. A week of
-  in-house use showed related leads that read as one attack. The join is
-  therefore the next step.
+- **A campaign object over related leads:** `main` holds this item, and the
+  next release ships the item. A campaign joins the investigations of one
+  activity by proven links, and the analyst decides once on the campaign. A
+  lead whose investigations one campaign holds waits on that campaign.
 - **An API key login for Security Onion:** Security Onion 3.3 takes a browser
   session cookie or an API key. soc-ai uses the cookie. An API key needs no
   password on disk, and a login throttle does not affect it. It is therefore the

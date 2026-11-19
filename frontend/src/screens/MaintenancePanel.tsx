@@ -1,7 +1,7 @@
 import { type Maintenance, getMaintenance } from '../lib/api';
 import { CollapseChevron } from '../components/Panel';
 import { ErrorState, LoadingState } from '../components/States';
-import { absTime } from '../lib/timeRange';
+import { UtcTime } from '../components/UtcTime';
 import { useAsync } from '../lib/useAsync';
 
 function fmtSize(bytes: number): string {
@@ -67,7 +67,7 @@ export function MaintenancePanel({
                   <>
                     <span className="font-semibold">{data.blocklist_files}</span> feed file
                     {data.blocklist_files === 1 ? '' : 's'}. The last refresh was{' '}
-                    <span className="font-semibold">{absTime(data.blocklists_refreshed)}</span>.
+                    <UtcTime className="font-semibold" iso={data.blocklists_refreshed} />.
                   </>
                 ) : (
                   <span className="text-faint">
@@ -93,7 +93,7 @@ export function MaintenancePanel({
                   >
                     <span className="min-w-0 flex-1 break-all font-mono">{b.name}</span>
                     <span className="flex-none text-faint">{fmtSize(b.size_bytes)}</span>
-                    <span className="flex-none text-faint">{absTime(b.modified)}</span>
+                    <UtcTime className="flex-none text-faint" iso={b.modified} />
                   </div>
                 ))}
               </div>

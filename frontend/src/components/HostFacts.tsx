@@ -39,7 +39,8 @@ import {
   roleLabel,
   sweepWindowWords,
 } from '../lib/hostDossier';
-import { absTime } from '../lib/timeRange';
+import { timeTitle, utcTimesInText } from '../lib/timeRange';
+import { UtcTime } from './UtcTime';
 import type { Dossier, DossierField, DossierFieldName } from '../lib/types';
 import { useDossierWrite } from '../lib/useDossierWrite';
 import { Panel, PanelHeader } from './Panel';
@@ -474,7 +475,7 @@ function WhyDrawer({
               Declared by{' '}
               <span className="font-semibold text-text-2">{f.operator_actor ?? 'an operator'}</span>
               {f.operator_set_at ? (
-                <span className="text-faint"> · {absTime(f.operator_set_at)}</span>
+                <span className="text-faint"> · <UtcTime iso={f.operator_set_at} /></span>
               ) : null}
             </div>
             <div>
@@ -515,13 +516,13 @@ function WhyDrawer({
                 )}
                 {conf && <span className="font-mono text-[11px] text-faint">{conf}</span>}
                 {typeof entry.last_seen === 'string' && (
-                  <span className="font-mono text-[11px] text-faint">{absTime(entry.last_seen)}</span>
+                  <UtcTime className="font-mono text-[11px] text-faint" iso={entry.last_seen} />
                 )}
               </div>
               {strings.length > 0 && (
                 <ul className="ml-1 flex flex-col gap-0.5">
                   {strings.map((line, i) => (
-                    <li key={i} className="text-[12px] leading-[1.5] text-dim" title={String(line)}>
+                    <li key={i} className="text-[12px] leading-[1.5] text-dim" title={utcTimesInText(String(line))}>
                       · {plainEvidence(String(line))}
                     </li>
                   ))}
@@ -536,8 +537,8 @@ function WhyDrawer({
 
         {(f.observed_at || f.last_run_at) && (
           <div className="flex flex-wrap gap-x-4 gap-y-0.5 font-mono text-[11px] text-faint">
-            {f.observed_at && <span>evidence {absTime(f.observed_at)}</span>}
-            {f.last_run_at && <span>checked {absTime(f.last_run_at)}</span>}
+            {f.observed_at && <span>evidence <UtcTime iso={f.observed_at} /></span>}
+            {f.last_run_at && <span>checked <UtcTime iso={f.last_run_at} /></span>}
           </div>
         )}
 
@@ -602,6 +603,8 @@ export function FactRow({
   // Freshness: when it was last confirmed for an inferred fact, when it was
   // said for a declared one. Relative either way; the wall clock rides in the
   // hover and the drawer.
+  // The tooltip names the time that the text states (round 3 part 2, P1).
+  const freshnessAt = f.overridden ? f.operator_set_at : f.observed_at;
   const freshness = f.overridden
     ? f.operator_set_at
       ? relativeAge(f.operator_set_at)
@@ -632,7 +635,10 @@ export function FactRow({
           <FactValue f={f} />
         </div>
         {meta && (
-          <span className="flex-none text-[11.5px] text-faint" title={f.observed_at ? absTime(f.observed_at) : undefined}>
+          <span
+            className="flex-none text-[11.5px] text-faint"
+            title={freshnessAt ? timeTitle(freshnessAt) : undefined}
+          >
             {meta}
           </span>
         )}

@@ -23,7 +23,7 @@ import {
   valueText,
 } from '../lib/hostDossier';
 import { plural } from '../lib/plural';
-import { absTime, ago } from '../lib/timeRange';
+import { ago, timeTitle } from '../lib/timeRange';
 import type { MachineAddress, MachineContainer, MachineDetail } from '../lib/types';
 import { useAsync } from '../lib/useAsync';
 import { Panel, PanelHeader } from './Panel';
@@ -152,10 +152,10 @@ function AddressRow({
         <td className="px-2.5 py-2 text-[12px] text-text-2" title={addressKindTitle(a.kind)}>
           {addressKindLabel(a.kind)}
         </td>
-        <td className="px-2.5 py-2 text-right font-mono text-[11.5px] text-faint" title={absTime(a.first_seen)}>
+        <td className="px-2.5 py-2 text-right font-mono text-[11.5px] text-faint" title={timeTitle(a.first_seen)}>
           {ago(a.first_seen)}
         </td>
-        <td className="px-2.5 py-2 text-right font-mono text-[11.5px] text-faint" title={absTime(a.last_seen)}>
+        <td className="px-2.5 py-2 text-right font-mono text-[11.5px] text-faint" title={timeTitle(a.last_seen)}>
           {ago(a.last_seen)}
         </td>
         <td className="px-2.5 py-2 text-right font-mono text-[12px] text-dim">{a.events.toLocaleString()}</td>
@@ -187,10 +187,10 @@ function ContainerRow({ c }: { c: MachineContainer }) {
   return (
     <tr className="border-b border-border-faint last:border-0">
       <td className="px-[15px] py-1.5 font-mono text-[12px] text-text-2">{c.ip}</td>
-      <td className="px-2.5 py-1.5 text-right font-mono text-[11.5px] text-faint" title={absTime(c.first_seen)}>
+      <td className="px-2.5 py-1.5 text-right font-mono text-[11.5px] text-faint" title={timeTitle(c.first_seen)}>
         {ago(c.first_seen)}
       </td>
-      <td className="px-2.5 py-1.5 text-right font-mono text-[11.5px] text-faint" title={absTime(c.last_seen)}>
+      <td className="px-2.5 py-1.5 text-right font-mono text-[11.5px] text-faint" title={timeTitle(c.last_seen)}>
         {ago(c.last_seen)}
       </td>
       <td className="px-[15px] py-1.5 text-right font-mono text-[12px] text-dim">{c.events.toLocaleString()}</td>

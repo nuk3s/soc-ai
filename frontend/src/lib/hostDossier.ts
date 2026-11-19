@@ -13,7 +13,7 @@
 // what lets the identity sentence's composition RULES be tested as rules.
 // ---------------------------------------------------------------------------
 
-import { ago } from './timeRange';
+import { ago, utcTimesInText } from './timeRange';
 import type {
   DossierFieldBrief,
   DossierFieldName,
@@ -444,9 +444,11 @@ const DATASET_WORDS: [RegExp, string][] = [
   [/\bsuricata\.alert\b/g, 'IDS alerts'],
 ];
 
-/** One evidence line with the dataset names in plain words. */
+/** One evidence line with the dataset names in plain words, and each ISO
+ *  time in the UTC form of the page. A stored agent line read "last
+ *  2026-11-18T20:41:32.112000+00:00" on the host page (round 3 part 2, P1). */
 export function plainEvidence(text: string): string {
-  return DATASET_WORDS.reduce((out, [pattern, words]) => out.replace(pattern, words), text);
+  return utcTimesInText(DATASET_WORDS.reduce((out, [pattern, words]) => out.replace(pattern, words), text));
 }
 
 /** "confidence 0.50 of 1.00, too low to assert": the number with its scale

@@ -308,6 +308,15 @@ POSTGRES_MODULES = frozenset(
         "test_saved_views.py",
         # Migration 0065 and the tour state on the user row.
         "test_me_tours.py",
+        # Migration 0074 and the answers of a hunt.
+        "test_hunt_answers.py",
+        # Migration 0075: the selection of the open false positives and the
+        # grid state read JSON paths of the events and the reports.
+        "test_rule_decision_selection.py",
+        "test_rule_decision_grid_state.py",
+        # Migration 0076: the fill reads the JSON of the stored grid read, and
+        # the end rule of a campaign is two plain comparisons in SQL.
+        "test_campaign_end_store.py",
     }
 )
 

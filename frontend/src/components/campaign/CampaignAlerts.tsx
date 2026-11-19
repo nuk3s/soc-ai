@@ -1,10 +1,11 @@
 import type { CampaignPairEvents, CampaignParty, CampaignRuleEvents } from '../../lib/api';
 import { NOT_JUDGED } from '../../lib/campaignWords';
 import { plural } from '../../lib/plural';
-import { utcStamp } from '../../lib/timeRange';
+
 import { VerdictPill } from '../Badges';
 import { selectionHoldsPair, type CampaignSelection } from './selection';
 import { PartyLink } from './shared';
+import { UtcTime } from '../UtcTime';
 
 const TH = 'px-2.5 py-2 text-left font-semibold';
 
@@ -132,10 +133,10 @@ export function CampaignAlerts({
                 <td className="px-2.5 py-2.5">{machine(r.pair.source)}</td>
                 <td className="px-2.5 py-2.5">{machine(r.pair.target)}</td>
                 <td className="whitespace-nowrap px-2.5 py-2.5 font-mono text-[11.5px] text-text-2">
-                  {utcStamp(r.rule.firstAt)}
+                  <UtcTime iso={r.rule.firstAt} seconds={false} />
                 </td>
                 <td className="whitespace-nowrap px-2.5 py-2.5 font-mono text-[11.5px] text-text-2">
-                  {utcStamp(r.rule.lastAt)}
+                  <UtcTime iso={r.rule.lastAt} seconds={false} />
                 </td>
                 <td data-testid="alert-verdict" className="px-[15px] py-2.5">
                   <RuleVerdict verdict={r.rule.verdict} />

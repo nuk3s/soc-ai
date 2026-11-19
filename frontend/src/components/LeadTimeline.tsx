@@ -10,6 +10,7 @@ import {
   dismissReasonLabel,
 } from './LeadsStrip';
 import { Panel, PanelHeader } from './Panel';
+import { RelTime } from './RelTime';
 import type { LeadDetail, LeadObservationDetail, LeadPromotedFinding } from '../lib/api';
 import { kindLabel, sourceLabel, sourceTitle } from '../lib/kinds';
 import {
@@ -50,18 +51,6 @@ import {
   SIGHTING_HALF_WEIGHT,
   WEIGHT_NOW,
 } from '../lib/tooltips';
-
-/** The hover text of an observation's time: the event time and the record
- *  time, or the record time alone when the row has no document time. Both in
- *  UTC, with the label, the zone the whole timeline reads. */
-export function observationTimeTitle(o: {
-  observed_at?: string | null;
-  born_at: string | null;
-}): string {
-  return o.observed_at
-    ? `Event time ${utcStamp(o.observed_at)}. Recorded ${utcStamp(o.born_at)}.`
-    : `Recorded ${utcStamp(o.born_at)}. No document time is on record.`;
-}
 
 // ---------------------------------------------------------------------------
 // The timeline of one lead: every observation that formed it, every decision
@@ -163,13 +152,11 @@ export function decisionSentence(d: LeadDecision): string {
 const CHIP_CLASS =
   'rounded-chip border border-border-strong bg-surface-2 px-1.5 py-px text-[10.5px] text-text-2';
 
-/** The relative time of a row, with the UTC time in the hover. */
+/** The relative time of a row, with the UTC and the local time in the hover. */
 function When({ at }: { at: string | null }) {
   if (!at) return null;
   return (
-    <span className="font-mono text-[11px] text-dim" title={utcStamp(at)}>
-      {ago(at)}
-    </span>
+    <RelTime className="font-mono text-[11px] text-dim" iso={at} />
   );
 }
 
@@ -332,13 +319,13 @@ function ObservationRow({
       <div className="flex flex-wrap items-center gap-2">
         {/* The event time when the row has one. The record time read an
             event a day old as new on the sweep that found it. */}
-        <span
+        <RelTime
           className="font-mono text-[11px] text-dim"
-          title={observationTimeTitle(o)}
-          data-testid={`observation-time-${o.id}`}
-        >
-          {ago(o.observed_at ?? o.born_at)}
-        </span>
+          testId={`observation-time-${o.id}`}
+          iso={o.observed_at ?? o.born_at}
+          what={o.observed_at ? 'Event time' : 'Recorded'}
+          note={o.observed_at ? `Recorded ${utcStamp(o.born_at)}.` : 'No document time is on record.'}
+        />
         <span className={CHIP_CLASS} title={CHIP_TYPE}>
           {kindLabel(o.kind, o.kind_label)}
         </span>
@@ -352,7 +339,7 @@ function ObservationRow({
             data-testid={`observation-retired-${o.id}`}
             title="An analyst retired the analytic that wrote this observation. It no longer runs."
           >
-            analytic retired on {o.analytic_retired_at.slice(0, 10)}
+            analytic retired on {o.analytic_retired_at.slice(0, 10)} UTC
           </span>
         ) : (
           <span

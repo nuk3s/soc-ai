@@ -14,6 +14,8 @@ import {
   detectionSentence,
   eventsFacts,
   falsePositiveSentence,
+  artifactWords,
+  linkPieces,
   linkSentence,
   moreWords,
   namedSentence,
@@ -25,6 +27,7 @@ import {
   stageLabel,
   timelineNote,
 } from './campaignWords';
+import { UNKNOWN } from '../components/Kpi';
 import { EVENTS } from '../test/campaign';
 
 const EVIDENCE: CampaignEvidence = {
@@ -81,34 +84,49 @@ describe('linkSentence', () => {
     );
   });
 
-  it('states the shared connection', () => {
+  it('states the shared connection, with its id in the hover', () => {
     expect(linkSentence(member('session'))).toBe(
-      'This investigation shares the connection 1:abc= with the investigation run-a1.',
+      'This investigation shares a connection with another investigation of the campaign.',
     );
+    // W5: the id of the connection and the id of the other investigation
+    // are in the hover and behind the link, never in the words.
+    const p = linkPieces(member('session'));
+    expect(p.title).toBe('Connection 1:abc=');
+    expect(p.other).toEqual({ runId: 'run-a1', words: 'another investigation of the campaign' });
   });
 
   it('names the other investigation by its label when the label is known', () => {
     const labels = { 'run-a1': 'ET EXPLOIT Example Upload Request' };
     expect(linkSentence(member('session'), {}, labels)).toBe(
-      'This investigation shares the connection 1:abc= with the investigation "ET EXPLOIT Example Upload Request".',
+      'This investigation shares a connection with the investigation "ET EXPLOIT Example Upload Request".',
     );
     expect(linkSentence(member('actor'), {}, labels)).toContain(
       'of the investigation "ET EXPLOIT Example Upload Request".',
     );
-    // NEGATIVE CONTROL: an investigation that is not in the list keeps its id.
-    expect(linkSentence(member('session'), {}, { other: 'x' })).toContain('with the investigation run-a1.');
+    // An investigation that is not in the list reads in words. Its id is
+    // behind the link (W5).
+    expect(linkSentence(member('session'), {}, { other: 'x' })).toContain(
+      'with another investigation of the campaign.',
+    );
+    expect(linkSentence(member('session'), {}, { other: 'x' })).not.toContain('run-a1');
   });
 
   it('states the same attacking machine and its nearest investigation', () => {
     expect(linkSentence(member('actor'))).toBe(
-      'The attacking machine actor-a is the source of this investigation and of the investigation run-a1.',
+      'The attacking machine actor-a is the source of this investigation and of another investigation of the campaign.',
     );
   });
 
   it('states the shared artifact', () => {
     expect(linkSentence(member('artifact'))).toBe(
-      'This investigation shares CVE-2026-0001 with the investigation run-a1.',
+      'This investigation shares CVE-2026-0001 with another investigation of the campaign.',
     );
+    // W5: the prefix of the engine reads as words.
+    expect(artifactWords('rule: ET EXPLOIT Example Request')).toBe('the rule ET EXPLOIT Example Request');
+    expect(artifactWords('cve: CVE-2026-0001')).toBe('the vulnerability CVE-2026-0001');
+    expect(artifactWords('http: POST /index.php')).toBe('the web request POST /index.php');
+    // NEGATIVE CONTROL: no evidence states that the fact is unknown.
+    expect(artifactWords(null)).toBe(UNKNOWN);
   });
 
   it('states the same records', () => {
@@ -140,11 +158,11 @@ describe('linkSentence', () => {
   it('reads the machine name when the evidence names no machine', () => {
     const m = member('actor', { machineName: null, machineKey: 'agent:actor-b' });
     expect(linkSentence(m, { 'agent:actor-b': 'actor-b' })).toBe(
-      'The attacking machine actor-b is the source of this investigation and of the investigation run-a1.',
+      'The attacking machine actor-b is the source of this investigation and of another investigation of the campaign.',
     );
     // NEGATIVE CONTROL: with no machine name, the key stands.
     expect(linkSentence(m)).toBe(
-      'The attacking machine agent:actor-b is the source of this investigation and of the investigation run-a1.',
+      'The attacking machine agent:actor-b is the source of this investigation and of another investigation of the campaign.',
     );
   });
 });
@@ -189,6 +207,25 @@ describe('the section sentences', () => {
     expect(authorizationSentence({ ...a, state: 'expired' }, 6)).toBe(
       'The authorization Red team test is expired.',
     );
+  });
+
+  // Production 2026-11-19: the campaign record and a stored record with a
+  // rule list had one name. The page read "53 investigations inside" until
+  // 12-01 beside "covers 24 of the 54 investigations" until 11-20.
+  it('names a stored record as the earlier one when the campaign holds its own authorization', () => {
+    const a = { id: 1, label: 'Red team test', state: 'active', expiresAt: '2026-11-20T09:00:00Z', memberRuns: 4 };
+    expect(authorizationSentence(a, 6, { label: 'Red team test', state: 'active' })).toBe(
+      'An earlier authorization has the same name, Red team test. It lists rules and covers 4 of the 6 investigations. It expires 2026-11-20 09:00 UTC.',
+    );
+    expect(authorizationSentence(a, 6, { label: 'Autumn test', state: 'active' })).toBe(
+      'The earlier authorization Red team test lists rules and covers 4 of the 6 investigations. It expires 2026-11-20 09:00 UTC.',
+    );
+    // NEGATIVE CONTROL: with no authorization on the campaign, and with one
+    // that is no longer in force, the line reads as before.
+    const plain = 'The authorization Red team test covers 4 of the 6 investigations. It expires 2026-11-20 09:00 UTC.';
+    expect(authorizationSentence(a, 6, null)).toBe(plain);
+    expect(authorizationSentence(a, 6, { label: 'Red team test', state: 'revoked' })).toBe(plain);
+    expect(authorizationSentence(a, 6, { label: 'Red team test', state: 'expired' })).toBe(plain);
   });
 
   it('states a session after the two names', () => {
@@ -239,10 +276,10 @@ describe('the event words', () => {
 
   it('states the facts of the grid and of the stored events', () => {
     expect(eventsFacts(EVENTS)).toBe(
-      '47 alerts of 3 rules. 1 hunt finding. 1,840 grid records between the machines.',
+      '47 alerts of 3 confirmed rules. soc-ai did not confirm 12 alerts of 2 other rules. 1 hunt finding. 1,840 grid records between the machines.',
     );
-    expect(eventsFacts({ ...EVENTS, alerts: 1, rules: 1, findings: 2, records: 1 })).toBe(
-      '1 alert of 1 rule. 2 hunt findings. 1 grid record between the machines.',
+    expect(eventsFacts({ ...EVENTS, alerts: 1, rules: 1, findings: 2, records: 1, pairs: [] })).toBe(
+      '1 alert of 1 confirmed rule. 2 hunt findings. 1 grid record between the machines.',
     );
     expect(eventsFacts({ ...EVENTS, source: 'stored', alerts: 1200, records: null })).toBe(
       '1,200 alert events that the investigations hold. 1 hunt finding.',

@@ -87,8 +87,9 @@ async def get_rule_content(
             "found": False,
             "rule_id": rule_id,
             "hint": (
-                "no detection matched this publicId/SID or exact title — check the "
-                "alert's rule.uuid, or free-text search with t_query_detections"
+                "No detection matched this publicId, SID or exact title. Check the "
+                "rule.uuid of the alert, or search the free text with "
+                "t_query_detections."
             ),
         }
 

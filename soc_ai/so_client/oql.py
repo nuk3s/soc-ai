@@ -97,8 +97,7 @@ def get_whitelist() -> FieldWhitelist:
 # the model.
 _FORBIDDEN_FIELD_HINTS: dict[str, str] = {
     "_index": (
-        "; the physical index name is not queryable — filter on "
-        "event.dataset or event.module instead"
+        "; the physical index name is not queryable. Filter on event.dataset or event.module"
     ),
 }
 
@@ -417,7 +416,7 @@ _COUNT_RE = re.compile(r"^count$", re.IGNORECASE)
 _VALID_PIPE_STAGES_HELP = (
     "valid stages: 'groupby <field>[, <field2>]', 'sortby <field> [asc|desc]', "
     "'head <N>' (alias 'limit <N>'), 'count'. There is NO 'fields'/projection "
-    "stage — results always return full documents; narrow the base filter instead"
+    "stage. Results always return full documents. Narrow the base filter"
 )
 
 
@@ -721,7 +720,7 @@ def validate_oql(ast: OqlAst, *, max_results: int = 100) -> None:
         if pattern[:1] in ("*", "?"):
             raise OqlValidationError(
                 f"leading-wildcard patterns are too expensive; anchor the "
-                f"wildcard (write foo*, not *foo) — or, for a substring/contains "
+                f"wildcard (write foo*, not *foo). For a substring/contains "
                 f"match, use field:~value, which searches the field's analyzed "
                 f"text and is the right form for process.command_line and "
                 f"message: {pattern!r}",
@@ -857,11 +856,18 @@ def _term_to_dsl(field_name: str, value: Value) -> dict[str, Any]:
     assert_never(value)
 
 
-def ast_to_es_dsl(ast: OqlAst, *, default_size: int = 100) -> dict[str, Any]:
+def ast_to_es_dsl(
+    ast: OqlAst, *, default_size: int = 100, sort_unmapped_type: str | None = None
+) -> dict[str, Any]:
     """Translate an :class:`OqlAst` to an Elasticsearch search body.
 
     Returned keys: ``query``, ``size``, optionally ``sort``, ``aggs``,
     ``track_total_hits``. Caller wires them into ``ElasticClient.search``.
+
+    ``sort_unmapped_type`` is the type of the ``sortby`` field from the field
+    capabilities of the grid (:func:`soc_ai.so_client.query_forms.sort_unmapped_type`).
+    The shards of an index that does not map the field then sort with no
+    value. With ``None`` the sort is the sort of the query as written.
     """
     body: dict[str, Any] = {
         "query": filter_to_dsl(ast.filter_),
@@ -889,7 +895,10 @@ def ast_to_es_dsl(ast: OqlAst, *, default_size: int = 100) -> dict[str, Any]:
             # Sorting buckets by doc_count
             _attach_bucket_sort(body["aggs"], sortby.direction)
         else:
-            body["sort"] = [{sortby.field: {"order": sortby.direction}}]
+            order: dict[str, Any] = {"order": sortby.direction}
+            if sort_unmapped_type is not None:
+                order["unmapped_type"] = sort_unmapped_type
+            body["sort"] = [{sortby.field: order}]
 
     if head is not None:
         if has_groupby:

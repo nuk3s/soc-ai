@@ -7,7 +7,22 @@ describe('fieldChipLabel', () => {
   it('names a field in words with a short value', () => {
     expect(fieldChipLabel('community_id_events.0.zeek_http_status', '200')).toBe('HTTP status 200');
     expect(fieldChipLabel('alert.rule_metadata.signature_severity', 'Informational')).toBe(
-      'Signature severity Informational',
+      'Rule metadata severity Informational',
+    );
+  });
+
+  it('names the two severity fields apart, each with its source in the tooltip', () => {
+    // Round 3 part 2, P4: a card showed "rule severity High" beside
+    // "Signature severity Informational".
+    expect(fieldChipLabel('alert.severity_label', 'High')).toBe('Alert severity High');
+    expect(fieldChipTitle('alert.rule_metadata.signature_severity', { documentId: 'd1' })).toBe(
+      'Field alert.rule_metadata.signature_severity. The author of the rule writes this level in the rule metadata. ' +
+        'It can differ from the alert severity. Open the alert at this field.',
+    );
+    expect(fieldChipTitle('alert.severity_label', {})).toContain('Security Onion records this level on the alert.');
+    // Negative control: a field with no note keeps the short tooltip.
+    expect(fieldChipTitle('alert.payload_printable', { documentId: 'd1' })).toBe(
+      'Field alert.payload_printable. Open the alert at this field.',
     );
   });
 

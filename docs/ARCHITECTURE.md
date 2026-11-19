@@ -392,21 +392,44 @@ Elasticsearch. Raw OQL never reaches ES. The pipeline is:
 2. `validate_oql` walks the AST. It rejects any field that the whitelist
    `oql_fields.json` does not hold. It rejects a repeated or unsafe pipe stage.
    It caps `head` at a hard ceiling of 10,000 rows.
-3. `ast_to_es_dsl` translates the validated AST into an ES search body.
+3. `query_events_oql` reads the field types of the grid with `_field_caps`
+   for the fields that a correction needs. `soc_ai/so_client/query_forms.py`
+   then writes a wildcard of whole octets on an IP field as the CIDR. The module
+   writes a time with a space on a date field as ISO 8601 in UTC. Any other
+   wildcard on an IP field is a query error with a CIDR hint. The tool result
+   states each rewrite. With no answer from the grid, the query goes as written.
+4. `ast_to_es_dsl` translates the validated AST into an ES search body. A sort
+   gets the `unmapped_type` of the field type of the grid.
 
 `query_events_oql` also excludes synthetic-eval documents by default. It matches
 them on `synth.scenario_id`, so no fixture leaks into a real response.
 
+A query that the grid rejects for the type of a field raises
+`GridQueryRejectedError`. The tool boundary in `soc_ai/agent/toolset.py` returns
+the reason `query_rejected` with the reason text of Elasticsearch. A known reason
+also gets a hint. A hunt does not count a rejected query as a grid failure. A
+console route that runs an analyst query answers 400 `query_rejected`.
+
 ## Write-action flow (`soc_ai/tools/write_exec.py` → `execute_write_tool`)
 
-1. The pipeline never executes a write itself. It lists the write tools in
-   `TriageReport.recommended_actions`, and that list is advisory.
+1. The pipeline executes no recommended write. The pipeline lists the write tools
+   in `TriageReport.recommended_actions`, and that list is advisory. The
+   auto-acknowledge of step 2 is the one write that the pipeline executes.
 2. The analyst executes a recommendation from the report through the actions API
    at `POST /api/v1/investigations/{id}/actions/{index}/execute`. The group
    acknowledge, the group escalate and the auto-acknowledge use the same path.
-   The auto-acknowledge is off by default. It gates on the confidence, the
-   severity, and whether the run retrieved anything. Set
-   `auto_ack_fp_enabled=true` to enable it.
+   The auto-acknowledge is off by default. The auto-acknowledge gates on the
+   confidence, the citations and whether the investigation retrieved anything.
+   The auto-acknowledge also holds a high-stakes alert: a critical or high alert,
+   an alert with an exploit, attack or malware signal, and a decoy alert. A high
+   Suricata alert of the classification policy violation or inappropriate
+   content, with each signature severity Informational, is not high-stakes for
+   the severity alone. A standing rule decision lifts that one hold for one
+   rule. The term is `rule_decision_days`, and the default is 30 days. The
+   decision ends after the term or when the analyst ends the decision. A true
+   positive verdict on an investigation of the rule ends the decision at once.
+   Every other guard stays. Set `auto_ack_fp_enabled=true` to turn on the
+   auto-acknowledge.
 3. Every execution runs through `execute_write_tool`. It accepts the 3 write
    tools, `open_finding_case` for the escalate of a promoted finding, and
    `open_campaign_case` for the one case of a campaign. No report can name

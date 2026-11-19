@@ -216,7 +216,15 @@ async def in_open_campaign(db: AsyncSession, addresses: Iterable[str], *, now: d
         return False
     rows = await db.execute(
         select(Campaign, CampaignParty.machine_key, CampaignParty.addresses)
-        .options(load_only(Campaign.id, Campaign.status, Campaign.last_event, Campaign.decision))
+        .options(
+            load_only(
+                Campaign.id,
+                Campaign.status,
+                Campaign.last_event,
+                Campaign.last_alert_at,
+                Campaign.decision,
+            )
+        )
         .join(CampaignParty, CampaignParty.campaign_id == Campaign.id)
         .where(Campaign.status == STATUS_ACTIVE)
     )
